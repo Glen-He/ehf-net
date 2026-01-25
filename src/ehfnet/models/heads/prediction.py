@@ -64,11 +64,11 @@ class GaussianSmearing(nn.Module):
 
         if num_gaussians < 10:
             raise ValueError(
-                f"num_gaussians 过小会导致表达能力不足，期望 >= 10，实际为 {num_gaussians}"
+                f"num_gaussians is too small; expected >= 10, got {num_gaussians}."
             )
 
         if stop <= start:
-            raise ValueError(f"stop ({stop}) 必须大于 start ({start})")
+            raise ValueError(f"stop ({stop}) must be greater than start ({start}).")
 
         offset = torch.linspace(start, stop, num_gaussians)
         self.register_buffer("offset", offset)
@@ -309,13 +309,9 @@ class PredictionHead(nn.Module):
         if N_lig == 0 or N_pro == 0:
 
             return {
-                "v_atomic": torch.zeros(
-                    (N_lig, 3), device=device, dtype=lig_atom_feat.dtype
-                ),
+                "v_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
                 "binding_affinity": self.baseline_energy.expand(B).unsqueeze(-1),
-                "force_atomic": torch.zeros(
-                    (N_lig, 3), device=device, dtype=lig_atom_feat.dtype
-                ),
+                "force_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
             }
 
         # 1. 邻居搜索
@@ -340,13 +336,9 @@ class PredictionHead(nn.Module):
         if edge_index.size(1) == 0:
 
             return {
-                "v_atomic": torch.zeros(
-                    (N_lig, 3), device=device, dtype=lig_atom_feat.dtype
-                ),
+                "v_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
                 "binding_affinity": self.baseline_energy.expand(B).unsqueeze(-1),
-                "force_atomic": torch.zeros(
-                    (N_lig, 3), device=device, dtype=lig_atom_feat.dtype
-                ),
+                "force_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
             }
 
         i_idx = edge_index[0]

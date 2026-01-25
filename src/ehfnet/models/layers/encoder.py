@@ -351,12 +351,14 @@ class EHFEncoder(nn.Module):
         for src, rel, dst in relevant_edge_keys:
 
             if (src, rel, dst) not in edge_dict:
-                logger.warning(f"边类型 ({src}, {rel}, {dst}) 在输入数据中缺失，跳过该边")
+                logger.warning(
+                    f"Edge type ({src}, {rel}, {dst}) is missing in input data; skipping."
+                )
                 continue
 
             if src not in offsets or dst not in offsets:
                 logger.warning(
-                    f"边类型 ({src}, {rel}, {dst}) 的节点在输入中缺失，跳过该边"
+                    f"Nodes for edge type ({src}, {rel}, {dst}) are missing in input; skipping."
                 )
                 continue
 
@@ -439,8 +441,8 @@ class EHFEncoder(nn.Module):
 
             elif x.numel() > 0:
                 logger.warning(
-                    f"时间嵌入广播失败，节点类型 {nt}："
-                    f"节点数={x.shape[0]}, 时间步批次={t_emb.shape[0]}"
+                    f"Failed to broadcast time embedding for node type {nt}: "
+                    f"num_nodes={x.shape[0]}, num_time_steps={t_emb.shape[0]}."
                 )
 
         edge_dict = data.edge_index_dict

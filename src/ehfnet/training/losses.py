@@ -75,7 +75,7 @@ class FlowMatchingLoss(nn.Module):
         v_atomic = predictions["v_atomic"]
         
         if v_atomic is None:
-            raise ValueError("predictions['v_atomic'] 不能为空")
+            raise ValueError("predictions['v_atomic'] must not be None.")
 
         device = v_atomic.device
         loss_dict: dict[str, Tensor] = {}
@@ -84,7 +84,7 @@ class FlowMatchingLoss(nn.Module):
         v_target_atomic = targets["v_atomic_target"]
 
         if v_target_atomic is None:
-            raise ValueError("targets['v_atomic_target'] 不能为空")
+            raise ValueError("targets['v_atomic_target'] must not be None.")
             
         masses = data["ligand_atom"].masses
         batch = data["ligand_atom"].batch
@@ -112,7 +112,7 @@ class FlowMatchingLoss(nn.Module):
         pred_trans = predictions["v_translation"]
 
         if pred_trans is None:
-            raise ValueError("predictions['v_translation'] 不能为空")
+            raise ValueError("predictions['v_translation'] must not be None.")
 
         raw_loss_trans = F.mse_loss(pred_trans, gt_trans)
         loss_dict["raw_loss_trans"] = raw_loss_trans.detach()
@@ -120,7 +120,7 @@ class FlowMatchingLoss(nn.Module):
         pred_rot = predictions["v_rotation"]
 
         if pred_rot is None:
-            raise ValueError("predictions['v_rotation'] 不能为空")
+            raise ValueError("predictions['v_rotation'] must not be None.")
 
         raw_loss_rot = F.mse_loss(pred_rot, gt_rot)
         loss_dict["raw_loss_rot"] = raw_loss_rot.detach()

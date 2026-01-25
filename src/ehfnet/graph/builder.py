@@ -548,7 +548,7 @@ class GraphBuilder:
 
             device = data[dst].pos.device
             n_dst = int(data[dst].pos.size(0))
-            # 广播：Global Node (0) -> All Local Nodes
+            # 广播：全局节点（global node，索引 0）-> 全部局部节点
             edge_index = torch.stack(
                 [
                     torch.zeros(n_dst, dtype=torch.long, device=device),

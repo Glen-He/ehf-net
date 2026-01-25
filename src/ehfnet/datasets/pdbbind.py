@@ -176,9 +176,9 @@ class PDBBindDataset(Dataset):
             esm_root: 全局 ESM 缓存目录（可选）
             esm: ESM 处理模式（如 "auto"）
             esm_model_name: ESM 模型名称
-            transform: PyG Dataset transform
-            pre_transform: PyG Dataset pre_transform
-            pre_filter: PyG Dataset pre_filter
+            transform: PyG Dataset 的 transform（可选）
+            pre_transform: PyG Dataset 的 pre_transform（可选）
+            pre_filter: PyG Dataset 的 pre_filter（可选）
             r_cutoff_intra: 图内边半径阈值
             r_cutoff_inter: 跨图边半径阈值
             max_neighbors_intra: 图内最大邻居数

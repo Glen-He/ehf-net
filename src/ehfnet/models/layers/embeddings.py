@@ -34,7 +34,7 @@ class TimeEmbedding(nn.Module):
         super().__init__()
 
         if dim % 2 != 0:
-            raise ValueError(f"dim 必须是偶数，当前为 {dim}")
+            raise ValueError(f"dim must be even, got {dim}.")
 
         half_dim = dim // 2
 

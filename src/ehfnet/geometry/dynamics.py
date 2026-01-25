@@ -555,7 +555,7 @@ class PathInterpolator:
     @staticmethod
     def _matrix_to_axis_angle(R: Tensor) -> Tensor:
         """
-        Log map: SO(3) -> so(3)
+        对数映射（log map）：SO(3) -> so(3)
         """
 
         trace = R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]
@@ -583,7 +583,7 @@ class PathInterpolator:
     @staticmethod
     def _rotation_vector_to_matrix(rot_vec: Tensor) -> Tensor:
         """
-        Exp map: so(3) -> SO(3) (Batch version)
+        指数映射（exp map）：so(3) -> SO(3)（batch 版本）
         """
 
         angle = torch.norm(rot_vec, dim=-1, keepdim=True)

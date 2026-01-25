@@ -15,3 +15,8 @@ wheels/
 !data/.gitkeep
 logs/
 outputs/
+
+# IDE files
+.idea/
+.vscode/
+.trae/

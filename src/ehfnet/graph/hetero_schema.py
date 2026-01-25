@@ -15,7 +15,7 @@ NODE_TYPES: list[str] = [
 ATOM_NODE_TYPES: list[str] = ["ligand_atom", "protein_atom"]
 
 
-# 阶段 1: 层级内信息更新 (Intra-level)
+# 阶段 1: 层级内信息更新（intra-level）
 INTRA_EDGES: list[tuple[str, str, str]] = [
     ("ligand_atom", "intra_proximity", "ligand_atom"),
     ("protein_atom", "intra_proximity", "protein_atom"),
@@ -23,7 +23,7 @@ INTRA_EDGES: list[tuple[str, str, str]] = [
 ]
 
 
-# 阶段 2: 自底向上聚合 (Bottom-up Aggregation)
+# 阶段 2: 自底向上聚合（bottom-up aggregation）
 AGGREGATE_EDGES: list[tuple[str, str, str]] = [
     ("ligand_atom", "aggregate_to", "ligand_molecule"),
     ("protein_atom", "aggregate_to", "protein_residue"),
@@ -31,7 +31,7 @@ AGGREGATE_EDGES: list[tuple[str, str, str]] = [
 ]
 
 
-# 阶段 3: 跨图交互 (Inter-graph Interaction / Docking)
+# 阶段 3: 跨图交互（inter-graph interaction / docking）
 INTER_EDGES: list[tuple[str, str, str]] = [
 
     # 1. 核心物理交互：原子-原子 (基于半径图)
@@ -52,7 +52,7 @@ INTER_EDGES: list[tuple[str, str, str]] = [
 ]
 
 
-# 阶段 4: 自顶向下广播 (Top-down Broadcast)
+# 阶段 4: 自顶向下广播（top-down broadcast）
 BROADCAST_EDGES: list[tuple[str, str, str]] = [
     ("ligand_molecule", "broadcast_to", "ligand_atom"),
     ("protein_pocket", "broadcast_to", "protein_residue"),

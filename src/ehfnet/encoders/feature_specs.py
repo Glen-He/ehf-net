@@ -103,7 +103,7 @@ LIGAND_MOLECULE_CONT_SCHEMA = [
 
 # --- 蛋白质特征 Schema ---
 PROTEIN_ATOM_CAT_SCHEMA = [
-    CatFeature("atomic_idx",                13, 16, "原子类型索引 (Element enum)"),
+    CatFeature("atomic_idx",                13, 16, "原子类型索引 (Element 枚举)"),
 ]
 
 
