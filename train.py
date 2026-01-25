@@ -1,7 +1,14 @@
+"""
+训练入口脚本
+
+该脚本用于解析命令行参数，配置日志记录，并启动 EHFNet 模型的训练过程。
+"""
+
 import argparse
 import os
 import sys
 import logging
+from datetime import datetime
 
 # 若从源码直接运行（未安装），将 src 加入 python path
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
@@ -12,8 +19,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train EHFNet for molecular docking prediction")
     
     # 数据相关参数
-    parser.add_argument("--data_root", type=str, required=True, help="Path to PDBBind dataset root directory")
-    parser.add_argument("--index_file", type=str, required=True, help="Path to index CSV or PDBBind index file")
+    parser.add_argument("--data_root", type=str, default="/pavo/glen/Code/EHFNet/data/processed/pdbbind", help="Path to PDBBind dataset root directory")
+    parser.add_argument("--index_file", type=str, default="/pavo/glen/Code/EHFNet/data/processed/pdbbind/index.csv", help="Path to index CSV or PDBBind index file")
     parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--esm_path", type=str, default=None, help="Path to precomputed ESM embeddings (optional)")
     
@@ -37,16 +44,25 @@ def main():
     args = parser.parse_args()
 
     # 配置 logging
+    # 将日志保存在 logs/train 目录下，并使用时间戳防止覆盖
+    log_dir = os.path.join("logs", "train")
+    os.makedirs(log_dir, exist_ok=True)
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = os.path.join(log_dir, f"train_{timestamp}.log")
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(os.path.join(args.save_dir, "train.log") if os.path.exists(args.save_dir) else "train.log")
+            logging.FileHandler(log_file, encoding='utf-8')
         ]
     )
     
-    # 创建保存目录（确保后续日志可写入指定目录；即使 Trainer 会创建，这里也先兜底）
+    logging.info(f"Logging to {log_file}")
+    
+    # 创建保存目录
     os.makedirs(args.save_dir, exist_ok=True)
 
     logger = logging.getLogger(__name__)

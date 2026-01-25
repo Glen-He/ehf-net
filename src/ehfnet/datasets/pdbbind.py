@@ -28,9 +28,8 @@ def load_index(index_file: str) -> pd.DataFrame:
     """
     加载数据索引文件。
 
-    支持两种格式：
-    - CSV：要求包含列 {"pdb_id", "affinity"}
-    - PDBBind INDEX：按行解析，读取第 0 列 pdb_id 与第 3 列 affinity
+    仅支持 CSV 格式：
+    - 必须包含列 {"pdb_id", "affinity"}
 
     Args:
         index_file: 索引文件路径
@@ -42,33 +41,16 @@ def load_index(index_file: str) -> pd.DataFrame:
     if not osp.exists(index_file):
         raise FileNotFoundError(f"Index file not found: {index_file}")
 
-    if index_file.endswith(".csv"):
-        df = pd.read_csv(index_file)
-        required_cols = {"pdb_id", "affinity"}
+    if not index_file.endswith(".csv"):
+        raise ValueError("Index file must be a CSV file.")
 
-        if not required_cols.issubset(df.columns):
-            raise ValueError(f"CSV must contain columns: {required_cols}")
+    df = pd.read_csv(index_file)
+    required_cols = {"pdb_id", "affinity"}
 
-        df["pdb_id"] = df["pdb_id"].astype(str).str.lower()
+    if not required_cols.issubset(df.columns):
+        raise ValueError(f"CSV must contain columns: {required_cols}")
 
-        return df
-
-    data: list[dict[str, str | float]] = []
-
-    with open(index_file, "r") as f:
-
-        for line in f:
-            line = line.strip()
-
-            if not line or line.startswith("#") or line.startswith("PDB"):
-                continue
-            parts = line.split()
-
-            if len(parts) >= 4:
-                data.append({"pdb_id": parts[0].lower(), "affinity": float(parts[3])})
-
-    df = pd.DataFrame(data)
-    logger.info(f"Loaded {len(df)} complexes from PDBBind INDEX format")
+    df["pdb_id"] = df["pdb_id"].astype(str).str.lower()
 
     return df
 
@@ -207,6 +189,10 @@ class PDBBindDataset(Dataset):
 
         super().__init__(root, transform, pre_transform, pre_filter)
         self._build_valid_index()
+
+    @property
+    def raw_dir(self) -> str:
+        return osp.join(self.root, "cleaned")
 
     @property
     def raw_file_names(self) -> list[str]:
