@@ -18,7 +18,7 @@ from rdkit.Chem import ChemicalFeatures, RDConfig
 
 from torch_geometric.data import Dataset, HeteroData
 
-from ehfnet.graph import GraphBuilder
+from ehfnet.graph import GraphBuilder, ESMEmbeddingFiller
 from ehfnet.datasets.prepare import prepare_graph, get_esm_model
 
 logger = logging.getLogger(__name__)
@@ -150,6 +150,7 @@ class PDBBindDataset(Dataset):
         max_neighbors_intra: int = 64,
         max_neighbors_inter: int = 32,
         force_reprocess: bool = False,
+        esm_dim: int = 960,
     ) -> None:
         """
         Args:
@@ -166,23 +167,42 @@ class PDBBindDataset(Dataset):
             max_neighbors_intra: 图内最大邻居数
             max_neighbors_inter: 跨图最大邻居数
             force_reprocess: 是否强制重建缓存
+            esm_dim: ESM embedding 维度
         """
+        
         self.index_file = index_file
         self.esm_root = esm_root
         self.esm = esm
         self.esm_model_name = esm_model_name
         self.force_reprocess = force_reprocess
+        self.esm_dim = esm_dim
 
         self.index_df = load_index(index_file)
 
+        # 强制指定 cleaned 目录
+        self.cleaned_dir = osp.join(root, "cleaned")
+
+        if not osp.exists(self.cleaned_dir):
+
+            # 兼容性检查：如果 cleaned 不存在但 root 下直接有数据，发出警告
+            if not self.index_df.empty:
+                first_pdb = self.index_df.iloc[0]["pdb_id"]
+
+                if osp.exists(osp.join(root, first_pdb)):
+                    logger.warning(f"Data found in {root}, but expected in {self.cleaned_dir}. Please move data to 'cleaned' subdirectory.")
+        
         fdef_path = osp.join(RDConfig.RDDataDir, "BaseFeatures.fdef")
         self.feature_factory = cast(Any, ChemicalFeatures).BuildFeatureFactory(fdef_path)
+
+        # 默认为 960 (ESMC 300M)，如果使用 ESM-3 请改为 1152
+        esm_filler = ESMEmbeddingFiller(embed_dim=self.esm_dim)
 
         self.graph_builder = GraphBuilder(
             r_cutoff_intra=r_cutoff_intra,
             r_cutoff_inter=r_cutoff_inter,
             max_neighbors_intra=max_neighbors_intra,
             max_neighbors_inter=max_neighbors_inter,
+            esm_filler=esm_filler,
         )
 
         self._esm_model = None
@@ -192,7 +212,7 @@ class PDBBindDataset(Dataset):
 
     @property
     def raw_dir(self) -> str:
-        return osp.join(self.root, "cleaned")
+        return self.cleaned_dir
 
     @property
     def raw_file_names(self) -> list[str]:

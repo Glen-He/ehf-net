@@ -12,39 +12,39 @@ EHFNet 是一个基于**流匹配 (Flow Matching)** 和**等变图神经网络 (
 
 ## 🛠️ 安装
 
-本项目使用 `uv` 进行依赖管理（也可以使用 pip）。
+本项目**仅支持**使用 [uv](https://github.com/astral-sh/uv) 进行高效的依赖管理。
 
 ### 前置要求
 - Python >= 3.12
 - CUDA (推荐用于加速训练)
+- `uv` 包管理器
 
 ### 安装步骤
 
-1. **克隆仓库**:
+1. **安装 uv** (如果尚未安装):
+   ```bash
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+
+2. **克隆仓库**:
    ```bash
    git clone https://github.com/your-username/ehfnet.git
    cd ehfnet
    ```
 
-2. **安装依赖**:
-   如果使用 `uv`:
+3. **同步环境与依赖**:
    ```bash
    uv sync
-   ```
-   
-   或者使用 `pip`:
-   ```bash
-   pip install -r requirements.txt
-   # 注意: 可能需要手动安装 PyTorch 和 PyG 的对应 CUDA 版本
    ```
 
 ## 📂 数据准备
 
-训练数据需遵循 **PDBBind** 格式结构。请确保您的数据目录 (`data_root`) 结构如下：
+训练数据需存放在 `data_root` 下的 `cleaned` 文件夹中。
 
+**目录结构要求**：
 ```text
 data_root/
-├── raw/                          # 必须包含 raw 子目录
+├── cleaned/                      # 必须命名为 cleaned
 │   ├── 1a2b/                     # 每个 PDB ID 一个文件夹
 │   │   ├── 1a2b_ligand.sdf       # 配体文件 (支持 .sdf 或 .mol2)
 │   │   ├── 1a2b_protein.pdb      # 蛋白文件
@@ -52,26 +52,19 @@ data_root/
 │   ├── 3c4d/
 │   │   ├── ...
 │   └── ...
+├── index.csv                     # 索引文件 (建议放在 data_root 下)
 └── processed/                    # 程序会自动生成此目录用于缓存
 ```
 
 ### 索引文件 (Index File)
-您需要提供一个索引文件来指定训练样本。支持两种格式：
+您需要提供一个索引文件来指定训练样本。仅支持 **CSV 格式**：
+必须包含 `pdb_id` 和 `affinity` 两列。
 
-1. **CSV 格式** (推荐):
-   必须包含 `pdb_id` 和 `affinity` 两列。
-   ```csv
-   pdb_id,affinity
-   1a2b,6.5
-   3c4d,7.2
-   ```
-
-2. **PDBBind INDEX 格式**:
-   以空格分隔，第 1 列为 PDB ID，第 4 列为亲和力值 (pKd/pKi)。
-   ```text
-   1a2b  2018  1.23  6.50  ...
-   3c4d  2018  2.34  7.20  ...
-   ```
+```csv
+pdb_id,affinity
+1a2b,6.5
+3c4d,7.2
+```
 
 ## 🚀 训练
 
@@ -80,9 +73,9 @@ data_root/
 ### 基本用法
 
 ```bash
-python train.py \
+uv run python train.py \
     --data_root /path/to/data \
-    --index_file /path/to/index.csv \
+    --index_file /path/to/data/index.csv \
     --save_dir ./checkpoints
 ```
 
@@ -90,26 +83,26 @@ python train.py \
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--data_root` | 必填 | 数据集根目录 (需包含 `raw` 子文件夹) |
-| `--index_file` | 必填 | 索引文件路径 |
+| `--data_root` | 必填 | 数据集根目录 (需包含 `cleaned` 子文件夹) |
+| `--index_file` | 必填 | 索引文件路径 (CSV格式) |
 | `--save_dir` | `./checkpoints` | 模型检查点和日志保存目录 |
 | `--batch_size` | 8 | 批次大小 |
 | `--epochs` | 100 | 训练轮数 |
 | `--lr` | 1e-4 | 学习率 |
 | `--esm_path` | None | (可选) 全局 ESM embedding 存储路径 |
+| `--esm_dim` | 960 | ESM embedding 维度 (默认为 960) |
 | `--num_gnn_blocks` | 6 | GNN 层数 |
+| `--device` | `auto` | 指定训练设备 (如 `cuda:0`, `cuda:1`, `cpu`) |
 
 ### 示例：使用 ESM 特征训练
 
-如果您有预计算的 ESM 特征库：
-
 ```bash
-python train.py \
-    --data_root ./data/pdbbind \
-    --index_file ./data/index/general_PL.2020 \
-    --esm_path ./data/esm_embeddings \
+uv run python train.py \
+    --data_root ./data \
+    --index_file ./data/index.csv \
+    --esm_dim 960 \
     --batch_size 16 \
-    --hidden_dim 256
+    --device cuda:0
 ```
 
 ## 📊 输出与日志

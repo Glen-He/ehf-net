@@ -39,7 +39,9 @@ def train(
     lig_atom_cont_count: int = 9,
     lig_mol_cont_count: int = 9,
     pro_atom_cont_count: int = 5,
-    pro_res_cont_count: int = 1166,     # 14 (torsion) + 1152 (ESM)
+    pro_res_cont_count: int = 974,     # 14 (torsion) + 960 (ESM)
+    esm_dim: int = 960,
+    device: str | torch.device = "auto",
 ):
     """
     训练 EHFNet 模型
@@ -60,10 +62,16 @@ def train(
         lig_mol_cont_count: 配体分子连续特征数量
         pro_atom_cont_count: 蛋白原子连续特征数量
         pro_res_cont_count: 蛋白残基连续特征数量
+        esm_dim: ESM embedding 维度
+        device: 训练设备 ("cpu", "cuda", "cuda:0", "cuda:1" 等)，默认为 "auto" (自动检测)
     """
 
     # 1. 准备环境
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device(device)
+        
     os.makedirs(save_dir, exist_ok=True)
     logger.info(f"Using device: {device}")
 
@@ -84,6 +92,7 @@ def train(
         index_file=index_file,
         esm_root=esm_path,
         esm="auto",
+        esm_dim=esm_dim,
     )
 
     # 简单的划分（实际项目中建议按 scaffold 划分）

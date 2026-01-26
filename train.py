@@ -39,9 +39,14 @@ def main():
     parser.add_argument("--lig_atom_cont_count", type=int, default=9, help="Ligand atom continuous feature count")
     parser.add_argument("--lig_mol_cont_count", type=int, default=9, help="Ligand molecule continuous feature count")
     parser.add_argument("--pro_atom_cont_count", type=int, default=5, help="Protein atom continuous feature count")
-    parser.add_argument("--pro_res_cont_count", type=int, default=1166, help="Protein residue continuous feature count (14 torsion + 1152 ESM)")
+    parser.add_argument("--esm_dim", type=int, default=960, help="ESM embedding dimension (default: 960 for ESMC-300M)")
+    parser.add_argument("--device", type=str, default="auto", help="Device to use for training (e.g., 'cuda:0', 'cuda:1', 'cpu')")
+    # parser.add_argument("--pro_res_cont_count", type=int, default=974, help="Protein residue continuous feature count (14 torsion + 960 ESM)")
 
     args = parser.parse_args()
+    
+    # 动态计算 pro_res_cont_count: 14 (扭转角) + esm_dim
+    args.pro_res_cont_count = 14 + args.esm_dim
 
     # 配置 logging
     # 将日志保存在 logs/train 目录下，并使用时间戳防止覆盖
@@ -85,6 +90,8 @@ def main():
             lig_mol_cont_count=args.lig_mol_cont_count,
             pro_atom_cont_count=args.pro_atom_cont_count,
             pro_res_cont_count=args.pro_res_cont_count,
+            esm_dim=args.esm_dim,
+            device=args.device,
         )
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)
