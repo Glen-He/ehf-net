@@ -11,7 +11,8 @@ from typing import Any, cast
 from torch import Tensor
 from torch_geometric.data import HeteroData
 from torch_geometric.nn import radius, radius_graph
-
+from ehfnet.encoders.ligand_encoder import LigandEncodingResult
+from ehfnet.encoders.protein_encoder import ProteinEncodingResult
 from ehfnet.encoders.feature_specs import (
     LIGAND_ATOM_CAT_SCHEMA,
     LIGAND_ATOM_CONT_SCHEMA,
@@ -27,6 +28,7 @@ from ehfnet.graph.hetero_schema import (
     INTER_EDGES,
     BROADCAST_EDGES,
 )
+from ehfnet.graph.collate import GraphCollator
 
 
 class ESMEmbeddingFiller:
@@ -142,13 +144,13 @@ class GraphBuilder:
         self.esm_filler = esm_filler or ESMEmbeddingFiller()
 
 
-    def build(self, ligand_data: dict[str, Any], protein_data: dict[str, Any]) -> HeteroData:
+    def build(self, ligand_data: LigandEncodingResult, protein_data: ProteinEncodingResult) -> HeteroData:
         """
         构建单个样本的异构图。
 
         Args:
-            ligand_data: 配体编码结果字典
-            protein_data: 蛋白编码结果字典
+            ligand_data: 配体编码结果
+            protein_data: 蛋白编码结果
 
         Returns:
             PyG HeteroData 对象
@@ -172,13 +174,13 @@ class GraphBuilder:
         return data
 
 
-    def _add_ligand_atoms(self, data: HeteroData, ligand_data: dict[str, Any]) -> HeteroData:
+    def _add_ligand_atoms(self, data: HeteroData, ligand_data: LigandEncodingResult) -> HeteroData:
         """
         构建配体原子节点特征与坐标。
 
         Args:
             data: 待填充的 HeteroData
-            ligand_data: 配体编码结果字典
+            ligand_data: 配体编码结果
 
         Returns:
             更新后的 HeteroData
@@ -210,13 +212,13 @@ class GraphBuilder:
         return data
 
 
-    def _add_ligand_molecule(self, data: HeteroData, ligand_data: dict[str, Any]) -> HeteroData:
+    def _add_ligand_molecule(self, data: HeteroData, ligand_data: LigandEncodingResult) -> HeteroData:
         """
         构建配体分子全局节点特征。
 
         Args:
             data: 待填充的 HeteroData
-            ligand_data: 配体编码结果字典
+            ligand_data: 配体编码结果
 
         Returns:
             更新后的 HeteroData
@@ -234,13 +236,13 @@ class GraphBuilder:
         return data
 
 
-    def _add_protein_atoms(self, data: HeteroData, protein_data: dict[str, Any]) -> HeteroData:
+    def _add_protein_atoms(self, data: HeteroData, protein_data: ProteinEncodingResult) -> HeteroData:
         """
         构建蛋白原子节点特征与坐标，并附加 atom->residue 映射索引。
 
         Args:
             data: 待填充的 HeteroData
-            protein_data: 蛋白编码结果字典
+            protein_data: 蛋白编码结果
 
         Returns:
             更新后的 HeteroData
@@ -272,13 +274,13 @@ class GraphBuilder:
         return data
 
 
-    def _add_protein_residues(self, data: HeteroData, protein_data: dict[str, Any]) -> HeteroData:
+    def _add_protein_residues(self, data: HeteroData, protein_data: ProteinEncodingResult) -> HeteroData:
         """
         构建蛋白残基节点特征与坐标，并附加辅助 mask（结构恢复/损失计算）。
 
         Args:
             data: 待填充的 HeteroData
-            protein_data: 蛋白编码结果字典
+            protein_data: 蛋白编码结果
 
         Returns:
             更新后的 HeteroData
@@ -326,7 +328,7 @@ class GraphBuilder:
         return data
 
 
-    def _add_protein_pocket(self, data: HeteroData, _protein_data: dict[str, Any]) -> HeteroData:
+    def _add_protein_pocket(self, data: HeteroData, _protein_data: ProteinEncodingResult) -> HeteroData:
         """
         构建蛋白 pocket 全局节点特征。
 
@@ -334,7 +336,7 @@ class GraphBuilder:
 
         Args:
             data: 待填充的 HeteroData
-            _protein_data: 蛋白编码结果字典（目前不直接使用，但保留以便后续扩展）
+            _protein_data: 蛋白编码结果（目前不直接使用，但保留以便后续扩展）
 
         Returns:
             更新后的 HeteroData
@@ -473,7 +475,8 @@ class GraphBuilder:
         processed_edges: set[tuple[str, str, str]] = set()
 
         for src, rel, dst in INTER_EDGES:
-            edge_key = (rel, *sorted([src, dst]))
+            sorted_nodes = sorted([src, dst])
+            edge_key = (rel, sorted_nodes[0], sorted_nodes[1])
 
             if edge_key in processed_edges:
                 continue
@@ -561,13 +564,13 @@ class GraphBuilder:
         return data
 
 
-    def _add_torsion_constraints(self, data: HeteroData, ligand_data: dict[str, Any]) -> HeteroData:
+    def _add_torsion_constraints(self, data: HeteroData, ligand_data: LigandEncodingResult) -> HeteroData:
         """
         向 HeteroData 注入配体扭转约束信息。
 
         Args:
             data: HeteroData
-            ligand_data: 配体编码结果字典（可包含 torsion_indices/torsion_masks）
+            ligand_data: 配体编码结果（可包含 torsion_indices/torsion_masks）
 
         Returns:
             更新后的 HeteroData
@@ -655,7 +658,7 @@ def create_graph_tools(
     max_neighbors_intra: int = 64,
     max_neighbors_inter: int = 32,
     esm_fill_strategy: str = "zeros",
-) -> tuple[GraphBuilder, "GraphCollator"]:
+) -> tuple[GraphBuilder, GraphCollator]:
     """
     创建 GraphBuilder 与 GraphCollator。
 
@@ -669,9 +672,6 @@ def create_graph_tools(
     Returns:
         (builder, collator)
     """
-    
-    # 局部导入避免循环依赖
-    from ehfnet.graph.collate import GraphCollator
 
     esm_filler = ESMEmbeddingFiller(embed_dim=1152, fill_strategy=esm_fill_strategy)
     builder = GraphBuilder(

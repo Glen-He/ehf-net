@@ -107,7 +107,7 @@ uv run python train.py \
 
 ## 📊 输出与日志
 
-- **日志**: 训练日志将同时输出到终端和 `save_dir/train.log`。
+- **日志**: 训练日志将同时输出到终端和 `logs/train/train_{timestamp}.log`。
 - **模型**: 验证集损失最低的模型将保存为 `save_dir/best_model.pt`。
 - **监控**: 进度条会实时显示 Loss 及其分量 (平移、旋转、扭转、能量)。
 

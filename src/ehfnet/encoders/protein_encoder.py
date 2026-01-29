@@ -241,6 +241,8 @@ class ProteinEncoder:
         *,
         esm_embeddings: dict[int, np.ndarray] | None = None,
         esm_embedding_file: str | Path | None = None,
+        pocket_radius: float | None = None,
+        ligand_positions: np.ndarray | None = None,
     ) -> ProteinEncodingResult:
         """
         编码蛋白质结构
@@ -249,21 +251,35 @@ class ProteinEncoder:
             universe: MDAnalysis Universe 对象
             esm_embeddings: 预计算的 ESM 嵌入字典 {residue_index: embedding}
             esm_embedding_file: ESM 嵌入文件路径（.npz 格式）
+            pocket_radius: 口袋提取半径 (Å)。如果提供，则仅保留该半径内的残基。
+            ligand_positions: 配体原子坐标 [L, 3]，用于确定口袋中心。
 
         Returns:
             编码结果字典
-
-        Raises:
-            ValueError: Universe 不包含蛋白质原子
-
-        Notes:
-            如果同时提供 esm_embeddings 和 esm_embedding_file，优先使用 esm_embeddings
         """
 
         protein_atoms = universe.select_atoms("protein")
 
         if len(protein_atoms) == 0:
             raise ValueError("Universe contains no protein atoms")
+
+        # 口袋提取逻辑
+        if pocket_radius is not None and ligand_positions is not None:
+            # 手动筛选残基，以保证 Residue-level 的完整性
+            dist_sq = np.min(
+                np.sum((protein_atoms.positions[:, None, :] - np.array(ligand_positions)[None, :, :])**2, axis=-1),
+                axis=1
+            )
+            mask = dist_sq <= (pocket_radius**2)
+            
+            # 获取满足条件的原子所属的所有残基
+            valid_residues = protein_atoms[mask].residues
+            
+            if len(valid_residues) == 0:
+                logger.warning(f"No residues found within {pocket_radius}A of ligand. Falling back to full protein.")
+            else:
+                protein_atoms = valid_residues.atoms
+                logger.info(f"Extracted pocket with {len(valid_residues)} residues within {pocket_radius}A.")
 
         all_atoms = sorted(protein_atoms.atoms, key=lambda a: a.ix)
         all_residues = sorted(list(protein_atoms.residues), key=lambda r: r.ix)

@@ -151,6 +151,7 @@ class PDBBindDataset(Dataset):
         max_neighbors_inter: int = 32,
         force_reprocess: bool = False,
         esm_dim: int = 960,
+        pocket_radius: float | None = 20.0,
     ) -> None:
         """
         Args:
@@ -168,14 +169,15 @@ class PDBBindDataset(Dataset):
             max_neighbors_inter: 跨图最大邻居数
             force_reprocess: 是否强制重建缓存
             esm_dim: ESM embedding 维度
+            pocket_radius: 口袋提取半径 (Å)。设为 None 则不进行裁剪。
         """
-        
         self.index_file = index_file
         self.esm_root = esm_root
         self.esm = esm
         self.esm_model_name = esm_model_name
         self.force_reprocess = force_reprocess
         self.esm_dim = esm_dim
+        self.pocket_radius = pocket_radius
 
         self.index_df = load_index(index_file)
 
@@ -310,18 +312,19 @@ class PDBBindDataset(Dataset):
             self._esm_model = get_esm_model(model_name=self.esm_model_name)
 
         data = prepare_graph(
-            pdb_id=pdb_id,
-            ligand_path=lig,
-            protein_path=pro,
-            affinity=affinity,
-            feature_factory=self.feature_factory,
-            graph_builder=self.graph_builder,
-            esm_cache_path=esm_cache_path,
-            esm_cache_write_path=esm_cache_write_path,
-            esm=self.esm,
-            esm_model=self._esm_model,
-            esm_model_name=self.esm_model_name,
-        )
+                    pdb_id=pdb_id,
+                    ligand_path=lig,
+                    protein_path=pro,
+                    affinity=affinity,
+                    feature_factory=self.feature_factory,
+                    graph_builder=self.graph_builder,
+                    esm_cache_path=esm_cache_path,
+                    esm_cache_write_path=esm_cache_write_path,
+                    esm=self.esm,
+                    esm_model=self._esm_model,
+                    esm_model_name=self.esm_model_name,
+                    pocket_radius=self.pocket_radius,
+                )
 
         return data
 

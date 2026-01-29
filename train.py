@@ -41,6 +41,7 @@ def main():
     parser.add_argument("--pro_atom_cont_count", type=int, default=5, help="Protein atom continuous feature count")
     parser.add_argument("--esm_dim", type=int, default=960, help="ESM embedding dimension (default: 960 for ESMC-300M)")
     parser.add_argument("--device", type=str, default="auto", help="Device to use for training (e.g., 'cuda:0', 'cuda:1', 'cpu')")
+    parser.add_argument("--pocket_radius", type=float, default=20.0, help="Radius (A) for protein pocket extraction (default: 20.0)")
     # parser.add_argument("--pro_res_cont_count", type=int, default=974, help="Protein residue continuous feature count (14 torsion + 960 ESM)")
 
     args = parser.parse_args()
@@ -92,6 +93,7 @@ def main():
             pro_res_cont_count=args.pro_res_cont_count,
             esm_dim=args.esm_dim,
             device=args.device,
+            pocket_radius=args.pocket_radius,
         )
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)

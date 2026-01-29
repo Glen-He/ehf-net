@@ -46,10 +46,10 @@ class FlowMatchingLoss(nn.Module):
         # 可学习的对数方差 s = log(sigma^2)，初始化为 0（即初始权重=1）
         self.log_vars = nn.ParameterDict(
             {
-                "trans": nn.Parameter(torch.zeros(1)),
-                "rot": nn.Parameter(torch.zeros(1)),
-                "torsion": nn.Parameter(torch.zeros(1)),
-                "energy": nn.Parameter(torch.zeros(1)),
+                "trans": nn.Parameter(torch.zeros(())),
+                "rot": nn.Parameter(torch.zeros(())),
+                "torsion": nn.Parameter(torch.zeros(())),
+                "energy": nn.Parameter(torch.zeros(())),
             }
         )
 
@@ -130,10 +130,10 @@ class FlowMatchingLoss(nn.Module):
         if pred_torsion is not None and gt_torsion.numel() > 0:
 
             if pred_torsion.dim() == 1:
-                pred_torsion = pred_torsion.unsqueeze(-1)
+                pred_torsion = pred_torsion.view(-1, 1)
 
             if gt_torsion.dim() == 1:
-                gt_torsion = gt_torsion.unsqueeze(-1)
+                gt_torsion = gt_torsion.view(-1, 1)
 
             raw_loss_torsion = F.mse_loss(pred_torsion, gt_torsion)
 

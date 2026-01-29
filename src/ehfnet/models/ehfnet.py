@@ -136,7 +136,6 @@ class EHFNet(nn.Module):
         x_dict = ctx["x_dict"]
         pos_dict = ctx["pos_dict"]
         vel_dict = ctx["vel_dict"]
-        pos_initial = ctx["initial_ligand_pos"]
 
         # 2. 从 encoder 获取粗略速度 v_coarse（EGNN 隐式速度）
         v_coarse = vel_dict["ligand_atom"]
@@ -193,7 +192,7 @@ class EHFNet(nn.Module):
         )
 
         if v_torsion is not None and v_torsion.numel() > 0:
-            v_torsion = v_torsion.unsqueeze(-1)
+            v_torsion = v_torsion.view(-1, 1)
             
         else:
             v_torsion = None

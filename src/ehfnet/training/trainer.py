@@ -42,6 +42,7 @@ def train(
     pro_res_cont_count: int = 974,     # 14 (torsion) + 960 (ESM)
     esm_dim: int = 960,
     device: str | torch.device = "auto",
+    pocket_radius: float | None = 20.0,
 ):
     """
     训练 EHFNet 模型
@@ -64,6 +65,7 @@ def train(
         pro_res_cont_count: 蛋白残基连续特征数量
         esm_dim: ESM embedding 维度
         device: 训练设备 ("cpu", "cuda", "cuda:0", "cuda:1" 等)，默认为 "auto" (自动检测)
+        pocket_radius: 口袋提取半径 (Å)
     """
 
     # 1. 准备环境
@@ -93,6 +95,7 @@ def train(
         esm_root=esm_path,
         esm="auto",
         esm_dim=esm_dim,
+        pocket_radius=pocket_radius,
     )
 
     # 简单的划分（实际项目中建议按 scaffold 划分）
@@ -166,11 +169,12 @@ def train(
             optimizer.zero_grad()
 
             # 流匹配训练步骤
-            x_1 = batch["ligand_atom"].pos
-
-            t, x_t, v_target = matcher.sample_location_and_target(
-                x_1=x_1, data=batch, x_0=None
-            )
+            # 生成训练目标不需要梯度
+            with torch.no_grad():
+                x_1 = batch["ligand_atom"].pos
+                t, x_t, v_target = matcher.sample_location_and_target(
+                    x_1=x_1, data=batch, x_0=None
+                )
 
             batch["ligand_atom"].pos = x_t
 

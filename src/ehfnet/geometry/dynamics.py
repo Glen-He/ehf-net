@@ -94,13 +94,16 @@ class VelocityDecomposer:
         total_dofs = 6 * B + T
 
         # 1. 预计算质心（质量加权）
+        # 注意：在分解速度时，我们将坐标视为常数，只对速度求导
+        # 这可以极大地提高数值稳定性，避免 SVD/Solve 在反向传播时的梯度爆炸
+        pos_const = pos.detach()
         if masses.dim() == 1:
             masses = masses.unsqueeze(-1)
 
         mass_per_mol = scatter_sum(masses, batch, dim=0, dim_size=B)
         mass_per_mol = torch.clamp(mass_per_mol, min=self.eps)
-        com = scatter_sum(pos * masses, batch, dim=0, dim_size=B) / mass_per_mol
-        r_rel = pos - com[batch]
+        com = scatter_sum(pos_const * masses, batch, dim=0, dim_size=B) / mass_per_mol
+        r_rel = pos_const - com[batch]
 
         # 2. 构建线性方程组 Ax = v
         A = torch.zeros((N * 3, total_dofs), device=device, dtype=dtype)
@@ -109,40 +112,41 @@ class VelocityDecomposer:
         for b in range(B):
             mask = batch == b
             idx_rows = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+            n_atoms_b = idx_rows.numel()
 
-            if idx_rows.numel() == 0:
+            if n_atoms_b == 0:
                 continue
 
-            # 平移：Identity
+            # 平移：恒等矩阵块
             for k in range(3):
                 A[idx_rows * 3 + k, 6 * b + k] = 1.0
 
-            # 旋转：r 的反对称矩阵
-            r = r_rel[idx_rows]
-            n_atoms = r.shape[0]
-            cross_mat = torch.zeros((n_atoms, 3, 3), device=device, dtype=dtype)
-            cross_mat[:, 0, 1] = -r[:, 2]
-            cross_mat[:, 0, 2] = r[:, 1]
-            cross_mat[:, 1, 0] = r[:, 2]
-            cross_mat[:, 1, 2] = -r[:, 0]
-            cross_mat[:, 2, 0] = -r[:, 1]
-            cross_mat[:, 2, 1] = r[:, 0]
+            # 旋转：只有当原子数 >= 2 时旋转才有意义
+            if n_atoms_b >= 2:
+                r = r_rel[idx_rows]
+                cross_mat = torch.zeros((n_atoms_b, 3, 3), device=device, dtype=dtype)
+                cross_mat[:, 0, 1] = -r[:, 2]
+                cross_mat[:, 0, 2] = r[:, 1]
+                cross_mat[:, 1, 0] = r[:, 2]
+                cross_mat[:, 1, 2] = -r[:, 0]
+                cross_mat[:, 2, 0] = -r[:, 1]
+                cross_mat[:, 2, 1] = r[:, 0]
 
-            row_indices = (
-                idx_rows.unsqueeze(1) * 3 + torch.arange(3, device=device).unsqueeze(0)
-            ).view(-1)
-            A[row_indices, 6 * b + 3 : 6 * b + 6] = cross_mat.view(-1, 3)
+                row_indices = (
+                    idx_rows.unsqueeze(1) * 3 + torch.arange(3, device=device).unsqueeze(0)
+                ).view(-1)
+                A[row_indices, 6 * b + 3 : 6 * b + 6] = cross_mat.view(-1, 3)
 
         # 2.2 填充扭转基
         if T > 0:
-            u = pos[torsion_indices[:, 1]]
-            v = pos[torsion_indices[:, 2]]
+            u = pos_const[torsion_indices[:, 1]]
+            v = pos_const[torsion_indices[:, 2]]
             axis = F.normalize(v - u, dim=-1, eps=self.eps)
 
             t_idx, n_idx = torsion_moving_mask.nonzero(as_tuple=True)
 
             if t_idx.numel() > 0:
-                r_rot = pos[n_idx] - u[t_idx]
+                r_rot = pos_const[n_idx] - u[t_idx]
                 axis_vec = axis[t_idx]
                 vel_tor = torch.cross(axis_vec, r_rot, dim=-1)  # v = w x r
 
@@ -150,33 +154,32 @@ class VelocityDecomposer:
                 for k in range(3):
                     A[n_idx * 3 + k, col_indices] = vel_tor[:, k]
 
-        # 3. 求解 Ax = b（使用阻尼最小二乘法）
+        # 3. 求解 Ax = b
         b_vec = vel.view(-1)  # [3N]
 
-        # 计算 A.T @ A 和 A.T @ b
-        AT = A.T
-        ATA = torch.matmul(AT, A)
-        ATb = torch.matmul(AT, b_vec)
-
-        # 添加 Tikhonov 正则化（阻尼项）
-        diag_indices = torch.arange(total_dofs, device=device)
-        ATA[diag_indices, diag_indices] += PhysicsConstants.DAMPING_FACTOR
+        # 为了数值稳定性，将计算移至 CPU 并使用更高精度
+        # 采用正规方程 (ATA + damping)x = ATb 求解，这在 CPU 上非常稳定且快速
+        A_cpu = A.to("cpu", dtype=torch.float64)
+        b_cpu = b_vec.to("cpu", dtype=torch.float64)
 
         try:
-            # 使用 Cholesky 分解求解（比 inv 更快更稳）
-            L = torch.linalg.cholesky(ATA)
-            solution = torch.cholesky_solve(ATb.unsqueeze(-1), L).squeeze(-1)
-
-        except RuntimeError:
-
-            # 回退到鲁棒的 solve
-            try:
-                solution = torch.linalg.solve(ATA, ATb)
-
-            except RuntimeError:
-                # 最后的兜底：全零
-                logger.warning("Failed to decompose velocity, returning zeros")
-                solution = torch.zeros(total_dofs, device=device, dtype=dtype)
+            ATA_cpu = A_cpu.T @ A_cpu
+            ATb_cpu = A_cpu.T @ b_cpu
+            
+            # 添加阻尼项
+            diag_indices = torch.arange(total_dofs, device="cpu")
+            ATA_cpu[diag_indices, diag_indices] += PhysicsConstants.DAMPING_FACTOR
+            
+            # 求解
+            solution_cpu = torch.linalg.solve(ATA_cpu, ATb_cpu)
+            solution = solution_cpu.to(device, dtype=dtype)
+            
+        except Exception as e:
+            logger.warning(
+                f"DECOMPOSE FAILED: B={B}, T={T}, N={N}. "
+                f"Error: {e}. Returning zeros."
+            )
+            solution = torch.zeros(total_dofs, device=device, dtype=dtype)
 
         # 4. 拆解结果
         rigid_sol = solution[: 6 * B].view(B, 6)
@@ -238,9 +241,6 @@ class PoseUpdater:
         Returns:
             更新后的坐标 [N, 3]
         """
-
-        device = pos.device
-        dtype = pos.dtype
 
         if masses.dim() == 1:
             masses = masses.unsqueeze(-1)
@@ -336,8 +336,8 @@ class PoseUpdater:
         row2 = torch.stack([-axis[1], axis[0], zero])
         K = torch.stack([row0, row1, row2])
 
-        I = torch.eye(3, device=axis.device, dtype=axis.dtype)
-        return I + torch.sin(angle) * K + (1.0 - torch.cos(angle)) * torch.matmul(K, K)
+        identity_mat = torch.eye(3, device=axis.device, dtype=axis.dtype)
+        return identity_mat + torch.sin(angle) * K + (1.0 - torch.cos(angle)) * torch.matmul(K, K)
 
 
 class PathInterpolator:
@@ -354,6 +354,7 @@ class PathInterpolator:
         """
 
         self.eps = eps
+
 
     def compute_path_parameters(
         self,
@@ -409,16 +410,25 @@ class PathInterpolator:
                 continue
 
             # 质量加权的协方差矩阵
-            P = pos_0_centered[mask_b]  # [N_b, 3]
-            Q = pos_1_centered[mask_b]  # [N_b, 3]
-            w = masses[mask_b]  # [N_b, 1]
+            P = pos_0_centered[mask_b]      # [N_b, 3]
+            Q = pos_1_centered[mask_b]      # [N_b, 3]
+            w = masses[mask_b]              # [N_b, 1]
             
             # H = P^T @ W @ Q
-            H = torch.matmul(P.T, w * Q)  # [3, 3]
+            H = torch.matmul(P.T, w * Q)    # [3, 3]
             
+            # 检查 H 是否有效（防止 N_b=1 或坐标异常导致的 NaN/Zero）
+            if not torch.isfinite(H).all() or torch.norm(H) < self.eps:
+                R[b] = torch.eye(3, device=device, dtype=dtype)
+                continue
+
             try:
-                # SVD 分解：H = U @ S @ V^T
-                U, S, Vh = torch.linalg.svd(H)
+                # 在 CPU 上执行 SVD，CPU 驱动程序 (Lapack) 通常比 GPU (cuSolver) 更稳健
+                H_cpu = H.to("cpu", dtype=torch.float64)
+                U_cpu, S_cpu, Vh_cpu = torch.linalg.svd(H_cpu)
+                
+                U = U_cpu.to(device, dtype=dtype)
+                Vh = Vh_cpu.to(device, dtype=dtype)
                 
                 # 计算旋转矩阵：R = V @ U^T
                 R_b = torch.matmul(Vh.T, U.T)
@@ -431,9 +441,9 @@ class PathInterpolator:
                 
                 R[b] = R_b
 
-            except RuntimeError:
+            except Exception as e:
                 # SVD 失败时使用单位矩阵
-                logger.warning(f"SVD failed for batch {b}, using identity matrix")
+                logger.warning(f"SVD failed for batch {b}: {e}, using identity matrix")
                 R[b] = torch.eye(3, device=device, dtype=dtype)
 
         # 3. 计算扭转角差异
@@ -490,6 +500,7 @@ class PathInterpolator:
 
         return pos_t, (pos_next - pos_t) / dt
 
+
     def _compute_pose_at_t(self, params: dict[str, Any], t: Tensor) -> Tensor:
         """
         计算 t 时刻的位姿
@@ -501,8 +512,8 @@ class PathInterpolator:
         com_t = params["com_0"] + t * params["delta_trans"]
 
         # 2. 插值旋转（轴角线性插值）
-        rot_vec = self._matrix_to_axis_angle(params["R_total"])  # [B, 3]
-        R_t = self._rotation_vector_to_matrix(rot_vec * t)  # [B, 3, 3]
+        rot_vec = self._matrix_to_axis_angle(params["R_total"])     # [B, 3]
+        R_t = self._rotation_vector_to_matrix(rot_vec * t)          # [B, 3, 3]
 
         # 3. 应用刚体 + 扭转
         pos_torsioned = params["pos_0_centered"].clone()
@@ -532,9 +543,7 @@ class PathInterpolator:
 
 
     @staticmethod
-    def _calc_dihedrals(
-        pos: Tensor, idx0: Tensor, idx1: Tensor, idx2: Tensor, idx3: Tensor
-    ) -> Tensor:
+    def _calc_dihedrals(pos: Tensor, idx0: Tensor, idx1: Tensor, idx2: Tensor, idx3: Tensor) -> Tensor:
         """
         计算二面角
         """
@@ -599,9 +608,9 @@ class PathInterpolator:
         K[:, 2, 0] = -axis[:, 1]
         K[:, 2, 1] = axis[:, 0]
 
-        I = torch.eye(3, device=rot_vec.device, dtype=rot_vec.dtype).unsqueeze(0)
+        identity_mat = torch.eye(3, device=rot_vec.device, dtype=rot_vec.dtype).unsqueeze(0)
         R = (
-            I
+            identity_mat
             + torch.sin(angle).unsqueeze(2) * K
             + (1 - torch.cos(angle)).unsqueeze(2) * torch.matmul(K, K)
         )

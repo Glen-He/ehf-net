@@ -7,7 +7,7 @@
 import logging
 import numpy as np
 
-from typing import Any, TypedDict
+from typing import TypedDict, Callable
 from rdkit import Chem
 from rdkit.Chem import (
     rdMolDescriptors,
@@ -32,6 +32,12 @@ from ehfnet.geometry.static import get_moving_atoms
 logger = logging.getLogger(__name__)
 
 _LIGAND_CAT_MAX: dict[str, int] = {f.name: f.num_embeddings - 1 for f in LIGAND_ATOM_CAT_SCHEMA}
+
+# 为缺失类型提示的 RDKit 函数创建类型安全的包装器
+_calc_mol_wt: Callable[[Chem.Mol], float] = getattr(Descriptors, "MolWt")
+_calc_tpsa: Callable[[Chem.Mol], float] = getattr(Descriptors, "TPSA")
+_calc_logp: Callable[[Chem.Mol], float] = getattr(Crippen, "MolLogP")
+_calc_molar_refractivity: Callable[[Chem.Mol], float] = getattr(Crippen, "MolMR")
 
 
 class LigandEncodingResult(TypedDict):
@@ -480,11 +486,11 @@ class LigandEncoder:
         # 计算分子特征
         mol_data = {f.name: 0.0 for f in LIGAND_MOLECULE_CONT_SCHEMA}
 
-        mol_data["wt"] = Descriptors.MolWt(mol)
-        mol_data["tpsa"] = Descriptors.TPSA(mol)
-        mol_data["logp"] = Crippen.MolLogP(mol)
+        mol_data["wt"] = _calc_mol_wt(mol)
+        mol_data["tpsa"] = _calc_tpsa(mol)
+        mol_data["logp"] = _calc_logp(mol)
         mol_data["qed"] = QED.qed(mol)
-        mol_data["molar_refractivity"] = Crippen.MolMR(mol)
+        mol_data["molar_refractivity"] = _calc_molar_refractivity(mol)
 
         mol_data["hallKier_alpha"] = rdMolDescriptors.CalcHallKierAlpha(mol)
         mol_data["kappa2"] = rdMolDescriptors.CalcKappa2(mol)
