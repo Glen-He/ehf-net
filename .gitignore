@@ -16,6 +16,7 @@ wheels/
 logs/
 outputs/
 nohup.out
+checkpoints/
 
 # IDE files
 .idea/
