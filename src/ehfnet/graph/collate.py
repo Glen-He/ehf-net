@@ -75,7 +75,15 @@ class GraphCollator:
         ligand_atom_offset = 0
 
         for data in samples:
-            n_lig = int(data["ligand_atom"].num_nodes)
+            # 优先从属性获取，否则尝试推断
+            if hasattr(data["ligand_atom"], "num_nodes") and data["ligand_atom"].num_nodes is not None:
+                n_lig = int(data["ligand_atom"].num_nodes)
+            elif hasattr(data["ligand_atom"], "pos"):
+                n_lig = data["ligand_atom"].pos.size(0)
+            elif hasattr(data["ligand_atom"], "x"):
+                n_lig = data["ligand_atom"].x.size(0)
+            else:
+                raise ValueError("Could not determine number of ligand atoms for collation.")
 
             if not hasattr(data, "torsion_indices") or not hasattr(data, "torsion_moving_mask"):
                 raise ValueError(

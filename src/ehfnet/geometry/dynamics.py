@@ -157,6 +157,18 @@ class VelocityDecomposer:
         # 3. 求解 Ax = b
         b_vec = vel.view(-1)  # [3N]
 
+        if not torch.isfinite(A).all() or not torch.isfinite(b_vec).all():
+            # 这种情况通常发生在某些极端几何结构（如原子重叠）或路径插值异常时
+            # 我们通过返回零速度来跳过该批次的贡献，确保训练不会中断
+            nan_in_A = not torch.isfinite(A).all()
+            nan_in_b = not torch.isfinite(b_vec).all()
+            logger.debug(f"Numerical instability in decompose: NaN in A: {nan_in_A}, NaN in b: {nan_in_b}. Skipping batch.")
+            return (
+                torch.zeros(B, 3, device=device, dtype=dtype),
+                torch.zeros(B, 3, device=device, dtype=dtype),
+                torch.zeros(T, device=device, dtype=dtype),
+            )
+
         # 为了数值稳定性，将计算移至 CPU 并使用更高精度
         # 采用正规方程 (ATA + damping)x = ATb 求解，这在 CPU 上非常稳定且快速
         A_cpu = A.to("cpu", dtype=torch.float64)
@@ -172,6 +184,13 @@ class VelocityDecomposer:
             
             # 求解
             solution_cpu = torch.linalg.solve(ATA_cpu, ATb_cpu)
+            
+            # 安全检查：对解进行幅值限制，防止病态矩阵导致的数值爆炸
+            # 物理上，如果一个旋转速度或扭转速度超过 1000 弧度/秒，通常是数学奇异点
+            max_solution = 1000.0
+            if torch.abs(solution_cpu).max() > max_solution:
+                solution_cpu = torch.clamp(solution_cpu, min=-max_solution, max=max_solution)
+                
             solution = solution_cpu.to(device, dtype=dtype)
             
         except Exception as e:
@@ -399,6 +418,19 @@ class PathInterpolator:
         pos_0_centered = pos_0 - com_0[batch]
         pos_1_centered = pos_1 - com_1[batch]
 
+        if not torch.isfinite(pos_0_centered).all() or not torch.isfinite(pos_1_centered).all():
+            logger.warning("NaN detected in centered positions during path parameter computation.")
+            return {
+                "com_0": com_0,
+                "delta_trans": delta_trans,
+                "R_total": torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1),
+                "delta_torsions": torch.zeros(T, device=device, dtype=dtype),
+                "pos_0_centered": torch.zeros_like(pos_0_centered),
+                "batch": batch,
+                "torsion_indices": torsion_indices,
+                "torsion_moving_mask": torsion_moving_mask,
+            }
+
         # 2. 计算最佳旋转（Kabsch 算法）
         R = torch.zeros(B, 3, 3, device=device, dtype=dtype)
 
@@ -430,6 +462,10 @@ class PathInterpolator:
                 U = U_cpu.to(device, dtype=dtype)
                 Vh = Vh_cpu.to(device, dtype=dtype)
                 
+                if not torch.isfinite(U).all() or not torch.isfinite(Vh).all():
+                    R[b] = torch.eye(3, device=device, dtype=dtype)
+                    continue
+
                 # 计算旋转矩阵：R = V @ U^T
                 R_b = torch.matmul(Vh.T, U.T)
                 
@@ -463,6 +499,10 @@ class PathInterpolator:
             # 最小角度差
             diff = angle_1 - angle_0
             delta_torsions = torch.atan2(torch.sin(diff), torch.cos(diff))
+            
+            if not torch.isfinite(delta_torsions).all():
+                logger.warning("NaN detected in delta_torsions, replacing with zeros")
+                delta_torsions = torch.nan_to_num(delta_torsions, nan=0.0)
 
         return {
             "com_0": com_0,

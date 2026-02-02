@@ -6,12 +6,16 @@
 """
 
 import torch
+import logging
 
 from torch import Tensor
 from torch_scatter import scatter_mean
 from torch_geometric.data import HeteroData
 
 from ehfnet.geometry.dynamics import PathInterpolator, PoseUpdater, PhysicsConstants
+
+
+logger = logging.getLogger(__name__)
 
 
 class ConditionalFlowMatcher:
@@ -90,7 +94,21 @@ class ConditionalFlowMatcher:
         )
 
         # 4. 插值得到当前时刻坐标 x_t 和目标全原子速度 v_t
-        x_t, v_t = self.interpolator.interpolate(path_params, t)
+        try:
+            x_t, v_t = self.interpolator.interpolate(path_params, t)
+            
+            # 安全检查：防止异常大的速度导致 Loss 爆炸
+            v_norm = torch.norm(v_t, dim=-1)
+            max_v = 1000.0
+            if (v_norm > max_v).any():
+                logger.warning(f"Extreme velocity detected (max={v_norm.max().item():.2f}). Clipping.")
+                v_t = torch.clamp(v_t, min=-max_v, max=max_v)
+                
+        except Exception as e:
+            logger.error(f"Error during interpolation: {e}")
+            # 返回零速度作为兜底
+            x_t = x_0
+            v_t = torch.zeros_like(x_0)
 
         return t, x_t, v_t
 
@@ -338,15 +356,20 @@ class ConditionalFlowMatcher:
                 )
 
         # 2. 随机刚体位姿
+        # 获取当前（扭转后）的几何中心
         center = scatter_mean(x_torsioned, batch, dim=0, dim_size=B)
         x_centered = x_torsioned - center[batch]
 
+        # 随机旋转
         rot_matrices = self._random_rotation_matrix(B, device, dtype)
         x_rotated = torch.bmm(rot_matrices[batch], x_centered.unsqueeze(-1)).squeeze(-1)
 
-        translation = torch.randn(B, 3, device=device, dtype=dtype) * 5.0
+        # 随机位移（相对于原始中心 center 的偏移，而不是相对于原点）
+        # 使用 10.0 埃作为盲对接的随机初始范围（可根据需要调整）
+        translation_offset = torch.randn(B, 3, device=device, dtype=dtype) * 10.0
 
-        return x_rotated + translation[batch]
+        # 最终坐标 = 旋转后的坐标 + 原始中心 + 随机位移偏移
+        return x_rotated + center[batch] + translation_offset[batch]
 
 
     @staticmethod

@@ -146,15 +146,17 @@ class FlowMatchingLoss(nn.Module):
         gt_affinity = targets.get("binding_affinity_target", None)
 
         if pred_affinity is not None and gt_affinity is not None:
+            # 最后的安全检查，确保 gt_affinity 也是有效的
+            if torch.isnan(gt_affinity).any():
+                raw_loss_energy = torch.tensor(0.0, device=device)
+            else:
+                if pred_affinity.dim() == 1:
+                    pred_affinity = pred_affinity.unsqueeze(-1)
 
-            if pred_affinity.dim() == 1:
-                pred_affinity = pred_affinity.unsqueeze(-1)
+                if gt_affinity.dim() == 1:
+                    gt_affinity = gt_affinity.unsqueeze(-1)
 
-            if gt_affinity.dim() == 1:
-                gt_affinity = gt_affinity.unsqueeze(-1)
-
-            raw_loss_energy = F.mse_loss(pred_affinity, gt_affinity)
-
+                raw_loss_energy = F.mse_loss(pred_affinity, gt_affinity)
         else:
             raw_loss_energy = torch.tensor(0.0, device=device)
 

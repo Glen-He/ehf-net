@@ -4,7 +4,7 @@
 提供从原始文件（配体/蛋白）读取、ESM embedding 获取，以及构建 HeteroData 的工具函数。
 """
 
-import os
+
 import numpy as np
 
 from typing import Any, cast
@@ -81,11 +81,7 @@ def get_esm_model(model_name: str = "esmc_300m") -> ESMC:
         已加载并放置到可用设备上的 ESMC 模型
     """
 
-    device = (
-        "cuda"
-        if os.environ.get("CUDA_VISIBLE_DEVICES", "") != "" and torch.cuda.is_available()
-        else "cpu"
-    )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     return cast(ESMC, ESMC.from_pretrained(model_name).to(device).eval())
 

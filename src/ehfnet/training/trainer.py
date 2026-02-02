@@ -5,6 +5,7 @@
 """
 
 import os
+import math
 import torch
 import logging
 import torch.optim as optim
@@ -189,6 +190,27 @@ def train(
                 loss_dict = criterion(predictions, targets, batch)
                 loss = loss_dict["total"]
 
+                if torch.isnan(loss) or loss > 1e6:
+                    logger.error(f"{'NaN' if torch.isnan(loss) else 'Huge'} Loss detected!")
+                    for k, v in loss_dict.items():
+                        logger.error(f"  {k}: {v}")
+                    
+                    # 检查目标值
+                    gt_trans, gt_rot, gt_torsion = criterion.decomposer.decompose(
+                        pos=batch["ligand_atom"].pos,
+                        vel=targets["v_atomic_target"],
+                        masses=batch["ligand_atom"].masses,
+                        batch=batch["ligand_atom"].batch,
+                        torsion_indices=getattr(batch, "torsion_indices", None),
+                        torsion_moving_mask=getattr(batch, "torsion_moving_mask", None)
+                    )
+                    logger.error(f"  GT Trans norm: {gt_trans.norm().item()}")
+                    logger.error(f"  GT Rot norm: {gt_rot.norm().item()}")
+                    if gt_torsion.numel() > 0:
+                        logger.error(f"  GT Torsion norm: {gt_torsion.norm().item()}")
+                    
+                    raise RuntimeError("Stopping due to invalid Loss")
+
             # 反向传播
             scaler.scale(loss).backward()
 
@@ -231,19 +253,29 @@ def train(
             f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}"
         )
 
-        # 保存最佳模型
-        if avg_val_loss < best_val_loss:
+        # 准备保存数据
+        checkpoint = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "loss_state_dict": criterion.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "best_val_loss": best_val_loss,
+        }
+
+        # 1. 始终保存最新模型（作为保底）
+        torch.save(checkpoint, os.path.join(save_dir, "latest_model.pt"))
+
+        # 2. 只有当 Val Loss 有效且创下新低时保存最佳模型
+        if not math.isnan(avg_val_loss) and avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "loss_state_dict": criterion.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                },
-                os.path.join(save_dir, "best_model.pt"),
-            )
+            checkpoint["best_val_loss"] = best_val_loss
+            torch.save(checkpoint, os.path.join(save_dir, "best_model.pt"))
             logger.info(f"Saved best model with val_loss: {best_val_loss:.4f}")
+
+        # 3. 每 10 轮保存一个永久备份
+        if (epoch + 1) % 10 == 0:
+            torch.save(checkpoint, os.path.join(save_dir, f"model_epoch_{epoch+1}.pt"))
 
 
 @torch.no_grad()
@@ -258,44 +290,55 @@ def compute_validation_loss(
 ) -> float:
     """
     验证函数
-
-    Args:
-        model: 模型
-        matcher: ConditionalFlowMatcher
-        criterion: 损失函数
-        loader: 数据加载器
-        device: 设备
-        epoch: 当前轮数（用于固定随机种子）
-
-    Returns:
-        平均验证损失
     """
-
     model.eval()
     total_loss = 0.0
+    valid_batches = 0
 
-    # 固定随机种子，使验证集损失更稳定
+    # 固定随机种子
     if epoch is not None:
         torch.manual_seed(42 + epoch)
-
         if torch.cuda.is_available():
             torch.cuda.manual_seed(42 + epoch)
 
     for batch in loader:
-        batch = batch.to(device)
-        x_1 = batch["ligand_atom"].pos
+        try:
+            batch = batch.to(device)
+            x_1 = batch["ligand_atom"].pos
 
-        t, x_t, v_target = matcher.sample_location_and_target(x_1=x_1, data=batch)
+            t, x_t, v_target = matcher.sample_location_and_target(x_1=x_1, data=batch)
 
-        batch["ligand_atom"].pos = x_t
-        predictions = model(batch, t)
+            batch["ligand_atom"].pos = x_t
+            predictions = model(batch, t)
 
-        targets = {
-            "v_atomic_target": v_target,
-            "binding_affinity_target": batch.get("y_energy", None),
-        }
+            targets = {
+                "v_atomic_target": v_target,
+                "binding_affinity_target": batch.get("y_energy", None),
+            }
 
-        loss_dict = criterion(predictions, targets, batch)
-        total_loss += loss_dict["total"].item()
+            loss_dict = criterion(predictions, targets, batch)
+            loss = loss_dict["total"]
 
-    return total_loss / len(loader)
+            # 深度诊断：捕获爆炸样本
+            if not torch.isnan(loss) and not torch.isinf(loss) and loss.item() > 1000:
+                pdb_ids = batch.pdb_id if hasattr(batch, "pdb_id") else "unknown"
+                logger.warning(f"Extreme Loss ({loss.item():.2e}) detected in validation!")
+                logger.warning(f"  PDB IDs: {pdb_ids}")
+                logger.warning(f"  Raw Trans: {loss_dict.get('raw_loss_trans', 0):.2e}")
+                logger.warning(f"  Raw Rot: {loss_dict.get('raw_loss_rot', 0):.2e}")
+                logger.warning(f"  Raw Torsion: {loss_dict.get('raw_loss_torsion', 0):.2e}")
+                
+            # 过滤掉爆炸性的离群值，不参与平均值计算
+            if torch.isnan(loss) or torch.isinf(loss) or loss.item() > 1e6:
+                continue
+                
+            total_loss += loss.item()
+            valid_batches += 1
+        except Exception as e:
+            logger.warning(f"Validation batch failed: {e}")
+            continue
+
+    if valid_batches == 0:
+        return float("nan")
+        
+    return total_loss / valid_batches

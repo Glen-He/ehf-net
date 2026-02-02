@@ -50,6 +50,12 @@ def load_index(index_file: str) -> pd.DataFrame:
     if not required_cols.issubset(df.columns):
         raise ValueError(f"CSV must contain columns: {required_cols}")
 
+    # 过滤掉 affinity 为 NaN 的无效行
+    initial_len = len(df)
+    df = df.dropna(subset=["affinity"])
+    if len(df) < initial_len:
+        logger.warning(f"Dropped {initial_len - len(df)} rows with NaN affinity from index.")
+
     df["pdb_id"] = df["pdb_id"].astype(str).str.lower()
 
     return df
@@ -284,6 +290,13 @@ class PDBBindDataset(Dataset):
         logger.info(
             f"Processing complete: {success_count} success, {skip_count} cached, {error_count} errors"
         )
+
+        # 释放 ESM 模型显存，因为它在训练阶段不再需要
+        if self._esm_model is not None:
+            logger.info("Releasing ESM model from GPU memory...")
+            del self._esm_model
+            self._esm_model = None
+            torch.cuda.empty_cache()
 
 
     def _process_one(self, pdb_id: str, affinity: float) -> HeteroData | None:
