@@ -9,10 +9,8 @@ import torch
 import logging
 
 from torch import Tensor
-from torch_scatter import scatter_mean
 from torch_geometric.data import HeteroData
-
-from ehfnet.geometry.dynamics import PathInterpolator, PoseUpdater, PhysicsConstants
+from ehfnet.geometry.dynamics import PathInterpolator, PoseUpdater, PhysicsConstants, compute_center_of_mass
 
 
 logger = logging.getLogger(__name__)
@@ -26,19 +24,51 @@ class ConditionalFlowMatcher:
     推理时：基于 PoseUpdater 进行刚体 ODE 演化（支持 Euler/RK4）
     """
 
-    def __init__(self, sigma_min: float = 1e-4) -> None:
+    def __init__(
+        self, 
+        sigma_min: float = 1e-4,
+        spatial_sigma_min: float = 1.0,
+        spatial_sigma_max: float = 10.0,
+        warmup_epochs: int = 20
+    ) -> None:
         """
         Args:
             sigma_min: 最小噪声水平，用于防止 t=1 时的数值不稳定
+            spatial_sigma_min: 空间课程学习起始尺度 (Å)
+            spatial_sigma_max: 空间课程学习结束尺度 (Å)
+            warmup_epochs: 空间课程学习预热轮数
         """
 
         self.sigma_min = sigma_min
+        
+        # 课程学习参数
+        self.spatial_sigma_min = spatial_sigma_min
+        self.spatial_sigma_max = spatial_sigma_max
+        self.warmup_epochs = warmup_epochs
+        
         self.interpolator = PathInterpolator(eps=PhysicsConstants.EPSILON)
         self.updater = PoseUpdater(eps=PhysicsConstants.EPSILON)
 
 
+    def get_spatial_scale(self, epoch: int) -> float:
+        """
+        根据当前 epoch 计算空间扰动尺度
+        """
+        if self.warmup_epochs <= 0:
+            return self.spatial_sigma_max
+            
+        progress = min(1.0, epoch / self.warmup_epochs)
+        return self.spatial_sigma_min + (self.spatial_sigma_max - self.spatial_sigma_min) * progress
+
+
     def sample_location_and_target(
-        self, *, x_1: Tensor, data: HeteroData, x_0: Tensor | None = None
+        self,
+        *,
+        x_1: Tensor,
+        data: HeteroData,
+        x_0: Tensor | None = None,
+        current_epoch: int = 0,
+        total_epochs: int = 1,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """
         [训练接口] 采样时间 t，构造插值坐标 x_t 和目标速度 v_t
@@ -47,6 +77,8 @@ class ConditionalFlowMatcher:
             x_1: 真实结合构象 [N, 3] (Ground Truth)
             data: 图数据对象（包含 batch, masses, torsion_indices 等）
             x_0: 初始构象（可选）。如果为 None，则基于 x_1 进行随机刚体变换生成
+            current_epoch: 当前训练轮数 (用于课程学习)
+            total_epochs: 总训练轮数 (用于课程学习)
 
         Returns:
             t: 采样的时间步 [B]
@@ -71,6 +103,8 @@ class ConditionalFlowMatcher:
 
         # 1. 生成 x_0
         if x_0 is None:
+            current_scale = self.get_spatial_scale(current_epoch)
+            
             x_0 = self._generate_random_pose(
                 x_ref=x_1,
                 batch=batch,
@@ -78,10 +112,17 @@ class ConditionalFlowMatcher:
                 masses=masses,
                 torsion_indices=torsion_indices,
                 torsion_moving_mask=torsion_moving_mask,
+                translation_scale=current_scale,
             )
 
         # 2. 采样时间 t ~ U[0, 1]
-        t = torch.rand(B, device=device) * (1.0 - 2 * self.sigma_min) + self.sigma_min
+        # 时间课程学习：随着训练进行，逐渐降低 sigma_min，从容易（高噪声）到困难（低噪声）
+        sigma_start = 0.1
+        sigma_end = 1e-4
+        progress = min(1.0, current_epoch / max(1, total_epochs))
+        current_sigma = sigma_start + (sigma_end - sigma_start) * progress
+        
+        t = torch.rand(B, device=device) * (1.0 - 2 * current_sigma) + current_sigma
 
         # 3. 计算物理插值路径参数
         path_params = self.interpolator.compute_path_parameters(
@@ -326,6 +367,7 @@ class ConditionalFlowMatcher:
         masses: Tensor,
         torsion_indices: Tensor | None,
         torsion_moving_mask: Tensor | None,
+        translation_scale: float = 10.0,
     ) -> Tensor:
         """
         生成随机初始位姿（盲对接）
@@ -356,8 +398,10 @@ class ConditionalFlowMatcher:
                 )
 
         # 2. 随机刚体位姿
-        # 获取当前（扭转后）的几何中心
-        center = scatter_mean(x_torsioned, batch, dim=0, dim_size=B)
+        # 获取当前（扭转后）的质心 (Center of Mass)
+        # 使用统一的质心计算工具
+        center = compute_center_of_mass(x_torsioned, batch, masses, dim_size=B)
+        
         x_centered = x_torsioned - center[batch]
 
         # 随机旋转
@@ -365,8 +409,8 @@ class ConditionalFlowMatcher:
         x_rotated = torch.bmm(rot_matrices[batch], x_centered.unsqueeze(-1)).squeeze(-1)
 
         # 随机位移（相对于原始中心 center 的偏移，而不是相对于原点）
-        # 使用 10.0 埃作为盲对接的随机初始范围（可根据需要调整）
-        translation_offset = torch.randn(B, 3, device=device, dtype=dtype) * 10.0
+        # 使用传入的 translation_scale 控制随机初始范围
+        translation_offset = torch.randn(B, 3, device=device, dtype=dtype) * translation_scale
 
         # 最终坐标 = 旋转后的坐标 + 原始中心 + 随机位移偏移
         return x_rotated + center[batch] + translation_offset[batch]

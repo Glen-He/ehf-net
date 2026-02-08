@@ -90,12 +90,14 @@ class AtomEmbedding(nn.Module):
         cat_schema: list[CatFeature],
         cont_feature_count: int,
         hidden_dim: int,
+        stats: dict | None = None,
     ) -> None:
         """
         Args:
             cat_schema: 分类特征配置列表
             cont_feature_count: 连续特征数量
             hidden_dim: 隐藏层维度
+            stats: 统计数据字典，包含 mean 和 std (用于标准化)
         """
 
         super().__init__()
@@ -111,6 +113,11 @@ class AtomEmbedding(nn.Module):
                 )
             )
             total_categorical_dim += feat.embed_dim
+        
+        # 注册标准化参数
+        if stats is not None:
+            self.register_buffer("mean", stats["mean"])
+            self.register_buffer("std", stats["std"] + 1e-6)
 
         # 连续特征归一化
         self.cont_norm = nn.LayerNorm(cont_feature_count)
@@ -152,6 +159,10 @@ class AtomEmbedding(nn.Module):
         ):
             feature_list.append(layer(raw_ids))
 
+        # 标准化连续特征 (Z-Score)
+        if hasattr(self, "mean"):
+            x_cont = (x_cont - self.mean) / self.std
+
         # 归一化连续特征
         x_cont_normed = self.cont_norm(x_cont)
         feature_list.append(x_cont_normed)
@@ -173,8 +184,8 @@ class LigandAtomEmbedding(AtomEmbedding):
     基于 AtomEmbedding，对配体原子特征进行编码。
     """
 
-    def __init__(self, cont_feature_count: int, hidden_dim: int) -> None:
-        super().__init__(LIGAND_ATOM_CAT_SCHEMA, cont_feature_count, hidden_dim)
+    def __init__(self, cont_feature_count: int, hidden_dim: int, stats: dict | None = None) -> None:
+        super().__init__(LIGAND_ATOM_CAT_SCHEMA, cont_feature_count, hidden_dim, stats)
 
 
 class ProteinAtomEmbedding(AtomEmbedding):
@@ -184,8 +195,8 @@ class ProteinAtomEmbedding(AtomEmbedding):
     基于 AtomEmbedding，对蛋白质原子特征进行编码。
     """
 
-    def __init__(self, cont_feature_count: int, hidden_dim: int) -> None:
-        super().__init__(PROTEIN_ATOM_CAT_SCHEMA, cont_feature_count, hidden_dim)
+    def __init__(self, cont_feature_count: int, hidden_dim: int, stats: dict | None = None) -> None:
+        super().__init__(PROTEIN_ATOM_CAT_SCHEMA, cont_feature_count, hidden_dim, stats)
 
 
 class LigandMoleculeEmbedding(nn.Module):
@@ -195,14 +206,20 @@ class LigandMoleculeEmbedding(nn.Module):
     仅对连续特征进行线性投影。
     """
 
-    def __init__(self, cont_feature_count: int, hidden_dim: int) -> None:
+    def __init__(self, cont_feature_count: int, hidden_dim: int, stats: dict | None = None) -> None:
         """
         Args:
             cont_feature_count: 连续特征数量
             hidden_dim: 隐藏层维度
+            stats: 统计数据字典
         """
         super().__init__()
         self.output_dim = hidden_dim
+        
+        # 注册标准化参数
+        if stats is not None:
+            self.register_buffer("mean", stats["mean"])
+            self.register_buffer("std", stats["std"] + 1e-6)
 
         # 连续特征归一化
         self.cont_norm = nn.LayerNorm(cont_feature_count)
@@ -224,6 +241,10 @@ class LigandMoleculeEmbedding(nn.Module):
             投影后的分子特征 [M, hidden_dim]
         """
 
+        # 标准化连续特征 (Z-Score)
+        if hasattr(self, "mean"):
+            x_cont = (x_cont - self.mean) / self.std
+
         x_cont_normed = self.cont_norm(x_cont)
         return self.projection_mlp(x_cont_normed)
 
@@ -236,11 +257,12 @@ class ProteinResidueEmbedding(nn.Module):
     注意：连续特征包含预训练的 ESM embeddings，使用 LayerNorm 保持其语义空间。
     """
 
-    def __init__(self, cont_feature_count: int, hidden_dim: int) -> None:
+    def __init__(self, cont_feature_count: int, hidden_dim: int, stats: dict | None = None) -> None:
         """
         Args:
             cont_feature_count: 连续特征数量（包含扭转角 sin/cos + ESM embeddings）
             hidden_dim: 隐藏层维度
+            stats: 统计数据字典
         """
 
         super().__init__()
@@ -271,6 +293,11 @@ class ProteinResidueEmbedding(nn.Module):
                 )
             )
             total_categorical_dim += feat.embed_dim
+        
+        # 注册标准化参数
+        if stats is not None:
+            self.register_buffer("mean", stats["mean"])
+            self.register_buffer("std", stats["std"] + 1e-6)
 
         # 连续特征归一化（包含扭转角 sin/cos + ESM embeddings）
         self.cont_norm = nn.LayerNorm(cont_feature_count)
@@ -323,6 +350,10 @@ class ProteinResidueEmbedding(nn.Module):
             self.embedding_layers, x_cat_long.transpose(0, 1), strict=True
         ):
             embedded_list.append(layer(raw_ids))
+
+        # 标准化连续特征 (Z-Score)
+        if hasattr(self, "mean"):
+            x_cont = (x_cont - self.mean) / self.std
 
         # 归一化连续特征（包含 ESM embeddings）
         x_cont_normed = self.cont_norm(x_cont)

@@ -114,7 +114,8 @@ class FlowMatchingLoss(nn.Module):
         if pred_trans is None:
             raise ValueError("predictions['v_translation'] must not be None.")
 
-        raw_loss_trans = F.mse_loss(pred_trans, gt_trans)
+        # 使用 Huber Loss 替代 MSE，增强对离群值的鲁棒性
+        raw_loss_trans = F.huber_loss(pred_trans, gt_trans, delta=1.0)
         loss_dict["raw_loss_trans"] = raw_loss_trans.detach()
 
         pred_rot = predictions["v_rotation"]

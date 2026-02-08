@@ -14,6 +14,8 @@ from datetime import datetime
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 
 from ehfnet.training.trainer import train
+import torch
+# import subprocess
 
 def main():
     parser = argparse.ArgumentParser(description="Train EHFNet for molecular docking prediction")
@@ -27,7 +29,7 @@ def main():
     # 训练相关参数
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-6, help="Weight decay")
     parser.add_argument("--clip_grad", type=float, default=10.0, help="Gradient clipping value")
     
@@ -42,6 +44,7 @@ def main():
     parser.add_argument("--esm_dim", type=int, default=960, help="ESM embedding dimension (default: 960 for ESMC-300M)")
     parser.add_argument("--device", type=str, default="auto", help="Device to use for training (e.g., 'cuda:0', 'cuda:1', 'cpu')")
     parser.add_argument("--pocket_radius", type=float, default=20.0, help="Radius (A) for protein pocket extraction (default: 20.0)")
+    parser.add_argument("--warmup_epochs", type=int, default=20, help="Number of warmup epochs for spatial curriculum learning (default: 20)")
     # parser.add_argument("--pro_res_cont_count", type=int, default=974, help="Protein residue continuous feature count (14 torsion + 960 ESM)")
 
     args = parser.parse_args()
@@ -74,6 +77,34 @@ def main():
     logger = logging.getLogger(__name__)
     logger.info(f"Starting training with arguments: {args}")
 
+    # 加载归一化统计数据
+    stats_file = os.path.join(args.data_root, "normalization_stats.pt")
+    if not os.path.exists(stats_file):
+        logger.warning(f"Normalization stats not found at {stats_file}. Computing now...")
+        # 动态调用统计脚本
+        # script_path = os.path.join(os.path.dirname(__file__), "scripts/compute_dataset_stats.py")
+        processed_dir = os.path.join(args.data_root, "processed")
+        
+        try:
+            # 确保 processed 目录存在
+            if not os.path.exists(processed_dir):
+                 # 如果 processed 不存在，说明可能还没处理数据，dataset 会自动处理
+                 # 这里我们假设数据处理会在 Dataset 初始化时完成，所以先跳过
+                 logger.warning(f"Processed data dir {processed_dir} not found. Stats will be computed next time.")
+                 normalization_stats = None
+            else:
+                # 调用脚本计算
+                from scripts.compute_dataset_stats import compute_stats
+                compute_stats(processed_dir, stats_file)
+                normalization_stats = torch.load(stats_file, weights_only=False)
+                logger.info("Stats computed and loaded.")
+        except Exception as e:
+            logger.error(f"Failed to compute stats: {e}")
+            normalization_stats = None
+    else:
+        normalization_stats = torch.load(stats_file, weights_only=False)
+        logger.info(f"Loaded normalization stats from {stats_file}")
+
     try:
         train(
             data_root=args.data_root,
@@ -94,6 +125,8 @@ def main():
             esm_dim=args.esm_dim,
             device=args.device,
             pocket_radius=args.pocket_radius,
+            normalization_stats=normalization_stats,
+            warmup_epochs=args.warmup_epochs,
         )
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)

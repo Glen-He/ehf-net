@@ -6,7 +6,6 @@
 2. processed 文件夹（整个文件夹）
 """
 
-import os
 import shutil
 import argparse
 from pathlib import Path
@@ -102,6 +101,38 @@ def clean_processed_folder(data_root: str, dry_run: bool = False) -> tuple[bool,
         return False, 0
 
 
+def clean_normalization_stats(data_root: str, dry_run: bool = False) -> tuple[bool, int]:
+    """
+    Clean normalization stats file.
+
+    Args:
+        data_root: Path to data/processed/pdbbind
+        dry_run: If True, only print what would be deleted without actually deleting
+
+    Returns:
+        (success, file size in bytes)
+    """
+    stats_file = Path(data_root) / "normalization_stats.pt"
+    
+    if not stats_file.exists():
+        print(f"\nNormalization stats not found: {stats_file}")
+        return False, 0
+    
+    size = stats_file.stat().st_size
+    
+    if dry_run:
+        print(f"[DRY RUN] Would delete: {stats_file}")
+        return False, size
+        
+    try:
+        stats_file.unlink()
+        print(f"\nDeleted normalization stats: {stats_file}")
+        return True, size
+    except Exception as e:
+        print(f"Failed to delete {stats_file}: {e}")
+        return False, 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Clean training cache files in data/processed/pdbbind",
@@ -131,6 +162,12 @@ def main():
         default=False,
         help="Skip cleaning processed folder",
     )
+    parser.add_argument(
+        "--skip-stats",
+        action="store_true",
+        default=False,
+        help="Skip cleaning normalization stats",
+    )
 
     args = parser.parse_args()
 
@@ -147,26 +184,33 @@ def main():
     print(f"Mode: {'DRY RUN (no files will be deleted)' if args.dry_run else 'DELETION'}")
     print("=" * 60)
 
-    total_freed_mb = 0
+    total_freed_bytes = 0
 
     # Clean ESM cache
     if not args.skip_esm:
         npz_count, npz_size_mb = clean_esm_cache(str(data_root), args.dry_run)
-        total_freed_mb += npz_size_mb
+        total_freed_bytes += npz_size_mb * 1024 * 1024
         if not args.dry_run and npz_count > 0:
             print(f"✓ Deleted {npz_count} .npz files ({npz_size_mb} MB)")
 
     # Clean processed folder
     if not args.skip_processed:
         success, proc_size_mb = clean_processed_folder(str(data_root), args.dry_run)
-        total_freed_mb += proc_size_mb
+        total_freed_bytes += proc_size_mb * 1024 * 1024
+    
+    # Clean normalization stats
+    if not args.skip_stats:
+        success, stats_size = clean_normalization_stats(str(data_root), args.dry_run)
+        total_freed_bytes += stats_size
 
+    total_freed_mb = total_freed_bytes / (1024 * 1024)
+    
     print("\n" + "=" * 60)
     if args.dry_run:
-        print(f"[DRY RUN] Would free approximately {total_freed_mb} MB")
+        print(f"[DRY RUN] Would free approximately {total_freed_mb:.2f} MB")
         print("\nRe-run without --dry-run to actually delete files.")
     else:
-        print(f"Total space freed: {total_freed_mb} MB")
+        print(f"Total space freed: {total_freed_mb:.2f} MB")
         print("Cache cleaning completed!")
     print("=" * 60)
 

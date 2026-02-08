@@ -34,7 +34,7 @@ LIGAND_ATOM_CAT_SCHEMA = [
     CatFeature("num_hs",                    6,  4,  "氢原子数量 [0-5]"),
     CatFeature("degree",                    8,  8,  "原子度 (连接数) [0-7]"),
     CatFeature("implicit_valence",          7,  4,  "隐式化合价 [0-6] (硫/磷可达6价)"),
-    CatFeature("atomic_idx",                13, 16, "原子类型索引 (基于 Element 枚举)"),
+    CatFeature("atomic_idx",                24, 16, "原子类型索引 (基于 Element 枚举)"),
     CatFeature("formal_charge",             9,  8,  "形式电荷 [-4, +4] 映射到 [0, 8]"),
     CatFeature("hybridization",             9,  8,  "杂化类型 (SP, SP2, SP3等)"),
     CatFeature("num_radical_electrons",     4,  4,  "自由基电子数 [0-3]"),
@@ -103,7 +103,7 @@ LIGAND_MOLECULE_CONT_SCHEMA = [
 
 # --- 蛋白质特征 Schema ---
 PROTEIN_ATOM_CAT_SCHEMA = [
-    CatFeature("atomic_idx",                13, 16, "原子类型索引 (Element 枚举)"),
+    CatFeature("atomic_idx",                24, 16, "原子类型索引 (Element 枚举)"),
 ]
 
 

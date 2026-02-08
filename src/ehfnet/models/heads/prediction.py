@@ -171,6 +171,7 @@ class PredictionHead(nn.Module):
         num_rbf: int = PredictionConstants.NUM_RBF,
         r_cutoff: float = PredictionConstants.RBF_STOP,
         dropout_rate: float = 0.1,
+        affinity_stats: dict | None = None,
     ) -> None:
         """
         Args:
@@ -178,6 +179,7 @@ class PredictionHead(nn.Module):
             num_rbf: RBF 基函数数量
             r_cutoff: 截断距离（单位：Å）
             dropout_rate: Dropout 比例
+            affinity_stats: 结合能统计数据 (mean, std) 用于反归一化
         """
 
         super().__init__()
@@ -186,6 +188,15 @@ class PredictionHead(nn.Module):
         self.num_rbf = num_rbf
         self.r_cutoff = float(r_cutoff)
         self.scale = hidden_dim**-0.5
+        
+        # 注册结合能标准化参数
+        if affinity_stats:
+            self.register_buffer("aff_mean", affinity_stats["mean"])
+            self.register_buffer("aff_std", affinity_stats["std"])
+        else:
+            # 默认 fallback
+            self.register_buffer("aff_mean", torch.tensor(6.0))
+            self.register_buffer("aff_std", torch.tensor(1.5))
 
         # 动态调整邻居数
         self.adaptive_max_neighbors = True
@@ -229,7 +240,10 @@ class PredictionHead(nn.Module):
             if isinstance(module, nn.Linear) and module.out_features == 1:
 
                 if module.bias is not None:
-                    nn.init.constant_(module.bias, -2.0)
+                    # Change bias from -2.0 to 0.0 to prevent "vanishing velocity" at early stage.
+                    # Softplus(0.0) ≈ 0.69 (large enough initial inverse mass)
+                    # Softplus(-2.0) ≈ 0.13 (too small, causes slow movement)
+                    nn.init.constant_(module.bias, 0.0)
 
                 break
 
@@ -265,10 +279,6 @@ class PredictionHead(nn.Module):
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
-        )
-
-        self.baseline_energy = nn.Parameter(
-            torch.tensor([PredictionConstants.BASELINE_BINDING_ENERGY])
         )
 
         self.norm = nn.LayerNorm(hidden_dim)
@@ -310,7 +320,7 @@ class PredictionHead(nn.Module):
 
             return {
                 "v_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
-                "binding_affinity": self.baseline_energy.expand(B).unsqueeze(-1),
+                "binding_affinity": self.aff_mean.expand(B).unsqueeze(-1),
                 "force_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
             }
 
@@ -337,7 +347,7 @@ class PredictionHead(nn.Module):
 
             return {
                 "v_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
-                "binding_affinity": self.baseline_energy.expand(B).unsqueeze(-1),
+                "binding_affinity": self.aff_mean.expand(B).unsqueeze(-1),
                 "force_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
             }
 
@@ -435,10 +445,12 @@ class PredictionHead(nn.Module):
         global_input = torch.cat([lig_mol_feat, context_global], dim=-1)
         E_correction = self.global_correction_mlp(global_input).squeeze(-1)
 
-        # 最终能量
-        binding_affinity = (
-            E_physical + E_correction + self.baseline_energy
-        ).unsqueeze(-1)
+        # 最终能量 (Score)
+        # 神经网络输出的是归一化的分数 (期望在 0 附近)
+        score_norm = E_physical + E_correction
+        
+        # 反归一化，输出真实物理值
+        binding_affinity = (score_norm * self.aff_std + self.aff_mean).unsqueeze(-1)
 
         return {
             "v_atomic": v_atomic,

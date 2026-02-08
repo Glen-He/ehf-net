@@ -63,6 +63,7 @@ class EHFNet(nn.Module):
         num_rbf: int = 50,
         r_cutoff: float = 10.0,
         fix_protein: bool = True,
+        normalization_stats: dict | None = None,
     ) -> None:
         """
         Args:
@@ -78,6 +79,7 @@ class EHFNet(nn.Module):
             num_rbf: RBF 基函数数量
             r_cutoff: 截断距离（单位：Å）
             fix_protein: 是否冻结蛋白坐标（刚性对接）
+            normalization_stats: 归一化统计数据
         """
 
         super().__init__()
@@ -93,6 +95,7 @@ class EHFNet(nn.Module):
             m_dim_scalar=m_dim_scalar,
             dropout_rate=dropout_rate,
             fix_protein=fix_protein,
+            stats=normalization_stats,
         )
 
         self.prediction_head = PredictionHead(
@@ -100,6 +103,7 @@ class EHFNet(nn.Module):
             num_rbf=num_rbf,
             r_cutoff=r_cutoff,
             dropout_rate=dropout_rate,
+            affinity_stats=normalization_stats.get("affinity") if normalization_stats else None,
         )
 
         # 上下文感知门控网络

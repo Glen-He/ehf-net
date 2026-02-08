@@ -60,6 +60,7 @@ class EHFEncoder(nn.Module):
         m_dim_scalar: int = 16,
         dropout_rate: float = 0.0,
         fix_protein: bool = True,
+        stats: dict | None = None,
     ) -> None:
         """
         Args:
@@ -73,6 +74,7 @@ class EHFEncoder(nn.Module):
             m_dim_scalar: EGNN 消息维度
             dropout_rate: Dropout 比例
             fix_protein: 是否冻结蛋白坐标
+            stats: 统计数据字典 (用于输入归一化)
         """
         super().__init__()
 
@@ -81,16 +83,24 @@ class EHFEncoder(nn.Module):
 
         # 1. 特征嵌入
         self.ligand_atom_embedder = LigandAtomEmbedding(
-            cont_feature_count=lig_atom_cont_count, hidden_dim=hidden_dim
+            cont_feature_count=lig_atom_cont_count, 
+            hidden_dim=hidden_dim,
+            stats=stats.get("ligand_atom") if stats else None
         )
         self.ligand_molecule_embedder = LigandMoleculeEmbedding(
-            cont_feature_count=lig_mol_cont_count, hidden_dim=hidden_dim
+            cont_feature_count=lig_mol_cont_count, 
+            hidden_dim=hidden_dim,
+            stats=stats.get("ligand_molecule") if stats else None
         )
         self.protein_atom_embedder = ProteinAtomEmbedding(
-            cont_feature_count=pro_atom_cont_count, hidden_dim=hidden_dim
+            cont_feature_count=pro_atom_cont_count, 
+            hidden_dim=hidden_dim,
+            stats=stats.get("protein_atom") if stats else None
         )
         self.protein_residue_embedder = ProteinResidueEmbedding(
-            cont_feature_count=pro_res_cont_count, hidden_dim=hidden_dim
+            cont_feature_count=pro_res_cont_count, 
+            hidden_dim=hidden_dim,
+            stats=stats.get("protein_residue") if stats else None
         )
         self.protein_pocket_embedder = ProteinPocketEmbedding(hidden_dim=hidden_dim)
 

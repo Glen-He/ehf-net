@@ -21,6 +21,8 @@ from ehfnet.datasets.pdbbind import PDBBindDataset
 from ehfnet.training.losses import FlowMatchingLoss
 from ehfnet.training.flow_matcher import ConditionalFlowMatcher
 
+from torch_scatter import scatter_mean
+
 logger = logging.getLogger(__name__)
 
 
@@ -44,6 +46,8 @@ def train(
     esm_dim: int = 960,
     device: str | torch.device = "auto",
     pocket_radius: float | None = 20.0,
+    normalization_stats: dict | None = None,
+    warmup_epochs: int = 20,
 ):
     """
     训练 EHFNet 模型
@@ -67,6 +71,8 @@ def train(
         esm_dim: ESM embedding 维度
         device: 训练设备 ("cpu", "cuda", "cuda:0", "cuda:1" 等)，默认为 "auto" (自动检测)
         pocket_radius: 口袋提取半径 (Å)
+        normalization_stats: 归一化统计数据
+        warmup_epochs: 空间课程学习预热轮数
     """
 
     # 1. 准备环境
@@ -137,9 +143,13 @@ def train(
         lig_mol_cont_count=lig_mol_cont_count,
         pro_atom_cont_count=pro_atom_cont_count,
         pro_res_cont_count=pro_res_cont_count,
+        normalization_stats=normalization_stats,
     ).to(device)
 
-    matcher = ConditionalFlowMatcher(sigma_min=1e-4)
+    matcher = ConditionalFlowMatcher(
+        sigma_min=1e-4,
+        warmup_epochs=warmup_epochs,
+    )
     criterion = FlowMatchingLoss().to(device)
 
     # 4. 优化器
@@ -174,7 +184,11 @@ def train(
             with torch.no_grad():
                 x_1 = batch["ligand_atom"].pos
                 t, x_t, v_target = matcher.sample_location_and_target(
-                    x_1=x_1, data=batch, x_0=None
+                    x_1=x_1, 
+                    data=batch, 
+                    x_0=None,
+                    current_epoch=epoch,
+                    total_epochs=epochs,
                 )
 
             batch["ligand_atom"].pos = x_t
@@ -246,6 +260,7 @@ def train(
             loader=val_loader,
             device=device,
             epoch=epoch,
+            total_epochs=epochs,
         )
         scheduler.step(avg_val_loss)
 
@@ -287,26 +302,40 @@ def compute_validation_loss(
     loader: DataLoader,
     device: torch.device,
     epoch: int | None = None,
+    total_epochs: int = 1,
 ) -> float:
     """
-    验证函数
+    验证函数：计算 Loss 并统计全量 RMSD 指标
     """
     model.eval()
     total_loss = 0.0
     valid_batches = 0
-
-    # 固定随机种子
+    
+    # RMSD 统计容器
+    all_rmsd_init = []
+    all_rmsd_final = []
+    
+    # 固定随机种子 (保持验证集生成的一致性)
     if epoch is not None:
         torch.manual_seed(42 + epoch)
         if torch.cuda.is_available():
             torch.cuda.manual_seed(42 + epoch)
 
-    for batch in loader:
+    # 使用 tqdm 显示验证进度，因为现在推演会稍微花点时间
+    pbar = tqdm(loader, desc=f"Epoch {epoch+1} [Val]", leave=False)
+
+    for i, batch in enumerate(pbar):
         try:
             batch = batch.to(device)
             x_1 = batch["ligand_atom"].pos
 
-            t, x_t, v_target = matcher.sample_location_and_target(x_1=x_1, data=batch)
+            # 1. 计算 Loss (用于早停和模型选择)
+            t, x_t, v_target = matcher.sample_location_and_target(
+                x_1=x_1, 
+                data=batch, 
+                current_epoch=epoch if epoch is not None else 0,
+                total_epochs=total_epochs
+            )
 
             batch["ligand_atom"].pos = x_t
             predictions = model(batch, t)
@@ -318,25 +347,81 @@ def compute_validation_loss(
 
             loss_dict = criterion(predictions, targets, batch)
             loss = loss_dict["total"]
+            
+            # 过滤爆炸 Loss
+            if not torch.isnan(loss) and not torch.isinf(loss) and loss.item() < 1e6:
+                total_loss += loss.item()
+                valid_batches += 1
 
-            # 深度诊断：捕获爆炸样本
-            if not torch.isnan(loss) and not torch.isinf(loss) and loss.item() > 1000:
-                pdb_ids = batch.pdb_id if hasattr(batch, "pdb_id") else "unknown"
-                logger.warning(f"Extreme Loss ({loss.item():.2e}) detected in validation!")
-                logger.warning(f"  PDB IDs: {pdb_ids}")
-                logger.warning(f"  Raw Trans: {loss_dict.get('raw_loss_trans', 0):.2e}")
-                logger.warning(f"  Raw Rot: {loss_dict.get('raw_loss_rot', 0):.2e}")
-                logger.warning(f"  Raw Torsion: {loss_dict.get('raw_loss_torsion', 0):.2e}")
+            # 2. 全量 RMSD 推演
+            # -----------------------------------------------------------
+            try:
+                # 克隆数据用于推演
+                infer_batch = batch.clone()
+                infer_batch["ligand_atom"].pos = x_1 
                 
-            # 过滤掉爆炸性的离群值，不参与平均值计算
-            if torch.isnan(loss) or torch.isinf(loss) or loss.item() > 1e6:
-                continue
+                # 获取当前空间尺度
+                current_scale = matcher.get_spatial_scale(epoch if epoch is not None else 0)
+
+                # 生成随机初始位姿
+                x_0_infer = matcher._generate_random_pose(
+                    x_ref=x_1,
+                    batch=infer_batch["ligand_atom"].batch,
+                    B=int(infer_batch["ligand_atom"].batch.max().item()) + 1,
+                    masses=infer_batch["ligand_atom"].masses,
+                    torsion_indices=getattr(infer_batch, "torsion_indices", None),
+                    torsion_moving_mask=getattr(infer_batch, "torsion_moving_mask", None),
+                    translation_scale=current_scale
+                )
                 
-            total_loss += loss.item()
-            valid_batches += 1
+                # 记录初始 RMSD
+                sq_diff_init = ((x_0_infer - x_1) ** 2).sum(dim=-1)
+                msd_init = scatter_mean(sq_diff_init, infer_batch["ligand_atom"].batch, dim=0)
+                rmsd_init = torch.sqrt(msd_init)
+                all_rmsd_init.append(rmsd_init)
+
+                # 执行推演
+                infer_batch["ligand_atom"].pos = x_0_infer
+                final_pos, _ = matcher.ode_solve(
+                    model=model,
+                    data=infer_batch,
+                    steps=20,       # 保持 20 步以兼顾速度和精度
+                    method="euler"
+                )
+                
+                # 记录最终 RMSD
+                sq_diff_final = ((final_pos - x_1) ** 2).sum(dim=-1)
+                msd_final = scatter_mean(sq_diff_final, infer_batch["ligand_atom"].batch, dim=0)
+                rmsd_final = torch.sqrt(msd_final)
+                all_rmsd_final.append(rmsd_final)
+                
+            except Exception as e:
+                logger.warning(f"RMSD inference failed for batch {i}: {e}")
+            # -----------------------------------------------------------
+
         except Exception as e:
             logger.warning(f"Validation batch failed: {e}")
             continue
+
+    # 计算并打印统计结果
+    if len(all_rmsd_final) > 0:
+        # 拼接所有 batch 的 RMSD
+        cat_rmsd_init = torch.cat(all_rmsd_init)
+        cat_rmsd_final = torch.cat(all_rmsd_final)
+        
+        mean_init = cat_rmsd_init.mean().item()
+        mean_final = cat_rmsd_final.mean().item()
+        
+        # 计算成功率 (<2A 和 <5A)
+        success_2a = (cat_rmsd_final < 2.0).float().mean().item() * 100
+        success_5a = (cat_rmsd_final < 5.0).float().mean().item() * 100
+        
+        logger.info("-" * 60)
+        logger.info(f"[Validation Full Stats] Epoch {epoch+1}")
+        logger.info(f"  Mean RMSD: {mean_init:.2f} -> {mean_final:.2f} Å")
+        logger.info(f"  Success Rate (<2Å): {success_2a:.2f}%")
+        logger.info(f"  Success Rate (<5Å): {success_5a:.2f}%")
+        logger.info("-" * 60)
 
     if valid_batches == 0:
         return float("nan")

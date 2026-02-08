@@ -16,6 +16,38 @@ logger = logging.getLogger(__name__)
 
 
 # 物理化学常量
+def compute_center_of_mass(
+    pos: Tensor,
+    batch: Tensor,
+    masses: Tensor,
+    dim_size: int | None = None,
+    eps: float = 1e-6,
+) -> Tensor:
+    """
+    统一质心计算工具
+
+    Args:
+        pos: 原子坐标 [N, 3]
+        batch: 批次索引 [N]
+        masses: 原子质量 [N] 或 [N, 1]
+        dim_size: 批次大小 (可选)
+        eps: 数值稳定性参数 (默认 1e-6)
+
+    Returns:
+        质心坐标 [B, 3]
+    """
+    if masses.dim() == 1:
+        masses = masses.unsqueeze(-1)
+
+    if dim_size is None:
+        dim_size = int(batch.max().item()) + 1
+
+    mass_per_mol = scatter_sum(masses, batch, dim=0, dim_size=dim_size)
+    mass_per_mol = torch.clamp(mass_per_mol, min=eps)
+    com = scatter_sum(pos * masses, batch, dim=0, dim_size=dim_size) / mass_per_mol
+    return com
+
+
 class PhysicsConstants:
     """
     物理化学常量定义
@@ -100,9 +132,7 @@ class VelocityDecomposer:
         if masses.dim() == 1:
             masses = masses.unsqueeze(-1)
 
-        mass_per_mol = scatter_sum(masses, batch, dim=0, dim_size=B)
-        mass_per_mol = torch.clamp(mass_per_mol, min=self.eps)
-        com = scatter_sum(pos_const * masses, batch, dim=0, dim_size=B) / mass_per_mol
+        com = compute_center_of_mass(pos_const, batch, masses, dim_size=B)
         r_rel = pos_const - com[batch]
 
         # 2. 构建线性方程组 Ax = v
@@ -308,10 +338,7 @@ class PoseUpdater:
                 new_pos[mask] = torch.matmul(rel_pts, rot_mat.T) + origin
 
         # 2. 刚体更新
-        mass_per_mol = torch.clamp(
-            scatter_sum(masses, batch, dim=0, dim_size=B), min=self.eps
-        )
-        com = scatter_sum(new_pos * masses, batch, dim=0, dim_size=B) / mass_per_mol
+        com = compute_center_of_mass(new_pos, batch, masses, dim_size=B)
 
         d_trans = v_trans * dt
         d_rot_vec = v_rot * dt
@@ -408,11 +435,8 @@ class PathInterpolator:
             masses = masses.unsqueeze(-1)
 
         # 1. 质心对齐
-        mass_per_mol = torch.clamp(
-            scatter_sum(masses, batch, dim=0, dim_size=B), min=self.eps
-        )
-        com_0 = scatter_sum(pos_0 * masses, batch, dim=0, dim_size=B) / mass_per_mol
-        com_1 = scatter_sum(pos_1 * masses, batch, dim=0, dim_size=B) / mass_per_mol
+        com_0 = compute_center_of_mass(pos_0, batch, masses, dim_size=B)
+        com_1 = compute_center_of_mass(pos_1, batch, masses, dim_size=B)
         delta_trans = com_1 - com_0
 
         pos_0_centered = pos_0 - com_0[batch]
