@@ -148,7 +148,8 @@ class FlowMatchingLoss(nn.Module):
 
         if pred_affinity is not None and gt_affinity is not None:
             # 最后的安全检查，确保 gt_affinity 也是有效的
-            if torch.isnan(gt_affinity).any():
+            # 增加对 pred_affinity 的 NaN 检查
+            if torch.isnan(gt_affinity).any() or torch.isnan(pred_affinity).any():
                 raw_loss_energy = torch.tensor(0.0, device=device)
             else:
                 if pred_affinity.dim() == 1:

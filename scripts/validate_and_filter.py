@@ -6,24 +6,32 @@
 """
 
 import argparse
-from pathlib import Path
 import sys
 import csv
+import logging
+from pathlib import Path
+
+# 获取项目根目录
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
 
 def check_folder_consistency(ligand_dir, protein_dir):
     """
     检查 ligand 和 protein 文件夹的一致性。
     规则: 每一个 xxx_ligand.sdf 必须对应一个 xxx_protein.pdb
     """
-    print(f"Checking consistency between:\n  Ligand: {ligand_dir}\n  Protein: {protein_dir}")
+    logger.info(f"Checking consistency between:\n  Ligand: {ligand_dir}\n  Protein: {protein_dir}")
     
     if not ligand_dir.exists() or not protein_dir.exists():
-        print("Error: One or both directories do not exist.")
+        logger.error("Error: One or both directories do not exist.")
         return False
 
     #以此为基准：获取所有 ligand 前缀
-    ligand_files = list(ligand_dir.glob("*_ligand.sdf"))
-    protein_files = list(protein_dir.glob("*_protein.pdb"))
+    # 显式排序保证确定性
+    ligand_files = sorted(list(ligand_dir.glob("*_ligand.sdf")))
+    protein_files = sorted(list(protein_dir.glob("*_protein.pdb")))
     
     # 提取前缀集合
     # 假设文件名格式严格为 prefix_ligand.sdf 和 prefix_protein.pdb
@@ -35,11 +43,11 @@ def check_folder_consistency(ligand_dir, protein_dir):
     missing_proteins = ligand_prefixes - protein_prefixes
     
     if missing_proteins:
-        print(f"\n[WARN] Found {len(missing_proteins)} ligands without corresponding protein files.")
+        logger.warning(f"\n[WARN] Found {len(missing_proteins)} ligands without corresponding protein files.")
         # 这里仅警告，因为稍后 cleanup 会统一处理
         return True 
     else:
-        print("\n[PASS] All ligand files have corresponding protein files.")
+        logger.info("\n[PASS] All ligand files have corresponding protein files.")
         return True
 
 def filter_csv(input_csv, output_csv, ligand_dir, protein_dir):
@@ -53,23 +61,23 @@ def filter_csv(input_csv, output_csv, ligand_dir, protein_dir):
     valid_ids = set()
     
     if not input_path.exists():
-        print(f"Error: CSV file {input_path} not found.")
+        logger.error(f"Error: CSV file {input_path} not found.")
         return set()
 
-    print(f"\nFiltering CSV based on file existence...")
-    print(f"Input: {input_path}")
-    print(f"Output: {output_path}")
+    logger.info(f"\nFiltering CSV based on file existence...")
+    logger.info(f"Input: {input_path}")
+    logger.info(f"Output: {output_path}")
 
     valid_count = 0
     skipped_count = 0
     
     try:
-        with open(input_path, 'r', encoding='utf-8', newline='') as infile, \
+        with open(input_path, 'r', encoding='utf-8-sig', newline='') as infile, \
              open(output_path, 'w', encoding='utf-8', newline='') as outfile:
             
             reader = csv.DictReader(infile)
             if not reader.fieldnames:
-                print("Error: CSV file is empty.")
+                logger.error("Error: CSV file is empty.")
                 return set()
                 
             writer = csv.DictWriter(outfile, fieldnames=reader.fieldnames)
@@ -86,32 +94,33 @@ def filter_csv(input_csv, output_csv, ligand_dir, protein_dir):
                 
                 # 注意：这里需要处理文件路径检查
                 # 我们假设文件名是全小写的（因为 extract_affinity 已经转了 ID 为小写，rename_to_lowercase 也转了文件名）
+                lower_id = concat_id.lower()
                 
-                ligand_name = f"{concat_id}_ligand.sdf"
-                protein_name = f"{concat_id}_protein.pdb"
+                ligand_name = f"{lower_id}_ligand.sdf"
+                protein_name = f"{lower_id}_protein.pdb"
                 
                 ligand_file = ligand_dir / ligand_name
                 protein_file = protein_dir / protein_name
                 
                 if ligand_file.exists() and protein_file.exists():
                     writer.writerow(row)
-                    valid_ids.add(concat_id)
+                    valid_ids.add(lower_id)
                     valid_count += 1
                 else:
                     skipped_count += 1
                     # 可选：打印一些丢失的示例
-                    # if skipped_count <= 5:
-                    #     print(f"Skipping {concat_id}: One or both files missing.")
+                    if skipped_count <= 5:
+                        logger.debug(f"Skipping {concat_id}: One or both files missing.")
         
-        print("-" * 30)
-        print(f"Filter Complete.")
-        print(f"Valid pairs retained: {valid_count}")
-        print(f"Skipped rows: {skipped_count}")
-        print(f"New CSV saved to: {output_path}")
+        logger.info("-" * 30)
+        logger.info(f"Filter Complete.")
+        logger.info(f"Valid pairs retained: {valid_count}")
+        logger.info(f"Skipped rows: {skipped_count}")
+        logger.info(f"New CSV saved to: {output_path}")
         return valid_ids
 
     except Exception as e:
-        print(f"An error occurred during CSV filtering: {e}")
+        logger.error(f"An error occurred during CSV filtering: {e}")
         return set()
 
 def cleanup_extra_files(valid_ids, ligand_dir, protein_dir, dry_run=False):
@@ -119,12 +128,12 @@ def cleanup_extra_files(valid_ids, ligand_dir, protein_dir, dry_run=False):
     删除不在 valid_ids 列表中的所有 sdf 和 pdb 文件。
     确保文件夹内容与过滤后的 CSV 严格一致。
     """
-    print(f"\nCleaning up extra files (Dry Run: {dry_run})...")
+    logger.info(f"\nCleaning up extra files (Dry Run: {dry_run})...")
     
     deleted_count = 0
     
-    # 扫描配体文件夹
-    for file_path in ligand_dir.glob("*_ligand.sdf"):
+    # 扫描配体文件夹 (显式排序)
+    for file_path in sorted(list(ligand_dir.glob("*_ligand.sdf"))):
         prefix = file_path.name.lower().replace('_ligand.sdf', '')
         if prefix not in valid_ids:
             if not dry_run:
@@ -132,13 +141,13 @@ def cleanup_extra_files(valid_ids, ligand_dir, protein_dir, dry_run=False):
                     file_path.unlink()
                     deleted_count += 1
                 except Exception as e:
-                    print(f"Error deleting {file_path}: {e}")
+                    logger.error(f"Error deleting {file_path}: {e}")
             else:
-                 print(f"  [Would Delete] {file_path.name}")
+                 logger.info(f"  [Would Delete] {file_path.name}")
                  deleted_count += 1
     
-    # 扫描蛋白文件夹
-    for file_path in protein_dir.glob("*_protein.pdb"):
+    # 扫描蛋白文件夹 (显式排序)
+    for file_path in sorted(list(protein_dir.glob("*_protein.pdb"))):
         prefix = file_path.name.lower().replace('_protein.pdb', '')
         if prefix not in valid_ids:
             if not dry_run:
@@ -146,20 +155,28 @@ def cleanup_extra_files(valid_ids, ligand_dir, protein_dir, dry_run=False):
                     file_path.unlink()
                     deleted_count += 1
                 except Exception as e:
-                    print(f"Error deleting {file_path}: {e}")
+                    logger.error(f"Error deleting {file_path}: {e}")
             else:
-                 print(f"  [Would Delete] {file_path.name}")
+                 logger.info(f"  [Would Delete] {file_path.name}")
                  deleted_count += 1
                  
     action = "Deleted" if not dry_run else "Found"
-    print(f"Cleanup Complete. {action} {deleted_count} extra files.")
+    logger.info(f"Cleanup Complete. {action} {deleted_count} extra files.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Validate dataset file pairs, filter CSV, and cleanup extra files.")
-    parser.add_argument("--ligand_dir", type=str, default="/pavo/glen/Code/EHFNet/data/raw/pdbbind/ligand", help="Path to ligand directory")
-    parser.add_argument("--protein_dir", type=str, default="/pavo/glen/Code/EHFNet/data/raw/pdbbind/protein", help="Path to protein directory")
-    parser.add_argument("--input_csv", type=str, default="/pavo/glen/Code/EHFNet/data/raw/pdbbind/hiqbind_labels.csv", help="Input CSV file")
-    parser.add_argument("--output_csv", type=str, default="/pavo/glen/Code/EHFNet/data/raw/pdbbind/hiqbind_filtered.csv", help="Output filtered CSV file")
+    
+    # 动态默认路径
+    default_base = PROJECT_ROOT / "data/raw/pdbbind"
+    default_ligand = default_base / "ligand"
+    default_protein = default_base / "protein"
+    default_input = default_base / "hiqbind_labels.csv"
+    default_output = default_base / "hiqbind_filtered.csv"
+    
+    parser.add_argument("--ligand_dir", type=str, default=str(default_ligand), help="Path to ligand directory")
+    parser.add_argument("--protein_dir", type=str, default=str(default_protein), help="Path to protein directory")
+    parser.add_argument("--input_csv", type=str, default=str(default_input), help="Input CSV file")
+    parser.add_argument("--output_csv", type=str, default=str(default_output), help="Output filtered CSV file")
     
     parser.add_argument("--dry_run", action="store_true", help="Only show what would be deleted without actually deleting")
 
@@ -178,4 +195,4 @@ if __name__ == "__main__":
     if valid_ids:
         cleanup_extra_files(valid_ids, ligand_path, protein_path, dry_run=args.dry_run)
     else:
-        print("\n[SKIP] No valid IDs found or CSV processing failed. Skipping cleanup.")
+        logger.warning("\n[SKIP] No valid IDs found or CSV processing failed. Skipping cleanup.")

@@ -8,21 +8,33 @@ import argparse
 import os
 import sys
 import logging
-from datetime import datetime
 
-# 若从源码直接运行（未安装），将 src 加入 python path
-sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
+from datetime import datetime
+from pathlib import Path
+
+# 获取项目根目录
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+if str(PROJECT_ROOT / "src") not in sys.path:
+    sys.path.append(str(PROJECT_ROOT / "src"))
 
 from ehfnet.training.trainer import train
 import torch
-# import subprocess
+
+# [新增] 全局开启 TF32 (提速神器)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 def main():
     parser = argparse.ArgumentParser(description="Train EHFNet for molecular docking prediction")
     
     # 数据相关参数
-    parser.add_argument("--data_root", type=str, default="/pavo/glen/Code/EHFNet/data/processed/pdbbind", help="Path to PDBBind dataset root directory")
-    parser.add_argument("--index_file", type=str, default="/pavo/glen/Code/EHFNet/data/processed/pdbbind/index.csv", help="Path to index CSV or PDBBind index file")
+    # 使用动态路径作为默认值
+    default_data_root = PROJECT_ROOT / "data/processed/pdbbind"
+    default_index_file = default_data_root / "index.csv"
+    
+    parser.add_argument("--data_root", type=str, default=str(default_data_root), help="Path to PDBBind dataset root directory")
+    parser.add_argument("--index_file", type=str, default=str(default_index_file), help="Path to index CSV or PDBBind index file")
     parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--esm_path", type=str, default=None, help="Path to precomputed ESM embeddings (optional)")
     
@@ -45,7 +57,7 @@ def main():
     parser.add_argument("--device", type=str, default="auto", help="Device to use for training (e.g., 'cuda:0', 'cuda:1', 'cpu')")
     parser.add_argument("--pocket_radius", type=float, default=20.0, help="Radius (A) for protein pocket extraction (default: 20.0)")
     parser.add_argument("--warmup_epochs", type=int, default=20, help="Number of warmup epochs for spatial curriculum learning (default: 20)")
-    # parser.add_argument("--pro_res_cont_count", type=int, default=974, help="Protein residue continuous feature count (14 torsion + 960 ESM)")
+    parser.add_argument("--rmsd_ratio", type=float, default=0.1, help="Ratio of validation set to compute RMSD (0.0-1.0)")
 
     args = parser.parse_args()
     
@@ -81,23 +93,21 @@ def main():
     stats_file = os.path.join(args.data_root, "normalization_stats.pt")
     if not os.path.exists(stats_file):
         logger.warning(f"Normalization stats not found at {stats_file}. Computing now...")
-        # 动态调用统计脚本
-        # script_path = os.path.join(os.path.dirname(__file__), "scripts/compute_dataset_stats.py")
         processed_dir = os.path.join(args.data_root, "processed")
         
         try:
             # 确保 processed 目录存在
             if not os.path.exists(processed_dir):
-                 # 如果 processed 不存在，说明可能还没处理数据，dataset 会自动处理
-                 # 这里我们假设数据处理会在 Dataset 初始化时完成，所以先跳过
                  logger.warning(f"Processed data dir {processed_dir} not found. Stats will be computed next time.")
                  normalization_stats = None
+
             else:
                 # 调用脚本计算
                 from scripts.compute_dataset_stats import compute_stats
                 compute_stats(processed_dir, stats_file)
                 normalization_stats = torch.load(stats_file, weights_only=False)
                 logger.info("Stats computed and loaded.")
+
         except Exception as e:
             logger.error(f"Failed to compute stats: {e}")
             normalization_stats = None
@@ -127,6 +137,7 @@ def main():
             pocket_radius=args.pocket_radius,
             normalization_stats=normalization_stats,
             warmup_epochs=args.warmup_epochs,
+            rmsd_check_ratio=args.rmsd_ratio,
         )
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)

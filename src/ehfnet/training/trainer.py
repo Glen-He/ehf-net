@@ -15,13 +15,15 @@ from torch.utils.data import DataLoader
 from torch.amp.autocast_mode import autocast
 from torch.amp.grad_scaler import GradScaler
 
+from torch_scatter import scatter_mean
+
 from ehfnet.models import EHFNet
 from ehfnet.graph import GraphCollator
 from ehfnet.datasets.pdbbind import PDBBindDataset
+from ehfnet.datasets.splitter import ScaffoldSplitter
 from ehfnet.training.losses import FlowMatchingLoss
 from ehfnet.training.flow_matcher import ConditionalFlowMatcher
 
-from torch_scatter import scatter_mean
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,7 @@ def train(
     pocket_radius: float | None = 20.0,
     normalization_stats: dict | None = None,
     warmup_epochs: int = 20,
+    rmsd_check_ratio: float = 0.1,
 ):
     """
     训练 EHFNet 模型
@@ -73,11 +76,14 @@ def train(
         pocket_radius: 口袋提取半径 (Å)
         normalization_stats: 归一化统计数据
         warmup_epochs: 空间课程学习预热轮数
+        rmsd_check_ratio: 验证集中计算 RMSD 的样本比例 (0.0 ~ 1.0)
+                          例如 0.1 表示随机抽取 10% 的 batch 进行耗时的 RMSD 推演
     """
 
     # 1. 准备环境
     if device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     else:
         device = torch.device(device)
         
@@ -105,20 +111,28 @@ def train(
         pocket_radius=pocket_radius,
     )
 
-    # 简单的划分（实际项目中建议按 scaffold 划分）
-    train_size = int(0.9 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_set, val_set = torch.utils.data.random_split(
-        dataset, [train_size, val_size]
+    # [修改] 使用工程级 Scaffold Splitter
+    logger.info("Splitting dataset by Scaffold...")
+    
+    # 实例化 Splitter
+    splitter = ScaffoldSplitter(include_chirality=False, seed=42)
+    
+    # 执行划分 (Train 90%, Val 10%, Test 0%)
+    train_set, val_set, _ = splitter.split(
+        dataset,
+        frac_train=0.9,
+        frac_val=0.1,
+        frac_test=0.0
     )
 
-    logger.info(f"Train size: {len(train_set)}, Val size: {len(val_set)}")
+    logger.info(f"Final Dataset Sizes: Train={len(train_set)}, Val={len(val_set)}")
 
     train_loader = DataLoader(
         train_set,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=0,
+        num_workers=4,
+        persistent_workers=True,
         collate_fn=collator.collate,
         pin_memory=True,
     )
@@ -127,10 +141,20 @@ def train(
         val_set,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=4,
+        persistent_workers=True,
         collate_fn=collator.collate,
         pin_memory=True,
     )
+
+    # [新增逻辑] 计算需要检查的 Batch 数量
+    total_val_batches = len(val_loader)
+    rmsd_check_batches = int(total_val_batches * rmsd_check_ratio)
+    # 确保至少检查 1 个 batch (如果 ratio > 0)
+    if rmsd_check_ratio > 0 and rmsd_check_batches < 1:
+        rmsd_check_batches = 1
+    
+    logger.info(f"Validation Sampling: Check RMSD for {rmsd_check_batches}/{total_val_batches} batches ({rmsd_check_ratio*100:.1f}%)")
 
     # 3. 准备模型组件
     logger.info("Initializing Model & Flow Components...")
@@ -261,6 +285,7 @@ def train(
             device=device,
             epoch=epoch,
             total_epochs=epochs,
+            max_rmsd_batches=rmsd_check_batches,
         )
         scheduler.step(avg_val_loss)
 
@@ -303,6 +328,7 @@ def compute_validation_loss(
     device: torch.device,
     epoch: int | None = None,
     total_epochs: int = 1,
+    max_rmsd_batches: int = 10,
 ) -> float:
     """
     验证函数：计算 Loss 并统计全量 RMSD 指标
@@ -355,48 +381,49 @@ def compute_validation_loss(
 
             # 2. 全量 RMSD 推演
             # -----------------------------------------------------------
-            try:
-                # 克隆数据用于推演
-                infer_batch = batch.clone()
-                infer_batch["ligand_atom"].pos = x_1 
-                
-                # 获取当前空间尺度
-                current_scale = matcher.get_spatial_scale(epoch if epoch is not None else 0)
+            if i < max_rmsd_batches:
+                try:
+                    # 克隆数据用于推演
+                    infer_batch = batch.clone()
+                    infer_batch["ligand_atom"].pos = x_1 
+                    
+                    # 获取当前空间尺度
+                    current_scale = matcher.get_spatial_scale(epoch if epoch is not None else 0)
 
-                # 生成随机初始位姿
-                x_0_infer = matcher._generate_random_pose(
-                    x_ref=x_1,
-                    batch=infer_batch["ligand_atom"].batch,
-                    B=int(infer_batch["ligand_atom"].batch.max().item()) + 1,
-                    masses=infer_batch["ligand_atom"].masses,
-                    torsion_indices=getattr(infer_batch, "torsion_indices", None),
-                    torsion_moving_mask=getattr(infer_batch, "torsion_moving_mask", None),
-                    translation_scale=current_scale
-                )
-                
-                # 记录初始 RMSD
-                sq_diff_init = ((x_0_infer - x_1) ** 2).sum(dim=-1)
-                msd_init = scatter_mean(sq_diff_init, infer_batch["ligand_atom"].batch, dim=0)
-                rmsd_init = torch.sqrt(msd_init)
-                all_rmsd_init.append(rmsd_init)
+                    # 生成随机初始位姿
+                    x_0_infer = matcher._generate_random_pose(
+                        x_ref=x_1,
+                        batch=infer_batch["ligand_atom"].batch,
+                        B=int(infer_batch["ligand_atom"].batch.max().item()) + 1,
+                        masses=infer_batch["ligand_atom"].masses,
+                        torsion_indices=getattr(infer_batch, "torsion_indices", None),
+                        torsion_moving_mask=getattr(infer_batch, "torsion_moving_mask", None),
+                        translation_scale=current_scale
+                    )
+                    
+                    # 记录初始 RMSD
+                    sq_diff_init = ((x_0_infer - x_1) ** 2).sum(dim=-1)
+                    msd_init = scatter_mean(sq_diff_init, infer_batch["ligand_atom"].batch, dim=0)
+                    rmsd_init = torch.sqrt(msd_init)
+                    all_rmsd_init.append(rmsd_init)
 
-                # 执行推演
-                infer_batch["ligand_atom"].pos = x_0_infer
-                final_pos, _ = matcher.ode_solve(
-                    model=model,
-                    data=infer_batch,
-                    steps=20,       # 保持 20 步以兼顾速度和精度
-                    method="euler"
-                )
-                
-                # 记录最终 RMSD
-                sq_diff_final = ((final_pos - x_1) ** 2).sum(dim=-1)
-                msd_final = scatter_mean(sq_diff_final, infer_batch["ligand_atom"].batch, dim=0)
-                rmsd_final = torch.sqrt(msd_final)
-                all_rmsd_final.append(rmsd_final)
-                
-            except Exception as e:
-                logger.warning(f"RMSD inference failed for batch {i}: {e}")
+                    # 执行推演
+                    infer_batch["ligand_atom"].pos = x_0_infer
+                    final_pos, _ = matcher.ode_solve(
+                        model=model,
+                        data=infer_batch,
+                        steps=20,       # 保持 20 步以兼顾速度和精度
+                        method="euler"
+                    )
+                    
+                    # 记录最终 RMSD
+                    sq_diff_final = ((final_pos - x_1) ** 2).sum(dim=-1)
+                    msd_final = scatter_mean(sq_diff_final, infer_batch["ligand_atom"].batch, dim=0)
+                    rmsd_final = torch.sqrt(msd_final)
+                    all_rmsd_final.append(rmsd_final)
+                    
+                except Exception as e:
+                    logger.warning(f"RMSD inference failed for batch {i}: {e}")
             # -----------------------------------------------------------
 
         except Exception as e:

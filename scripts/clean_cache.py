@@ -8,97 +8,100 @@
 
 import shutil
 import argparse
+import logging
+
 from pathlib import Path
 from tqdm import tqdm
 
 
-def clean_esm_cache(data_root: str, dry_run: bool = False) -> tuple[int, int]:
-    """
-    Clean ESM embedding cache files (.npz) in cleaned folder.
+# 获取项目根目录 (假设脚本在 scripts/ 下)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
+
+def clean_esm_cache(data_root: str, dry_run: bool = False) -> tuple[int, float]:
+    """
+    Clean ESM cache files (.npz) in the 'cleaned' directory.
+    
     Args:
         data_root: Path to data/processed/pdbbind
         dry_run: If True, only print what would be deleted without actually deleting
-
+        
     Returns:
-        (number of files deleted, total size in MB)
+        (count, size_in_mb)
     """
 
-    cleaned_dir = Path(data_root) / "cleaned"
+    root = Path(data_root)
+    esm_cache_dir = root / "cleaned"
+    
+    if not esm_cache_dir.exists():
+        logger.warning(f"Directory not found: {esm_cache_dir}. Skipping ESM cache cleaning.")
+        return 0, 0.0
 
-    if not cleaned_dir.exists():
-        print(f"Cleaned directory not found: {cleaned_dir}")
-        return 0, 0
-
-    npz_files = list(cleaned_dir.rglob("*.npz"))
-
-    if not npz_files:
-        print("No .npz files found in cleaned directory.")
-        return 0, 0
-
-    total_size = sum(f.stat().st_size for f in npz_files)
-    total_size_mb = total_size / (1024 * 1024)
-
-    print(f"\nFound {len(npz_files)} .npz files ({total_size_mb:.2f} MB)")
-
+    npz_files = list(esm_cache_dir.rglob("*_esm.npz"))
+    count = len(npz_files)
+    
+    if count == 0:
+        return 0, 0.0
+        
+    size_bytes = sum(f.stat().st_size for f in npz_files)
+    size_mb = size_bytes / (1024 * 1024)
+    
+    logger.info(f"Found {count} .npz files ({size_mb:.2f} MB)")
+    
     if dry_run:
-        print("[DRY RUN] Would delete:")
-        for f in npz_files[:5]:  # Show first 5 as examples
-            print(f"  - {f.relative_to(data_root)}")
-        if len(npz_files) > 5:
-            print(f"  ... and {len(npz_files) - 5} more files")
-        return 0, 0
-
-    print("Deleting .npz files...")
-    for npz_file in tqdm(npz_files, desc="Cleaning ESM cache"):
+        return count, size_mb
+        
+    logger.info("Deleting .npz files...")
+    
+    for f in tqdm(npz_files, desc="Cleaning ESM cache"):
         try:
-            npz_file.unlink()
-        except Exception as e:
-            print(f"Failed to delete {npz_file}: {e}")
+            f.unlink()
+        except OSError as e:
+            logger.error(f"Failed to delete {f}: {e}")
+            
+    return count, size_mb
 
-    return len(npz_files), int(total_size_mb)
 
-
-def clean_processed_folder(data_root: str, dry_run: bool = False) -> tuple[bool, int]:
+def clean_processed_folder(data_root: str, dry_run: bool = False) -> tuple[bool, float]:
     """
-    Clean the entire processed folder.
-
+    Clean the entire 'processed' folder.
+    
     Args:
         data_root: Path to data/processed/pdbbind
         dry_run: If True, only print what would be deleted without actually deleting
-
+        
     Returns:
-        (success, folder size in MB)
+        (success, size_in_mb)
     """
 
-    processed_dir = Path(data_root) / "processed"
-
+    root = Path(data_root)
+    processed_dir = root / "processed"
+    
     if not processed_dir.exists():
-        print(f"\nProcessed directory not found: {processed_dir}")
-        return False, 0
-
-    # Calculate folder size
-    total_size = sum(
-        f.stat().st_size for f in processed_dir.rglob("*") if f.is_file()
-    )
-    total_size_mb = total_size / (1024 * 1024)
-    num_files = sum(1 for _ in processed_dir.rglob("*") if _.is_file())
-
-    print(f"\nFound processed folder: {num_files} files ({total_size_mb:.2f} MB)")
-
+        return True, 0.0
+        
+    # 计算大小
+    files = list(processed_dir.rglob("*"))
+    size_bytes = sum(f.stat().st_size for f in files if f.is_file())
+    size_mb = size_bytes / (1024 * 1024)
+    
+    logger.info(f"Found processed folder: {len(files)} files ({size_mb:.2f} MB)")
+    
     if dry_run:
-        print(f"[DRY RUN] Would delete entire folder: {processed_dir}")
-        return False, int(total_size_mb)
-
+        logger.info(f"[DRY RUN] Would delete: {processed_dir}")
+        return False, size_mb
+        
+    logger.info(f"Deleting processed folder: {processed_dir}")
+    
     try:
-        print(f"Deleting processed folder: {processed_dir}")
         shutil.rmtree(processed_dir)
-        print("✓ Processed folder deleted successfully")
-        return True, int(total_size_mb)
-
+        logger.info("✓ Processed folder deleted successfully")
+        return True, size_mb
     except Exception as e:
-        print(f"Failed to delete processed folder: {e}")
-        return False, 0
+        logger.error(f"Failed to delete {processed_dir}: {e}")
+        return False, 0.0
 
 
 def clean_normalization_stats(data_root: str, dry_run: bool = False) -> tuple[bool, int]:
@@ -112,36 +115,42 @@ def clean_normalization_stats(data_root: str, dry_run: bool = False) -> tuple[bo
     Returns:
         (success, file size in bytes)
     """
+
     stats_file = Path(data_root) / "normalization_stats.pt"
     
     if not stats_file.exists():
-        print(f"\nNormalization stats not found: {stats_file}")
+        logger.info(f"Normalization stats not found: {stats_file}")
         return False, 0
     
     size = stats_file.stat().st_size
     
     if dry_run:
-        print(f"[DRY RUN] Would delete: {stats_file}")
+        logger.info(f"[DRY RUN] Would delete: {stats_file}")
         return False, size
         
     try:
         stats_file.unlink()
-        print(f"\nDeleted normalization stats: {stats_file}")
+        logger.info(f"Deleted normalization stats: {stats_file}")
         return True, size
+        
     except Exception as e:
-        print(f"Failed to delete {stats_file}: {e}")
+        logger.error(f"Failed to delete {stats_file}: {e}")
         return False, 0
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Clean training cache files in data/processed/pdbbind",
+        description="Clean training cache files",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    
+    # 动态默认路径
+    default_data_root = PROJECT_ROOT / "data/processed/pdbbind"
+    
     parser.add_argument(
         "--data-root",
         type=str,
-        default="data/processed/pdbbind",
+        default=str(default_data_root),
         help="Path to processed data root",
     )
     parser.add_argument(
@@ -151,10 +160,10 @@ def main():
         help="Show what would be deleted without actually deleting",
     )
     parser.add_argument(
-        "--skip-esm",
+        "--clean-esm",
         action="store_true",
         default=False,
-        help="Skip cleaning ESM cache files (.npz)",
+        help="Enable cleaning of ESM cache files (.npz) (Default: False)",
     )
     parser.add_argument(
         "--skip-processed",
@@ -174,24 +183,26 @@ def main():
     data_root = Path(args.data_root)
 
     if not data_root.exists():
-        print(f"Error: Data root not found: {data_root}")
+        logger.error(f"Error: Data root not found: {data_root}")
         return
 
-    print("=" * 60)
-    print("EHFNet Cache Cleaner")
-    print("=" * 60)
-    print(f"Target: {data_root.absolute()}")
-    print(f"Mode: {'DRY RUN (no files will be deleted)' if args.dry_run else 'DELETION'}")
-    print("=" * 60)
+    logger.info("=" * 60)
+    logger.info("EHFNet Cache Cleaner")
+    logger.info("=" * 60)
+    logger.info(f"Target: {data_root.absolute()}")
+    logger.info(f"Mode: {'DRY RUN (no files will be deleted)' if args.dry_run else 'DELETION'}")
+    logger.info("=" * 60)
 
     total_freed_bytes = 0
 
     # Clean ESM cache
-    if not args.skip_esm:
+    if args.clean_esm:
         npz_count, npz_size_mb = clean_esm_cache(str(data_root), args.dry_run)
         total_freed_bytes += npz_size_mb * 1024 * 1024
         if not args.dry_run and npz_count > 0:
-            print(f"✓ Deleted {npz_count} .npz files ({npz_size_mb} MB)")
+            logger.info(f"✓ Deleted {npz_count} .npz files ({npz_size_mb:.2f} MB)")
+    else:
+        logger.info("Skipping ESM cache cleaning (use --clean-esm to enable).")
 
     # Clean processed folder
     if not args.skip_processed:
@@ -205,14 +216,14 @@ def main():
 
     total_freed_mb = total_freed_bytes / (1024 * 1024)
     
-    print("\n" + "=" * 60)
+    logger.info("\n" + "=" * 60)
     if args.dry_run:
-        print(f"[DRY RUN] Would free approximately {total_freed_mb:.2f} MB")
-        print("\nRe-run without --dry-run to actually delete files.")
+        logger.info(f"[DRY RUN] Would free approximately {total_freed_mb:.2f} MB")
+        logger.info("\nRe-run without --dry-run to actually delete files.")
     else:
-        print(f"Total space freed: {total_freed_mb:.2f} MB")
-        print("Cache cleaning completed!")
-    print("=" * 60)
+        logger.info(f"Total space freed: {total_freed_mb:.2f} MB")
+        logger.info("Cache cleaning completed!")
+    logger.info("=" * 60)
 
 
 if __name__ == "__main__":

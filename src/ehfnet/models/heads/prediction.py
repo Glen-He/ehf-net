@@ -240,10 +240,11 @@ class PredictionHead(nn.Module):
             if isinstance(module, nn.Linear) and module.out_features == 1:
 
                 if module.bias is not None:
-                    # Change bias from -2.0 to 0.0 to prevent "vanishing velocity" at early stage.
-                    # Softplus(0.0) ≈ 0.69 (large enough initial inverse mass)
-                    # Softplus(-2.0) ≈ 0.13 (too small, causes slow movement)
-                    nn.init.constant_(module.bias, 0.0)
+                    # Change bias from -2.0 to -1.0.
+                    # Softplus(-1.0) ≈ 0.31 (Balanced initial inverse mass)
+                    # Softplus(0.0) ≈ 0.69 (Fast movement)
+                    # Softplus(-2.0) ≈ 0.13 (Slow movement)
+                    nn.init.constant_(module.bias, -1.0)
 
                 break
 

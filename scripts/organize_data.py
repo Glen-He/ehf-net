@@ -9,7 +9,15 @@ import os
 import shutil
 import pandas as pd
 import argparse
+import logging
 from tqdm import tqdm
+from pathlib import Path
+
+# 获取项目根目录 (假设脚本在 scripts/ 下)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
 
 def organize_data(raw_root, target_root, index_file):
     """
@@ -26,7 +34,7 @@ def organize_data(raw_root, target_root, index_file):
     Target structure:
         target_root/
             index.csv
-            cleaned/    <-- Changed from 'raw'
+            cleaned/
                 {pdb_id}/
                     {pdb_id}_ligand.sdf
                     {pdb_id}_protein.pdb
@@ -38,11 +46,11 @@ def organize_data(raw_root, target_root, index_file):
     target_subdir = os.path.join(target_root, "cleaned")
     os.makedirs(target_subdir, exist_ok=True)
     
-    print(f"Source: {raw_root}")
-    print(f"Target: {target_root}")
+    logger.info(f"Source: {raw_root}")
+    logger.info(f"Target: {target_root}")
     
     # 2. Process Index CSV
-    print("Processing index file...")
+    logger.info("Processing index file...")
     if not os.path.exists(index_file):
         raise FileNotFoundError(f"Index file not found: {index_file}")
         
@@ -57,7 +65,7 @@ def organize_data(raw_root, target_root, index_file):
     # Check if mapping is needed
     if "Concatenated ID" in df.columns:
         df.rename(columns=rename_map, inplace=True)
-        print("  Renamed columns to standard format.")
+        logger.info("  Renamed columns to standard format.")
     
     # Ensure required columns exist
     if "pdb_id" not in df.columns or "affinity" not in df.columns:
@@ -66,18 +74,21 @@ def organize_data(raw_root, target_root, index_file):
     # Save standard index.csv
     target_index_path = os.path.join(target_root, "index.csv")
     df[["pdb_id", "affinity"]].to_csv(target_index_path, index=False)
-    print(f"  Saved standard index to: {target_index_path}")
+    logger.info(f"  Saved standard index to: {target_index_path}")
     
     # 3. Reorganize Files
-    print("Reorganizing files...")
+    logger.info("Reorganizing files...")
     ligand_dir = os.path.join(raw_root, "ligand")
     protein_dir = os.path.join(raw_root, "protein")
     
     success_count = 0
     missing_count = 0
     
-    for pdb_id in tqdm(df["pdb_id"]):
-        pdb_id = str(pdb_id).lower()
+    # 显式排序以保证确定性
+    pdb_ids = sorted(df["pdb_id"].astype(str))
+    
+    for pdb_id in tqdm(pdb_ids):
+        pdb_id = pdb_id.lower()
         
         # Define source paths
         # Note: Handling potential variations in naming if necessary. 
@@ -94,12 +105,11 @@ def organize_data(raw_root, target_root, index_file):
         
         # Check existence
         if not os.path.exists(src_ligand) or not os.path.exists(src_protein):
-            # print(f"Missing files for {pdb_id}")
+            # logger.warning(f"Missing files for {pdb_id}")
             missing_count += 1
             continue
             
         # Create target folder
-        # target_subdir 是我们在开头定义的新变量名 (指向 cleaned 文件夹)
         target_pdb_dir = os.path.join(target_subdir, pdb_id)
         os.makedirs(target_pdb_dir, exist_ok=True)
         
@@ -113,27 +123,32 @@ def organize_data(raw_root, target_root, index_file):
                 
             success_count += 1
         except Exception as e:
-            print(f"Error copying {pdb_id}: {e}")
+            logger.error(f"Error copying {pdb_id}: {e}")
             
-    print(f"\nDone!")
-    print(f"  Successfully processed: {success_count}")
-    print(f"  Missing/Skipped: {missing_count}")
-    print(f"  Output directory: {target_root}")
+    logger.info("\nDone!")
+    logger.info(f"  Successfully processed: {success_count}")
+    logger.info(f"  Missing/Skipped: {missing_count}")
+    logger.info(f"  Output directory: {target_root}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Reorganize raw data into PDBBind structure")
-    parser.add_argument("--raw_root", type=str, default="/pavo/glen/Code/EHFNet/data/raw/pdbbind", help="Path to source raw directory (containing ligand/protein folders)")
-    # 更改默认输出目录名为 pdbbind_processed
-    parser.add_argument("--target_root", type=str, default="/pavo/glen/Code/EHFNet/data/processed/pdbbind", help="Path to target directory")
-    parser.add_argument("--index_file", type=str, default="/pavo/glen/Code/EHFNet/data/raw/pdbbind/hiqbind_filtered.csv", help="Path to source CSV index file")
+    
+    # 动态默认路径
+    default_raw_root = PROJECT_ROOT / "data/raw/pdbbind"
+    default_target_root = PROJECT_ROOT / "data/processed/pdbbind"
+    default_index_file = default_raw_root / "hiqbind_filtered.csv"
+    
+    parser.add_argument("--raw_root", type=str, default=str(default_raw_root), help="Path to source raw directory (containing ligand/protein folders)")
+    parser.add_argument("--target_root", type=str, default=str(default_target_root), help="Path to target directory")
+    parser.add_argument("--index_file", type=str, default=str(default_index_file), help="Path to source CSV index file")
     
     args = parser.parse_args()
     
     # 打印一下当前的配置，方便用户确认
-    print("-" * 30)
-    print(f"Index File  : {args.index_file}")
-    print(f"Raw Root    : {args.raw_root}")
-    print(f"Target Root : {args.target_root}")
-    print("-" * 30)
+    logger.info("-" * 30)
+    logger.info(f"Index File  : {args.index_file}")
+    logger.info(f"Raw Root    : {args.raw_root}")
+    logger.info(f"Target Root : {args.target_root}")
+    logger.info("-" * 30)
 
     organize_data(args.raw_root, args.target_root, args.index_file)

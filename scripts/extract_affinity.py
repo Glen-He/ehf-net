@@ -6,40 +6,52 @@
 """
 
 import csv
-import os
 import argparse
+import logging
+
 from pathlib import Path
+
+# 获取项目根目录
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger(__name__)
 
 def extract_affinity(input_file, output_file, precision=3):
     """
     提取 CSV 文件中的 Concatenated ID 和 Log Binding Affinity 列。
     将 Concatenated ID 转换为小写，结合能保留指定小数位，并保存到新文件。
     """
+    
     input_path = Path(input_file)
     output_path = Path(output_file)
 
     if not input_path.exists():
-        print(f"Error: Input file '{input_file}' not found.")
+        logger.error(f"Error: Input file '{input_file}' not found.")
         return
 
-    print(f"Processing {input_path} ...")
+    logger.info(f"Processing {input_path} ...")
 
     try:
-        with open(input_path, mode='r', encoding='utf-8', newline='') as infile, \
+        with open(input_path, mode='r', encoding='utf-8-sig', newline='') as infile, \
              open(output_path, mode='w', encoding='utf-8', newline='') as outfile:
             
+            # 使用 DictReader 读取
             reader = csv.DictReader(infile)
+            
+            # 自动去除可能的BOM并normalize列名（可选优化，这里假设列名准确但可能有BOM，已用utf-8-sig解决）
+            if not reader.fieldnames:
+                 logger.error("Error: Empty file or no header found.")
+                 return
+            
             fieldnames = ['Concatenated ID', 'Log Binding Affinity']
             
-            # check if columns exist
-            # reader.fieldnames 可能是 None，需要先做判断
-            if not reader.fieldnames:
-                 print("Error: Empty file or no header found.")
-                 return
-
+            # 检查列是否存在
             if not set(fieldnames).issubset(set(reader.fieldnames)):
                  missing = set(fieldnames) - set(reader.fieldnames)
-                 print(f"Error: Missing columns in input file: {missing}")
+                 logger.error(f"Error: Missing columns in input file: {missing}")
+                 # 打印实际列名以供调试
+                 logger.error(f"Found columns: {reader.fieldnames}")
                  return
 
             writer = csv.DictWriter(outfile, fieldnames=fieldnames)
@@ -48,8 +60,12 @@ def extract_affinity(input_file, output_file, precision=3):
             count = 0
             for row in reader:
                 # 提取并处理数据
-                concatenated_id = row['Concatenated ID'].lower()
-                affinity_str = row['Log Binding Affinity']
+                raw_id = row.get('Concatenated ID', '')
+                if not raw_id:
+                    continue
+                    
+                concatenated_id = raw_id.lower().strip()
+                affinity_str = row.get('Log Binding Affinity', '').strip()
                 
                 # 尝试格式化 affinity
                 try:
@@ -66,30 +82,32 @@ def extract_affinity(input_file, output_file, precision=3):
                 })
                 count += 1
                 
-        print(f"Successfully processed {count} records.")
-        print(f"Saved to {output_path}")
+        logger.info(f"Successfully processed {count} records.")
+        logger.info(f"Saved to {output_path}")
 
     except Exception as e:
-        print(f"An error occurred: {e}")
+        logger.error(f"An error occurred: {e}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Extract ID and Affinity from CSV.")
-    parser.add_argument("--input", "-i", type=str, help="Input CSV file path")
-    parser.add_argument("--output", "-o", type=str, help="Output CSV file path")
-    # 添加精度参数，默认为 6
+    
+    # 动态默认路径
+    default_base = PROJECT_ROOT / "data/raw/pdbbind"
+    default_input = default_base / "hiqbind_info.csv"
+    default_output = default_base / "hiqbind_labels.csv"
+    
+    parser.add_argument("--input", "-i", type=str, default=str(default_input), help="Input CSV file path")
+    parser.add_argument("--output", "-o", type=str, default=str(default_output), help="Output CSV file path")
     parser.add_argument("--precision", "-p", type=int, default=6, help="Decimal precision for affinity (default: 6)")
     
     args = parser.parse_args()
     
-    # 默认路径使用绝对路径，确保在任何目录下运行都能找到文件
-    default_base = Path("/pavo/glen/Code/EHFNet/data/raw/pdbbind")
-    
-    input_full_path = Path(args.input) if args.input else default_base / "hiqbind_info.csv"
-    output_full_path = Path(args.output) if args.output else default_base / "hiqbind_labels.csv"
+    input_full_path = Path(args.input)
+    output_full_path = Path(args.output)
 
-    print(f"Input: {input_full_path}")
-    print(f"Output: {output_full_path}")
-    print(f"Precision: {args.precision} decimal places")
-    print("-" * 30)
+    logger.info(f"Input: {input_full_path}")
+    logger.info(f"Output: {output_full_path}")
+    logger.info(f"Precision: {args.precision} decimal places")
+    logger.info("-" * 30)
 
     extract_affinity(input_full_path, output_full_path, precision=args.precision)

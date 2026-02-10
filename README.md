@@ -49,7 +49,7 @@
 请遵循以下目录结构组织您的 PDBBind 数据集：
 
 ```text
-data_root/
+data_root/                        # [必须] 数据根目录
 ├── cleaned/                      # [必须] 存放原始结构文件
 │   ├── 1a2b/                     # 每个 PDB ID 一个子文件夹
 │   │   ├── 1a2b_ligand.sdf       # 配体 (支持 .sdf/.mol2)
@@ -67,6 +67,37 @@ pdb_id,affinity
 3c4d,7.2
 ```
 
+## 🛠️ 数据处理流程
+
+本项目提供了完整的工程化数据处理脚本，帮助您从原始数据生成标准数据集。
+
+### 1. 提取亲和力标签
+从原始 PDBBind 索引文件中提取 `pdb_id` 和 `affinity`：
+```bash
+uv run python scripts/extract_affinity.py \
+    --input data/raw/pdbbind/hiqbind_info.csv \
+    --output data/raw/pdbbind/hiqbind_labels.csv
+```
+
+### 2. 验证与清洗
+检查文件完整性，过滤缺失文件：
+```bash
+uv run python scripts/validate_and_filter.py \
+    --ligand_dir data/raw/pdbbind/ligand \
+    --protein_dir data/raw/pdbbind/protein \
+    --input_csv data/raw/pdbbind/hiqbind_labels.csv \
+    --output_csv data/raw/pdbbind/hiqbind_filtered.csv
+```
+
+### 3. 重组数据结构
+将扁平的文件夹结构重组为标准的嵌套结构：
+```bash
+uv run python scripts/organize_data.py \
+    --raw_root data/raw/pdbbind \
+    --target_root data/processed/pdbbind \
+    --index_file data/raw/pdbbind/hiqbind_filtered.csv
+```
+
 ## 🚀 训练 (Training)
 
 使用 `train.py` 启动训练。我们提供了丰富的命令行参数以支持灵活配置。
@@ -76,8 +107,8 @@ pdb_id,affinity
 ```bash
 # 单卡训练 (启用课程学习)
 uv run python train.py \
-    --data_root ./data/pdbbind \
-    --index_file ./data/pdbbind/index.csv \
+    --data_root ./data/processed/pdbbind \
+    --index_file ./data/processed/pdbbind/index.csv \
     --batch_size 16 \
     --warmup_epochs 20 \
     --device cuda:0

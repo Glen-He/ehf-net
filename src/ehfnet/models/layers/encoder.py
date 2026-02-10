@@ -12,6 +12,7 @@ from torch import nn, Tensor
 from torch.nn import ModuleList
 from torch_geometric.data import HeteroData
 from torch_geometric import nn as pyg_nn
+from torch_geometric.nn.conv import MessagePassing
 from egnn_pytorch import EGNN_Sparse
 
 from ehfnet.graph.hetero_schema import (
@@ -183,7 +184,7 @@ class EHFEncoder(nn.Module):
         Returns:
             异构图卷积模块
         """
-        conv_layers: dict[tuple[str, str, str], pyg_nn.SAGEConv] = {}
+        conv_layers: dict[tuple[str, str, str], MessagePassing] = {}
 
         for src, rel, dst in edges:
             conv_layers[(src, rel, dst)] = pyg_nn.SAGEConv(
@@ -303,8 +304,8 @@ class EHFEncoder(nn.Module):
         return x_dict, pos_dict, initial_lig_pos
 
 
-    @staticmethod
     def _run_egnn_on_atoms(
+        self,
         egnn_layer: EGNN_Sparse,
         x_dict: dict[str, Tensor],
         pos_dict: dict[str, Tensor],
@@ -421,6 +422,77 @@ class EHFEncoder(nn.Module):
         return x_dict
 
 
+    def _run_block(
+        self,
+        block: nn.ModuleDict,
+        x_dict: dict[str, Tensor],
+        pos_dict: dict[str, Tensor],
+        edge_dict: dict[tuple[str, str, str], Tensor],
+    ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
+        """
+        运行单个 GNN 块
+        """
+        typed_block = cast(nn.ModuleDict, block)
+
+        # 阶段 1: 层内精化
+        if "1_intra_egnn" in typed_block:
+            x_dict, pos_dict = self._run_egnn_on_atoms(
+                cast(EGNN_Sparse, typed_block["1_intra_egnn"]),
+                x_dict,
+                pos_dict,
+                edge_dict,
+                self.intra_atom_edges,
+            )
+
+        if "1_intra_gnn" in typed_block:
+            out = typed_block["1_intra_gnn"](x_dict, edge_dict)
+            x_dict = self._apply_residual_update(
+                x_dict, out, cast(nn.ModuleDict, typed_block["1_intra_update"])
+            )
+
+        # 阶段 2: 自下而上聚合
+        if "2_agg_gnn" in typed_block:
+            out = typed_block["2_agg_gnn"](x_dict, edge_dict)
+            x_dict = self._apply_residual_update(
+                x_dict, out, cast(nn.ModuleDict, typed_block["2_agg_update"])
+            )
+
+        # 阶段 3: 层间交互
+        if "3_inter_egnn" in typed_block:
+            x_dict, pos_dict = self._run_egnn_on_atoms(
+                cast(EGNN_Sparse, typed_block["3_inter_egnn"]),
+                x_dict,
+                pos_dict,
+                edge_dict,
+                self.inter_atom_edges,
+            )
+
+        if "3_inter_gnn" in typed_block:
+            out = typed_block["3_inter_gnn"](x_dict, edge_dict)
+            x_dict = self._apply_residual_update(
+                x_dict, out, cast(nn.ModuleDict, typed_block["3_inter_update"])
+            )
+
+        # 阶段 4: 自上而下广播
+        if "4_bcast_gnn" in typed_block:
+            out = typed_block["4_bcast_gnn"](x_dict, edge_dict)
+            x_dict = self._apply_residual_update(
+                x_dict, out, cast(nn.ModuleDict, typed_block["4_bcast_update"])
+            )
+
+        # 全局特征精化
+        if "post_mlp" in typed_block:
+            post_mlp = cast(nn.ModuleDict, typed_block["post_mlp"])
+
+            for nt in x_dict:
+                
+                if nt in post_mlp:
+                    update = post_mlp[nt](x_dict[nt])
+                    x_dict[nt] = x_dict[nt] + update
+        
+        return x_dict, pos_dict
+
+
     def forward(self, data: HeteroData, t: Tensor) -> dict[str, Any]:
         """
         前向传播
@@ -465,63 +537,9 @@ class EHFEncoder(nn.Module):
 
         # 运行 GNN 块
         for block in self.gnn_blocks:
-            typed_block = cast(nn.ModuleDict, block)
-
-            # 阶段 1: 层内精化
-            if "1_intra_egnn" in typed_block:
-                x_dict, pos_dict = self._run_egnn_on_atoms(
-                    typed_block["1_intra_egnn"],
-                    x_dict,
-                    pos_dict,
-                    edge_dict,
-                    self.intra_atom_edges,
-                )
-
-            if "1_intra_gnn" in typed_block:
-                out = typed_block["1_intra_gnn"](x_dict, edge_dict)
-                x_dict = self._apply_residual_update(
-                    x_dict, out, cast(nn.ModuleDict, typed_block["1_intra_update"])
-                )
-
-            # 阶段 2: 自下而上聚合
-            if "2_agg_gnn" in typed_block:
-                out = typed_block["2_agg_gnn"](x_dict, edge_dict)
-                x_dict = self._apply_residual_update(
-                    x_dict, out, cast(nn.ModuleDict, typed_block["2_agg_update"])
-                )
-
-            # 阶段 3: 层间交互
-            if "3_inter_egnn" in typed_block:
-                x_dict, pos_dict = self._run_egnn_on_atoms(
-                    typed_block["3_inter_egnn"],
-                    x_dict,
-                    pos_dict,
-                    edge_dict,
-                    self.inter_atom_edges,
-                )
-
-            if "3_inter_gnn" in typed_block:
-                out = typed_block["3_inter_gnn"](x_dict, edge_dict)
-                x_dict = self._apply_residual_update(
-                    x_dict, out, cast(nn.ModuleDict, typed_block["3_inter_update"])
-                )
-
-            # 阶段 4: 自上而下广播
-            if "4_bcast_gnn" in typed_block:
-                out = typed_block["4_bcast_gnn"](x_dict, edge_dict)
-                x_dict = self._apply_residual_update(
-                    x_dict, out, cast(nn.ModuleDict, typed_block["4_bcast_update"])
-                )
-
-            # 全局特征精化
-            if "post_mlp" in typed_block:
-                post_mlp = cast(nn.ModuleDict, typed_block["post_mlp"])
-
-                for nt in x_dict:
-                    
-                    if nt in post_mlp:
-                        update = post_mlp[nt](x_dict[nt])
-                        x_dict[nt] = x_dict[nt] + update
+            x_dict, pos_dict = self._run_block(
+                cast(nn.ModuleDict, block), x_dict, pos_dict, edge_dict
+            )
 
         # 计算速度：v = pos_out - pos_in
         vel_dict: dict[str, Tensor] = {}
