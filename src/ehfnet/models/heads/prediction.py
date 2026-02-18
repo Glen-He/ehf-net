@@ -321,7 +321,8 @@ class PredictionHead(nn.Module):
 
             return {
                 "v_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
-                "binding_affinity": self.aff_mean.expand(B).unsqueeze(-1),
+                # 训练目标使用归一化亲和力标签，这里保持输出在归一化空间
+                "binding_affinity": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
                 "force_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
             }
 
@@ -348,7 +349,8 @@ class PredictionHead(nn.Module):
 
             return {
                 "v_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
-                "binding_affinity": self.aff_mean.expand(B).unsqueeze(-1),
+                # 无有效相互作用边时输出标准化空间的基线值（0）
+                "binding_affinity": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
                 "force_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
             }
 
@@ -449,11 +451,9 @@ class PredictionHead(nn.Module):
         E_correction = self.global_correction_mlp(global_input).squeeze(-1)
 
         # 最终能量 (Score)
-        # 神经网络输出的是归一化的分数 (期望在 0 附近)
+        # 保持在归一化空间，与训练标签 y_energy 对齐，避免尺度错配
         score_norm = E_physical + E_correction
-        
-        # 反归一化，输出真实物理值
-        binding_affinity = (score_norm * self.aff_std + self.aff_mean).unsqueeze(-1)
+        binding_affinity = score_norm.unsqueeze(-1)
 
         return {
             "v_atomic": v_atomic,
