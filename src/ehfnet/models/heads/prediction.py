@@ -371,6 +371,8 @@ class PredictionHead(nn.Module):
         pair_input = torch.cat([lig_feat_sel, pro_feat_sel, edge_feat], dim=-1)
 
         force_magnitude = self.force_magnitude_mlp(pair_input)
+        # [Fix] 截断力场幅值，防止训练初期梯度爆炸导致 RMSD 变差
+        force_magnitude = torch.clamp(force_magnitude, min=-10.0, max=10.0)
 
         rel_pos = lig_pos_sel - pro_pos_sel
         direction = torch.nn.functional.normalize(

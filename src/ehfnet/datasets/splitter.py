@@ -154,8 +154,12 @@ class ScaffoldSplitter:
             else:
                 raise ValueError("Dataset must have 'index_df' attribute or it must be provided.")
         
-        # 此时 index_df 保证不为 None
-        assert index_df is not None
+        # [关键新增 1] 检查 dataset 是否有 PDB ID 到 Index 的映射
+        # PDBBindDataset 应该有 _pdb_to_idx 属性
+        if not hasattr(dataset, "_pdb_to_idx"):
+            raise AttributeError("Dataset must have '_pdb_to_idx' attribute mapping pdb_id to index.")
+        
+        pdb_to_idx = getattr(dataset, "_pdb_to_idx")
 
         logger.info(f"Start Scaffold Split (seed={self.seed})...")
         
@@ -163,6 +167,7 @@ class ScaffoldSplitter:
         # scaffold_map: dict[scaffold_smiles, list[dataset_index]]
         scaffold_map = defaultdict(list)
         invalid_count = 0
+        missing_in_dataset_count = 0 # [新增] 统计在 CSV 中但不在 Dataset 中的样本
         
         # 获取 raw_dir (假设 dataset 结构)
         raw_dir = getattr(dataset, "raw_dir", ".")
@@ -171,7 +176,16 @@ class ScaffoldSplitter:
         pbar = tqdm(index_df.iterrows(), total=len(index_df), desc="Analyzing Scaffolds")
         
         for idx, row in pbar:
-            pdb_id = row["pdb_id"]
+            pdb_id = str(row["pdb_id"]).lower() # 确保格式统一
+            
+            # [关键修改 2] 先检查该 PDB ID 是否在 Dataset 中有效
+            # 如果 Dataset 没加载这个样本（处理失败等），直接跳过，防止索引越界
+            if pdb_id not in pdb_to_idx:
+                missing_in_dataset_count += 1
+                continue
+                
+            # 获取真实的 dataset index
+            real_dataset_idx = pdb_to_idx[pdb_id]
             
             # 构建文件路径逻辑 (复用 pdbbind.py 的逻辑)
             # 这里为了解耦，重新构建路径检查，也可以让 dataset 提供 helper
@@ -191,10 +205,14 @@ class ScaffoldSplitter:
             else:
                 scaffold = generate_scaffold(mol, self.include_chirality)
 
-            scaffold_map[scaffold].append(idx)
+            # [关键修改 3] 这里存入 real_dataset_idx，而不是 CSV 的 idx
+            scaffold_map[scaffold].append(real_dataset_idx)
 
         if invalid_count > 0:
-            logger.warning(f"Failed to process {invalid_count} ligands. Assigned to 'null' group.")
+            logger.warning(f"Failed to generate scaffolds for {invalid_count} ligands.")
+            
+        if missing_in_dataset_count > 0:
+            logger.warning(f"Skipped {missing_in_dataset_count} entries present in CSV but missing in Dataset (processing failed?).")
 
         # 2. 排序骨架组
         # 关键步骤：按每个骨架包含的分子数量降序排列

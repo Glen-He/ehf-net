@@ -28,7 +28,7 @@ class ConditionalFlowMatcher:
         self, 
         sigma_min: float = 1e-4,
         spatial_sigma_min: float = 1.0,
-        spatial_sigma_max: float = 10.0,
+        spatial_sigma_max: float = 6.0,
         warmup_epochs: int = 20
     ) -> None:
         """
@@ -138,11 +138,13 @@ class ConditionalFlowMatcher:
         try:
             x_t, v_t = self.interpolator.interpolate(path_params, t)
             
-            # 安全检查：防止异常大的速度导致 Loss 爆炸
+            # [修改] 提高速度限制阈值到物理合理范围
+            # 在训练初期，由于空间扰动较大，速度可能达到 60-80 Å/s，这是可接受的
+            # 只有超过 80 Å/s 才认为是异常
             v_norm = torch.norm(v_t, dim=-1)
-            max_v = 1000.0
+            max_v = 80.0
             if (v_norm > max_v).any():
-                logger.warning(f"Extreme velocity detected (max={v_norm.max().item():.2f}). Clipping.")
+                logger.warning(f"Extreme velocity detected (max={v_norm.max().item():.2f}). Clipping to {max_v}.")
                 v_t = torch.clamp(v_t, min=-max_v, max=max_v)
                 
         except Exception as e:

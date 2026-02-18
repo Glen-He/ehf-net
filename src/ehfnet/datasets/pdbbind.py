@@ -9,6 +9,7 @@ import os.path as osp
 import logging
 
 import torch
+from torch import Tensor
 import pandas as pd
 
 from tqdm import tqdm
@@ -214,9 +215,32 @@ class PDBBindDataset(Dataset):
         )
 
         self._esm_model = None
+        
+        # [新增] 计算亲和力统计数据用于归一化
+        self.affinity_stats = self._compute_affinity_stats()
 
         super().__init__(root, transform, pre_transform, pre_filter)
         self._build_valid_index()
+
+    def _compute_affinity_stats(self) -> dict[str, float]:
+        """
+        计算亲和力标签的均值和标准差。
+        """
+        if self.index_df.empty:
+            return {"mean": 0.0, "std": 1.0}
+            
+        affinities = self.index_df["affinity"].values
+        mean = float(affinities.mean())
+        std = float(affinities.std())
+        
+        logger.info(f"Affinity stats: mean={mean:.4f}, std={std:.4f}")
+        return {"mean": mean, "std": std}
+
+    def denormalize_affinity(self, val: float | Tensor) -> float | Tensor:
+        """
+        将归一化的亲和力值还原为 pKd。
+        """
+        return val * self.affinity_stats["std"] + self.affinity_stats["mean"]
 
     @property
     def raw_dir(self) -> str:
@@ -389,4 +413,40 @@ class PDBBindDataset(Dataset):
         pdb_id = self._valid_pdb_ids[idx]
         file_path = osp.join(self.processed_dir, f"data_{pdb_id}.pt")
 
-        return cast(HeteroData, torch.load(file_path, weights_only=False))
+        data = cast(HeteroData, torch.load(file_path, weights_only=False))
+        
+        # [新增] 几何合理性检查：检测原子间最小距离，防止奇异解
+        if "ligand_atom" in data and hasattr(data["ligand_atom"], "pos"):
+            lig_pos = data["ligand_atom"].pos
+            if lig_pos.shape[0] > 1:
+                # 计算配体原子间的最小距离
+                dist_mat = torch.cdist(lig_pos, lig_pos, p=2)
+                # 排除对角线（自身距离为0）
+                dist_mat = dist_mat + torch.eye(dist_mat.shape[0], device=dist_mat.device) * 1000.0
+                min_dist = dist_mat.min().item()
+                
+                # 原子间最小合理距离约 0.5 Å（共价键长度通常 > 1.0 Å）
+                if min_dist < 0.5:
+                    logger.warning(
+                        f"Sample {pdb_id} has unreasonable geometry: min atom distance = {min_dist:.3f} Å. "
+                        "This may cause numerical instability."
+                    )
+        
+        # [新增] 实时归一化逻辑
+        if hasattr(data, "y_energy"):
+            raw_val = data.y_energy
+            
+            # [鲁棒性修改] 确保 raw_val 是 Tensor，防止意外的类型问题
+            if not isinstance(raw_val, torch.Tensor):
+                raw_val = torch.tensor(raw_val, dtype=torch.float)
+                
+            # 保存原始值用于评估
+            data.y_energy_raw = raw_val
+            
+            # 归一化: (x - mean) / std
+            # 显式转换为 float tensor 进行计算，确保结果仍为 Tensor
+            mean = self.affinity_stats["mean"]
+            std = self.affinity_stats["std"]
+            data.y_energy = (raw_val - mean) / std
+            
+        return data

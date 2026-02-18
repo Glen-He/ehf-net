@@ -30,26 +30,33 @@ class FlowMatchingLoss(nn.Module):
         eps: float = PhysicsConstants.EPSILON,
         log_var_min: float = -5.0,
         log_var_max: float = 5.0,
+        characteristic_scale: float = 5.0,
     ) -> None:
         """
         Args:
             eps: 数值稳定性保护参数
             log_var_min: 对数方差最小值
             log_var_max: 对数方差最大值
+            characteristic_scale: 特征长度尺度 L (Å)，用于平衡旋转和平移损失
         """
 
         super().__init__()
         self.decomposer = VelocityDecomposer(eps=eps)
         self.log_var_min = log_var_min
         self.log_var_max = log_var_max
+        self.L = characteristic_scale
 
-        # 可学习的对数方差 s = log(sigma^2)，初始化为 0（即初始权重=1）
+        # [修复] 可学习的对数方差 s = log(sigma^2)，初始化为 0.0（即初始权重 = 1.0）
+        # 让模型在训练初期获得充分的梯度信号，后续自动学习任务平衡
+        # 公式：weight = exp(-s)，loss = weight * raw_loss + 0.5 * s
+        # s=0.0 → weight=1.0（全权重）
+        # s=3.0 → weight=0.05（几乎忽略）
         self.log_vars = nn.ParameterDict(
             {
-                "trans": nn.Parameter(torch.zeros(())),
-                "rot": nn.Parameter(torch.zeros(())),
-                "torsion": nn.Parameter(torch.zeros(())),
-                "energy": nn.Parameter(torch.zeros(())),
+                "trans": nn.Parameter(torch.tensor(0.0)),
+                "rot": nn.Parameter(torch.tensor(0.0)),
+                "torsion": nn.Parameter(torch.tensor(0.0)),
+                "energy": nn.Parameter(torch.tensor(0.0)),
             }
         )
 
@@ -123,7 +130,13 @@ class FlowMatchingLoss(nn.Module):
         if pred_rot is None:
             raise ValueError("predictions['v_rotation'] must not be None.")
 
-        raw_loss_rot = F.mse_loss(pred_rot, gt_rot)
+        # [修改] 引入特征尺度 L 进行归一化
+        # 旋转 1 rad 产生的位移约为 L * 1
+        # Loss = ||(v_rot_pred - v_rot_gt) * L||^2 = L^2 * MSE
+        # [修改] 全面启用 Huber Loss 防爆
+        # [优化] delta 从 1.0 增大到 5.0，让初期合理误差保持在二次惩罚区域
+        # delta=5.0 意味着缩放后误差在 ±5 范围内使用 MSE，超出后使用 MAE
+        raw_loss_rot = F.huber_loss(pred_rot * self.L, gt_rot * self.L, delta=5.0)
         loss_dict["raw_loss_rot"] = raw_loss_rot.detach()
 
         pred_torsion = predictions.get("v_torsion", None)
@@ -136,7 +149,11 @@ class FlowMatchingLoss(nn.Module):
             if gt_torsion.dim() == 1:
                 gt_torsion = gt_torsion.view(-1, 1)
 
-            raw_loss_torsion = F.mse_loss(pred_torsion, gt_torsion)
+            # [修改] 扭转半径通常较小，取 L/2
+            # [修改] 使用 Huber Loss 替代 MSE
+            # [优化] delta 同样增大到 5.0
+            scale_tor = self.L / 2.0
+            raw_loss_torsion = F.huber_loss(pred_torsion * scale_tor, gt_torsion * scale_tor, delta=5.0)
 
         else:
             raw_loss_torsion = torch.tensor(0.0, device=device)

@@ -8,6 +8,8 @@ import os
 import math
 import torch
 import logging
+import gc
+import torch.nn.functional as F
 import torch.optim as optim
 
 from tqdm import tqdm
@@ -193,6 +195,12 @@ def train(
     best_val_loss = float("inf")
 
     for epoch in range(epochs):
+        # [新增] Epoch 开始前的深度清理
+        # 这有助于整理上一轮遗留的碎片
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         model.train()
         criterion.train()
 
@@ -277,6 +285,11 @@ def train(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+        # [新增] 训练结束，验证开始前的清理
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         avg_val_loss = compute_validation_loss(
             model=model,
             matcher=matcher,
@@ -286,7 +299,14 @@ def train(
             epoch=epoch,
             total_epochs=epochs,
             max_rmsd_batches=rmsd_check_batches,
+            dataset=dataset, # [新增] 传入 dataset 用于反归一化
         )
+        
+        # [新增] 验证结束，下一轮开始前的清理
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         scheduler.step(avg_val_loss)
 
         logger.info(
@@ -329,6 +349,7 @@ def compute_validation_loss(
     epoch: int | None = None,
     total_epochs: int = 1,
     max_rmsd_batches: int = 10,
+    dataset: PDBBindDataset | None = None, # [新增]
 ) -> float:
     """
     验证函数：计算 Loss 并统计全量 RMSD 指标
@@ -336,6 +357,10 @@ def compute_validation_loss(
     model.eval()
     total_loss = 0.0
     valid_batches = 0
+    
+    # 亲和力统计容器
+    affinity_preds = []
+    affinity_targets = []
     
     # RMSD 统计容器
     all_rmsd_init = []
@@ -378,6 +403,20 @@ def compute_validation_loss(
             if not torch.isnan(loss) and not torch.isinf(loss) and loss.item() < 1e6:
                 total_loss += loss.item()
                 valid_batches += 1
+                
+            # [新增] 收集亲和力预测 (用于计算 RMSE)
+            # 只有当 Loss 有效时，才收集预测值，避免 NaN 污染统计数据
+            if not torch.isnan(loss) and not torch.isinf(loss) and loss.item() < 1e6:
+                pred_aff = predictions.get("binding_affinity", None)
+                if pred_aff is not None:
+                    # 双重检查：预测值本身也不能含 NaN
+                    if not torch.isnan(pred_aff).any():
+                        affinity_preds.append(pred_aff.cpu())
+                        # 优先使用 raw 值，如果没有则使用归一化值（稍后统一处理）
+                        if hasattr(batch, "y_energy_raw"):
+                            affinity_targets.append(batch.y_energy_raw.cpu())
+                        else:
+                            affinity_targets.append(batch.get("y_energy").cpu())
 
             # 2. 全量 RMSD 推演
             # -----------------------------------------------------------
@@ -405,7 +444,8 @@ def compute_validation_loss(
                     sq_diff_init = ((x_0_infer - x_1) ** 2).sum(dim=-1)
                     msd_init = scatter_mean(sq_diff_init, infer_batch["ligand_atom"].batch, dim=0)
                     rmsd_init = torch.sqrt(msd_init)
-                    all_rmsd_init.append(rmsd_init)
+                    # [修改] 强制转 CPU，切断 GPU 显存占用
+                    all_rmsd_init.append(rmsd_init.detach().cpu())
 
                     # 执行推演
                     infer_batch["ligand_atom"].pos = x_0_infer
@@ -420,7 +460,8 @@ def compute_validation_loss(
                     sq_diff_final = ((final_pos - x_1) ** 2).sum(dim=-1)
                     msd_final = scatter_mean(sq_diff_final, infer_batch["ligand_atom"].batch, dim=0)
                     rmsd_final = torch.sqrt(msd_final)
-                    all_rmsd_final.append(rmsd_final)
+                    # [修改] 强制转 CPU，切断 GPU 显存占用
+                    all_rmsd_final.append(rmsd_final.detach().cpu())
                     
                 except Exception as e:
                     logger.warning(f"RMSD inference failed for batch {i}: {e}")
@@ -431,6 +472,24 @@ def compute_validation_loss(
             continue
 
     # 计算并打印统计结果
+    if len(affinity_preds) > 0 and dataset is not None:
+        cat_preds = torch.cat(affinity_preds).view(-1)
+        cat_targets = torch.cat(affinity_targets).view(-1)
+        
+        # 反归一化预测值
+        raw_preds = dataset.denormalize_affinity(cat_preds)
+        
+        # 如果 targets 已经是 raw 的（因为我们存了 y_energy_raw），则不需要反归一化
+        # 如果 dataset 中没有 y_energy_raw，说明 target 也是归一化的，需要反归一化
+        # 但我们在 Dataset.get 中已经强制添加了 y_energy_raw，所以 cat_targets 应该是 raw 的
+        # 为了保险起见，这里假设 cat_targets 是 raw 的 (pKd)
+        
+        mse_val = F.mse_loss(raw_preds, cat_targets)
+        rmse_val = torch.sqrt(mse_val).item()
+        mae_val = F.l1_loss(raw_preds, cat_targets).item()
+        
+        logger.info(f"[Validation Affinity] RMSE: {rmse_val:.4f} pKd | MAE: {mae_val:.4f} pKd")
+
     if len(all_rmsd_final) > 0:
         # 拼接所有 batch 的 RMSD
         cat_rmsd_init = torch.cat(all_rmsd_init)
@@ -452,5 +511,16 @@ def compute_validation_loss(
 
     if valid_batches == 0:
         return float("nan")
+
+    # [新增] 显式清理现场
+    # 虽然 Python 有 GC，但显式删除能更快释放引用
+    del all_rmsd_init
+    del all_rmsd_final
+    del affinity_preds
+    del affinity_targets
+    
+    # 强制通知 CUDA 释放缓存
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
         
     return total_loss / valid_batches

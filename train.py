@@ -21,6 +21,11 @@ if str(PROJECT_ROOT / "src") not in sys.path:
 from ehfnet.training.trainer import train
 import torch
 
+# [新增] 在 import torch 之前或刚开始设置
+# expandable_segments:True -> 允许分配器动态扩展显存段，极大缓解碎片化
+# max_split_size_mb:128 -> 避免大块显存被切得太碎
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+
 # [新增] 全局开启 TF32 (提速神器)
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -43,7 +48,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
     parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-6, help="Weight decay")
-    parser.add_argument("--clip_grad", type=float, default=10.0, help="Gradient clipping value")
+    parser.add_argument("--clip_grad", type=float, default=1.0, help="Gradient clipping value")
     
     # 模型相关参数
     parser.add_argument("--hidden_dim", type=int, default=128, help="Hidden dimension size")
