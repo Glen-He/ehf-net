@@ -14,8 +14,9 @@ import torch.optim as optim
 
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from torch.amp.autocast_mode import autocast
-from torch.amp.grad_scaler import GradScaler
+from torch.optim.swa_utils import AveragedModel
+from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+# autocast / GradScaler 已移除：三维坐标平方距离在 FP16 下易溢出（‖r‖²>65504）
 
 from torch_scatter import scatter_mean
 
@@ -53,6 +54,7 @@ def train(
     normalization_stats: dict | None = None,
     warmup_epochs: int = 20,
     rmsd_check_ratio: float = 0.1,
+    accumulation_steps: int = 1,
 ):
     """
     训练 EHFNet 模型
@@ -79,8 +81,7 @@ def train(
         normalization_stats: 归一化统计数据
         warmup_epochs: 空间课程学习预热轮数
         rmsd_check_ratio: 验证集中计算 RMSD 的样本比例 (0.0 ~ 1.0)
-                          例如 0.1 表示随机抽取 10% 的 batch 进行耗时的 RMSD 推演
-    """
+                          例如 0.1 表示随机抽取 10% 的 batch 进行耗时的 RMSD 推演        accumulation_steps: 梯度累积步数。当显存较小时，可设为 2/4 模拟更大 batch_size    """
 
     # 1. 准备环境
     if device == "auto":
@@ -186,19 +187,34 @@ def train(
         warmup_epochs=warmup_epochs,
     )
     criterion = FlowMatchingLoss().to(device)
+    # 速度分解由 matcher 内部完成，trainer 不持有分解器
 
     # 4. 优化器
+    # [修改] criterion 无可学习参数，仅优化 model
     optimizer = optim.AdamW(
-        list(model.parameters()) + list(criterion.parameters()),
+        model.parameters(),
         lr=lr,
         weight_decay=weight_decay,
     )
 
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.6, patience=5
+    # Warmup + 余弦退火（Step 级），防止初期梯度冲击 + 中后期平滑收敛
+    total_steps = epochs * len(train_loader)
+    warmup_steps = max(1, epochs // 10) * len(train_loader)  # 前 10% Epoch 线性升温
+    scheduler_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+    scheduler_cosine = CosineAnnealingLR(
+        optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=1e-6
+    )
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[scheduler_warmup, scheduler_cosine],
+        milestones=[warmup_steps],
     )
 
-    scaler = GradScaler("cuda" if torch.cuda.is_available() else "cpu")
+    # EMA 模型：惰性初始化——EHFNet 含 LazyModule，参数在首次前向后才完成初始化；
+    # 若在此处立即构建 AveragedModel 会对未初始化参数调用 .detach() 而崩溃。
+    # 解决方案：首次 optimizer.step() 后再构建，此时 lazy 参数已确定。
+    ema_decay = 0.999
+    ema_model: AveragedModel | None = None
 
     # 5. 训练循环
     best_val_loss = float("inf")
@@ -216,75 +232,91 @@ def train(
         train_loss_meter = 0.0
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
 
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             batch = batch.to(device)
-            optimizer.zero_grad()
+
+            # 梯度累积：仅在累积周期开头清零梯度
+            if batch_idx % accumulation_steps == 0:
+                optimizer.zero_grad()
 
             # 流匹配训练步骤
             # 生成训练目标不需要梯度
             with torch.no_grad():
                 x_1 = batch["ligand_atom"].pos
-                t, x_t, v_target = matcher.sample_location_and_target(
-                    x_1=x_1, 
-                    data=batch, 
-                    x_0=None,
+                # matcher 直接返回 SE(3) x T^m 切向量目标字典
+                t, x_t, targets = matcher.sample_location_and_target(
+                    x_1=x_1,
+                    data=batch,
                     current_epoch=epoch,
                     total_epochs=epochs,
                 )
 
             batch["ligand_atom"].pos = x_t
+            batch.t = t  # 注入时间步，供 Loss 时间掩码使用
 
-            with autocast(device_type="cuda" if torch.cuda.is_available() else "cpu"):
-                predictions = model(batch, t)
+            # FP32 前向传播（不使用 autocast，避免 FP16 距离平方溢出）
+            predictions = model(batch, t)
 
-                targets = {
-                    "v_atomic_target": v_target,
-                    "binding_affinity_target": batch.get("y_energy", None),
-                }
+            # 补充结合能 target
+            targets["binding_affinity_target"] = batch.get("y_energy", None)
 
-                loss_dict = criterion(predictions, targets, batch)
-                loss = loss_dict["total"]
+            loss_dict = criterion(predictions, targets, batch)
+            loss = loss_dict["total"]
 
-                if torch.isnan(loss) or loss > 1e6:
-                    logger.error(f"{'NaN' if torch.isnan(loss) else 'Huge'} Loss detected!")
-                    for k, v in loss_dict.items():
-                        logger.error(f"  {k}: {v}")
-                    
-                    # 检查目标值
-                    gt_trans, gt_rot, gt_torsion = criterion.decomposer.decompose(
-                        pos=batch["ligand_atom"].pos,
-                        vel=targets["v_atomic_target"],
-                        masses=batch["ligand_atom"].masses,
-                        batch=batch["ligand_atom"].batch,
-                        torsion_indices=getattr(batch, "torsion_indices", None),
-                        torsion_moving_mask=getattr(batch, "torsion_moving_mask", None)
-                    )
-                    logger.error(f"  GT Trans norm: {gt_trans.norm().item()}")
-                    logger.error(f"  GT Rot norm: {gt_rot.norm().item()}")
-                    if gt_torsion.numel() > 0:
-                        logger.error(f"  GT Torsion norm: {gt_torsion.norm().item()}")
-                    
-                    raise RuntimeError("Stopping due to invalid Loss")
+            # 防御性检查：若 loss 无梯度，跳过该 batch
+            if loss.grad_fn is None:
+                logger.warning(f"Batch {batch_idx}: loss has no grad_fn, skipping.")
+                optimizer.zero_grad()
+                continue
 
-            # 反向传播
-            scaler.scale(loss).backward()
+            if torch.isnan(loss) or loss > 200:
+                logger.warning(f"{'NaN' if torch.isnan(loss) else 'Huge'} Loss on batch {batch_idx}, skipping.")
+                for k, v in loss_dict.items():
+                    logger.warning(f"  {k}: {v}")
+                logger.warning(f"  GT Trans norm: {targets['v_trans_target'].norm().item()}")
+                logger.warning(f"  GT Rot norm: {targets['v_rot_target'].norm().item()}")
+                gt_tor = targets['v_torsion_target']
+                if gt_tor.numel() > 0:
+                    logger.warning(f"  GT Torsion norm: {gt_tor.norm().item()}")
+                optimizer.zero_grad()
+                continue
 
-            scaler.unscale_(optimizer)
-            all_params = list(model.parameters()) + list(criterion.parameters())
-            torch.nn.utils.clip_grad_norm_(all_params, clip_grad)
+            # 反向传播（纯 FP32）
+            # 梯度累积：将损失除以累积步数，确保梯度幅度与实际 batch_size 无关
+            scaled_loss = loss / accumulation_steps
+            scaled_loss.backward()
 
-            scaler.step(optimizer)
-            scaler.update()
+            # 仅在完成一个完整累积周期后才更新参数
+            is_last_in_cycle = (batch_idx + 1) % accumulation_steps == 0
+            is_last_batch = (batch_idx + 1) == len(train_loader)
+            if is_last_in_cycle or is_last_batch:
+                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+                # GradScaler 移除后需手动补回：Inf/NaN 梯度直接跳过，防止权重被污染
+                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                    logger.warning(f"Batch {batch_idx}: grad_norm={grad_norm:.4g}, skipping optimizer step.")
+                    optimizer.zero_grad()
+                else:
+                    optimizer.step()
+                    # 惰性构建 EMA（首次 step 后 lazy 参数已全部初始化）
+                    if ema_model is None:
+                        ema_model = AveragedModel(
+                            model,
+                            avg_fn=lambda avg_p, p, _: ema_decay * avg_p + (1.0 - ema_decay) * p,
+                        )
+                    ema_model.update_parameters(model)
+                    scheduler.step()
 
             # 记录日志
             train_loss_meter += loss.item()
             pbar.set_postfix(
                 {
                     "Loss": f"{loss.item():.4f}",
-                    "w_tr": f"{loss_dict.get('weight_trans', torch.tensor(0)).item():.2f}",
-                    "w_rot": f"{loss_dict.get('weight_rot', torch.tensor(0)).item():.2f}",
-                    "w_tor": f"{loss_dict.get('weight_torsion', torch.tensor(0)).item():.2f}",
-                    "w_ene": f"{loss_dict.get('weight_energy', torch.tensor(0)).item():.2f}",
+                    "L_tr": f"{loss_dict.get('loss_trans', torch.tensor(0)).item():.3f}",
+                    "L_rot": f"{loss_dict.get('loss_rot', torch.tensor(0)).item():.3f}",
+                    "L_tor": f"{loss_dict.get('loss_torsion', torch.tensor(0)).item():.3f}",
+                    "L_ene": f"{loss_dict.get('loss_energy', torch.tensor(0)).item():.3f}",
+                    "L_cls": f"{loss_dict.get('loss_clash', torch.tensor(0)).item():.3f}",
+                    "LR": f"{scheduler.get_last_lr()[0]:.2e}",
                 }
             )
 
@@ -300,7 +332,7 @@ def train(
             torch.cuda.empty_cache()
 
         avg_val_loss = compute_validation_loss(
-            model=model,
+            model=ema_model if ema_model is not None else model,
             matcher=matcher,
             criterion=criterion,
             loader=val_loader,
@@ -316,7 +348,7 @@ def train(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        scheduler.step(avg_val_loss)
+        # ReduceLROnPlateau 已移除，scheduler 已在 Step 级自动推进
 
         logger.info(
             f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}"
@@ -326,6 +358,7 @@ def train(
         checkpoint = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
+            "ema_model_state_dict": ema_model.module.state_dict() if ema_model is not None else model.state_dict(),
             "loss_state_dict": criterion.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
@@ -382,7 +415,7 @@ def compute_validation_loss(
             torch.cuda.manual_seed(42 + epoch)
 
     # 使用 tqdm 显示验证进度，因为现在推演会稍微花点时间
-    pbar = tqdm(loader, desc=f"Epoch {epoch+1} [Val]", leave=False)
+    pbar = tqdm(loader, desc=f"Epoch {(epoch or 0) + 1} [Val]", leave=False)
 
     for i, batch in enumerate(pbar):
         try:
@@ -390,20 +423,20 @@ def compute_validation_loss(
             x_1 = batch["ligand_atom"].pos
 
             # 1. 计算 Loss (用于早停和模型选择)
-            t, x_t, v_target = matcher.sample_location_and_target(
-                x_1=x_1, 
-                data=batch, 
+            t, x_t, targets = matcher.sample_location_and_target(
+                x_1=x_1,
+                data=batch,
                 current_epoch=epoch if epoch is not None else 0,
                 total_epochs=total_epochs
             )
 
             batch["ligand_atom"].pos = x_t
+            batch.t = t  # 注入时间步，供 Loss 时间掩码使用
+
             predictions = model(batch, t)
 
-            targets = {
-                "v_atomic_target": v_target,
-                "binding_affinity_target": batch.get("y_energy", None),
-            }
+            # matcher 已返回分解好的 SE(3) 目标，直接补全结合能
+            targets["binding_affinity_target"] = batch.get("y_energy", None)
 
             loss_dict = criterion(predictions, targets, batch)
             loss = loss_dict["total"]
@@ -426,7 +459,7 @@ def compute_validation_loss(
                             affinity_targets.append(batch.y_energy_raw.cpu())
                         else:
                             y_norm = batch.get("y_energy", None)
-                            if y_norm is not None:
+                            if y_norm is not None and dataset is not None:
                                 affinity_targets.append(dataset.denormalize_affinity(y_norm.cpu()))
 
             # 2. 全量 RMSD 推演
@@ -488,7 +521,7 @@ def compute_validation_loss(
         cat_targets = torch.cat(affinity_targets).view(-1)
         
         # 模型输出是 norm，验证时仅在这里做一次反归一化
-        raw_preds = dataset.denormalize_affinity(cat_preds)
+        raw_preds: torch.Tensor = dataset.denormalize_affinity(cat_preds)
         
         mse_val = F.mse_loss(raw_preds, cat_targets)
         rmse_val = torch.sqrt(mse_val).item()
@@ -509,7 +542,7 @@ def compute_validation_loss(
         success_5a = (cat_rmsd_final < 5.0).float().mean().item() * 100
         
         logger.info("-" * 60)
-        logger.info(f"[Validation Full Stats] Epoch {epoch+1}")
+        logger.info(f"[Validation Full Stats] Epoch {(epoch or 0) + 1}")
         logger.info(f"  Mean RMSD: {mean_init:.2f} -> {mean_final:.2f} Å")
         logger.info(f"  Success Rate (<2Å): {success_2a:.2f}%")
         logger.info(f"  Success Rate (<5Å): {success_5a:.2f}%")

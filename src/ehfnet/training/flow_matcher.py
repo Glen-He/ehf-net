@@ -10,7 +10,7 @@ import logging
 
 from torch import Tensor
 from torch_geometric.data import HeteroData
-from ehfnet.geometry.dynamics import PathInterpolator, PoseUpdater, PhysicsConstants, compute_center_of_mass
+from ehfnet.geometry.dynamics import PathInterpolator, PoseUpdater, PhysicsConstants, compute_center_of_mass, VelocityDecomposer
 
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,8 @@ class ConditionalFlowMatcher:
         
         self.interpolator = PathInterpolator(eps=PhysicsConstants.EPSILON)
         self.updater = PoseUpdater(eps=PhysicsConstants.EPSILON)
+        # [新增] 在流匹配器中直接持有分解器，训练时生成纯净的 SE(3) x T^m 目标
+        self.decomposer = VelocityDecomposer(eps=PhysicsConstants.EPSILON)
 
 
     def get_spatial_scale(self, epoch: int) -> float:
@@ -69,9 +71,9 @@ class ConditionalFlowMatcher:
         x_0: Tensor | None = None,
         current_epoch: int = 0,
         total_epochs: int = 1,
-    ) -> tuple[Tensor, Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
         """
-        [训练接口] 采样时间 t，构造插值坐标 x_t 和目标速度 v_t
+        [训练接口] 采样时间 t，构造插值坐标 x_t 和 SE(3) x T^m 目标字典
 
         Args:
             x_1: 真实结合构象 [N, 3] (Ground Truth)
@@ -83,7 +85,10 @@ class ConditionalFlowMatcher:
         Returns:
             t: 采样的时间步 [B]
             x_t: t 时刻的插值坐标 [N, 3]（模型输入）
-            v_t: t 时刻的目标速度 [N, 3]（包含刚体+扭转的真实物理速度，用于计算 Loss）
+            targets: SE(3) x T^m 切向量目标字典，包含:
+                - v_trans_target [B, 3]
+                - v_rot_target   [B, 3]
+                - v_torsion_target [T]
         """
 
         batch = data["ligand_atom"].batch
@@ -104,7 +109,6 @@ class ConditionalFlowMatcher:
         # 1. 生成 x_0
         if x_0 is None:
             current_scale = self.get_spatial_scale(current_epoch)
-            
             x_0 = self._generate_random_pose(
                 x_ref=x_1,
                 batch=batch,
@@ -116,7 +120,6 @@ class ConditionalFlowMatcher:
             )
 
         # 2. 采样时间 t，显式避开边界：t ~ U[sigma_min, 1-sigma_min]
-        # 防止 t 接近 0/1 导致时间嵌入数值不稳定
         sigma = float(self.sigma_min)
         sigma = max(0.0, min(0.49, sigma))
         t = torch.rand(B, device=device) * (1.0 - 2 * sigma) + sigma
@@ -131,24 +134,32 @@ class ConditionalFlowMatcher:
             torsion_moving_mask=torsion_moving_mask,
         )
 
-        # 4. 插值得到当前时刻坐标 x_t 和目标全原子速度 v_t
+        # 4. 插值得到 x_t 和瞬时笛卡尔速度 v_t
         try:
             x_t, v_t = self.interpolator.interpolate(path_params, t)
-            
-            # 配套放宽硬裁剪阈值，减少对目标速度分布的截断
-            v_norm = torch.norm(v_t, dim=-1)
-            max_v = 150.0
-            if (v_norm > max_v).any():
-                logger.warning(f"Extreme velocity detected (max={v_norm.max().item():.2f}). Soft-saturating to {max_v}.")
-                v_t = max_v * torch.tanh(v_t / max_v)
-                
+            # [移除] 不再对笛卡尔速度做硬截断，decomposer 内部已处理饱和
         except Exception as e:
             logger.error(f"Error during interpolation: {e}")
-            # 返回零速度作为兜底
             x_t = x_0
             v_t = torch.zeros_like(x_0)
 
-        return t, x_t, v_t
+        # 5. [核心] 将笛卡尔速度分解为 SE(3) x T^m 切向量，彻底消灭极端速度问题
+        v_trans, v_rot, v_torsion = self.decomposer.decompose(
+            pos=x_t,
+            vel=v_t,
+            masses=masses,
+            batch=batch,
+            torsion_indices=torsion_indices,
+            torsion_moving_mask=torsion_moving_mask,
+        )
+
+        targets: dict[str, Tensor] = {
+            "v_trans_target": v_trans,
+            "v_rot_target": v_rot,
+            "v_torsion_target": v_torsion,
+        }
+
+        return t, x_t, targets
 
 
     @torch.no_grad()

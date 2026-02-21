@@ -13,7 +13,7 @@ from torch import Tensor
 import pandas as pd
 
 from tqdm import tqdm
-from typing import Any, Callable, cast
+from typing import Any, Callable, cast, overload
 
 from rdkit.Chem import ChemicalFeatures, RDConfig
 
@@ -237,6 +237,10 @@ class PDBBindDataset(Dataset):
         logger.info(f"Affinity stats: mean={mean:.4f}, std={std:.4f}")
         return {"mean": mean, "std": std}
 
+    @overload
+    def denormalize_affinity(self, val: Tensor) -> Tensor: ...
+    @overload
+    def denormalize_affinity(self, val: float) -> float: ...
     def denormalize_affinity(self, val: float | Tensor) -> float | Tensor:
         """
         将归一化的亲和力值还原为 pKd。

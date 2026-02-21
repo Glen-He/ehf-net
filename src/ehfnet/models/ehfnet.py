@@ -12,7 +12,6 @@ from torch_geometric.data import HeteroData
 
 from ehfnet.models.layers.encoder import EHFEncoder
 from ehfnet.models.heads.prediction import PredictionHead
-from ehfnet.geometry.dynamics import VelocityDecomposer
 
 
 class EHFNetOutput(TypedDict):
@@ -20,32 +19,27 @@ class EHFNetOutput(TypedDict):
     EHFNet 模型输出类型定义
     """
 
-    x_dict: dict[str, Tensor]   # 节点特征字典
-    v_atomic: Tensor            # 混合后的总原子速度 [N, 3]
-    v_coarse: Tensor            # EGNN 原始速度 [N, 3]
-    v_correction: Tensor        # 物理头预测速度 [N, 3]
-    alpha: Tensor               # 平均混合权重标量
-    v_translation: Tensor       # 平移速度 [B, 3]
-    v_rotation: Tensor          # 旋转速度 [B, 3]
-    v_torsion: Tensor | None    # 扭转角速度 [T, 1] 或 None
-    binding_affinity: Tensor    # 结合能 [B, 1]
-    force_atomic: Tensor        # 原子级力场 [N, 3]
-    pos_updated: Tensor         # 更新后的坐标 [N, 3]
+    x_dict: dict[str, Tensor]       # 节点特征字典
+    v_translation: Tensor           # 刚体平移速度 [B, 3]
+    v_rotation: Tensor              # 刚体旋转速度 [B, 3]
+    v_torsion: Tensor               # 扭转角速度 [T] （numel 可为 0）
+    binding_affinity: Tensor        # 结合能 [B, 1]
+    force_atomic: Tensor            # 原子级力场 [N, 3]
+    steric_clash_batch: Tensor | None  # 每分子位阻惩罚量 [B]，无边时为 None
+    pos_updated: Tensor             # 更新后的坐标 [N, 3]
 
 
 class EHFNet(nn.Module):
     """
     EHFNet 顶层模型
 
-    功能：
-    1. 调用 EHFEncoder 获取更新后的原子坐标和特征
-    2. 调用 PredictionHead 同时预测：
-       - 原子级速度场 (v_atomic)
-       - 配体-蛋白结合能 (binding_affinity)
-    3. 将 v_atomic 分解为符合物理约束的：
-       - 刚体平移速度 (v_translation)
-       - 刚体旋转速度 (v_rotation)
-       - 扭转角速度 (v_torsion)
+    架构：
+    1. 调用 EHFEncoder 获取原子层级特征
+    2. 直接生成 SE(3) 切空间向量：
+       - v_translation [B, 3]：平移速度（MLP 开环分子级特征）
+       - v_rotation [B, 3]：旋转速度（局角速度5轴）
+       - v_torsion [T]：每根扮转键的标量角速度
+    3. 调用 PredictionHead 预测结合亲和力 (辅助信号)
     """
 
     def __init__(
@@ -106,21 +100,28 @@ class EHFNet(nn.Module):
             affinity_stats=normalization_stats.get("affinity") if normalization_stats else None,
         )
 
-        # 上下文感知门控网络
-        # 为每个原子动态决定 EGNN 和 PredictionHead 的混合权重
-        # 输入：原子特征（已融合时间嵌入）
-        # 输出：每个原子的 alpha ∈ [0, 1]
-        #   - alpha ≈ 1: 信任 EGNN（保守的几何预测）
-        #   - alpha ≈ 0: 信任 PredictionHead（物理力场）
-        self.fusion_gate = nn.Sequential(
+        # SE(3) 切空间直接读出头（基于分子级特征 [B, H]）
+        # 平移 readout：R^3 平移速度
+        self.trans_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Sigmoid(),
+            nn.Linear(hidden_dim // 2, 3),
         )
 
-        # 速度分解器，用于将原子速度分解为平移、旋转、扭转分量
-        self.decomposer = VelocityDecomposer()
+        # 旋转 readout：轴角 × 幅度 (so(3) 元素)
+        self.rot_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 3),
+        )
+
+        # 扭转 readout：每个扭转键的标量角速度
+        # 输入: [T, H*2] (键轴两端原子特征拼接)
+        self.torsion_head = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
 
 
     def forward(self, data: HeteroData, t: Tensor) -> EHFNetOutput:
@@ -139,78 +140,52 @@ class EHFNet(nn.Module):
         ctx = self.encoder(data, t)
         x_dict = ctx["x_dict"]
         pos_dict = ctx["pos_dict"]
-        vel_dict = ctx["vel_dict"]
 
-        # 2. 从 encoder 获取粗略速度 v_coarse（EGNN 隐式速度）
-        v_coarse = vel_dict["ligand_atom"]
+        lig_atom_feat  = x_dict["ligand_atom"]       # [N_lig, H]
+        lig_mol_feat   = x_dict["ligand_molecule"]   # [B, H]
 
-        # 3. 预测头获取物理修正 v_correction（显式力场）
-        predictions = self.prediction_head(
-            lig_atom_feat=x_dict["ligand_atom"],
-            lig_atom_pos=pos_dict["ligand_atom"],
-            lig_batch=data["ligand_atom"].batch,
-            pro_atom_feat=x_dict["protein_atom"],
-            pro_atom_pos=pos_dict["protein_atom"],
-            pro_atom_batch=data["protein_atom"].batch,
-            lig_mol_feat=x_dict["ligand_molecule"],
-        )
+        # 2. SE(3) 平移 / 旋转 直接读出
+        v_translation = self.trans_head(lig_mol_feat)   # [B, 3]
+        v_rotation    = self.rot_head(lig_mol_feat)     # [B, 3]
 
-        v_correction = predictions["v_atomic"]
-        binding_affinity = predictions["binding_affinity"]
-        force_atomic = predictions["force_atomic"]
-
-        # 4. 上下文感知门控融合
-        h_ligand = x_dict["ligand_atom"]  # [N_lig, hidden_dim]
-        alpha = self.fusion_gate(h_ligand)  # [N_lig, 1]
-        
-        # 按原子加权融合
-        # alpha ≈ 1: 主要使用 EGNN 的保守预测（适合刚性骨架）
-        # alpha ≈ 0: 主要使用 PredictionHead 的物理力场（适合极性基团）
-        v_atomic = alpha * v_coarse + (1 - alpha) * v_correction
-
-        # 5. 使用联合优化分解速度
-        masses = data["ligand_atom"].masses
-        batch = data["ligand_atom"].batch
-        device = v_atomic.device
-
+        # 3. 扮转角速度：基于键轴原子特征 (a1, a2)
+        device = lig_atom_feat.device
         torsion_indices = getattr(
             data,
             "torsion_indices",
             torch.empty((0, 4), dtype=torch.long, device=device),
         )
-        torsion_moving_mask = getattr(
-            data,
-            "torsion_moving_mask",
-            torch.empty(
-                (0, pos_dict["ligand_atom"].size(0)), dtype=torch.bool, device=device
-            ),
-        )
 
-        v_translation, v_rotation, v_torsion = self.decomposer.decompose(
-            pos=pos_dict["ligand_atom"],
-            vel=v_atomic,
-            masses=masses,
-            batch=batch,
-            torsion_indices=torsion_indices,
-            torsion_moving_mask=torsion_moving_mask,
-        )
-
-        if v_torsion is not None and v_torsion.numel() > 0:
-            v_torsion = v_torsion.view(-1, 1)
-            
+        if torsion_indices.numel() > 0 and torsion_indices.size(0) > 0:
+            a1_feat = lig_atom_feat[torsion_indices[:, 1]]   # [T, H]
+            a2_feat = lig_atom_feat[torsion_indices[:, 2]]   # [T, H]
+            bond_feat = torch.cat([a1_feat, a2_feat], dim=-1)    # [T, 2H]
+            v_torsion = self.torsion_head(bond_feat).squeeze(-1) # [T]
         else:
-            v_torsion = None
+            v_torsion = torch.zeros(0, device=device, dtype=lig_mol_feat.dtype)
+
+        # 4. PredictionHead: 结合亲和力 + 原子力场
+        predictions = self.prediction_head(
+            lig_atom_feat=lig_atom_feat,
+            lig_atom_pos=pos_dict["ligand_atom"],
+            lig_batch=data["ligand_atom"].batch,
+            pro_atom_feat=x_dict["protein_atom"],
+            pro_atom_pos=pos_dict["protein_atom"],
+            pro_atom_batch=data["protein_atom"].batch,
+            lig_mol_feat=lig_mol_feat,
+        )
+
+        binding_affinity = predictions["binding_affinity"]
+        force_atomic     = predictions["force_atomic"]
+        steric_clash_batch = predictions.get("steric_clash_batch")
 
         return {
             "x_dict": x_dict,
-            "v_atomic": v_atomic,
-            "v_coarse": v_coarse,
-            "v_correction": v_correction,
-            "alpha": alpha.mean(),
             "v_translation": v_translation,
             "v_rotation": v_rotation,
             "v_torsion": v_torsion,
             "binding_affinity": binding_affinity,
             "force_atomic": force_atomic,
+            "steric_clash_batch": steric_clash_batch,
             "pos_updated": pos_dict["ligand_atom"],
         }

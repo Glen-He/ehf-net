@@ -32,11 +32,11 @@ class PredictionConstants:
     MIN_MAX_NEIGHBORS = 64          # 最小最大邻居数
 
     # 数值稳定性
-    MIN_DISTANCE = 1e-6             # Å, 最小距离阈值
-    EPSILON = 1e-8                  # 通用数值保护
+    MIN_DISTANCE = 1e-4             # Å, 最小距离阈值（提升 FP16 兼容性）
+    EPSILON = 1e-4                  # 通用数值保护（提升 FP16 兼容性）
 
     # 物理参数
-    MIN_MASS_INV = 0.01             # 最小质量倒数（防止梯度消失）
+    MIN_MASS_INV = 0.01             # 保留兼容（当前不使用）
     BASELINE_BINDING_ENERGY = -7.0  # kcal/mol, 典型结合能
     FORCE_CUTOFF = 6.0              # Å, 力场局部相互作用半径
     FORCE_LIMIT = 20.0              # 力幅值软饱和上限
@@ -232,32 +232,6 @@ class PredictionHead(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
         )
 
-        # 速度投影模块（力 → 速度）
-        # 物理约束：质量只依赖于原子特征（类型、局部环境），不依赖于当前受到的力
-        self.velocity_projection = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim // 2, 1),
-            nn.Softplus(),
-        )
-
-        # 初始化最后一层偏置
-        for module in self.velocity_projection.modules():
-
-            if isinstance(module, nn.Linear) and module.out_features == 1:
-
-                if module.bias is not None:
-                    # Change bias from -2.0 to -1.0.
-                    # Softplus(-1.0) ≈ 0.31 (Balanced initial inverse mass)
-                    # Softplus(0.0) ≈ 0.69 (Fast movement)
-                    # Softplus(-2.0) ≈ 0.13 (Slow movement)
-                    nn.init.constant_(module.bias, -1.0)
-
-                break
-
-        self.min_mass_inv = PredictionConstants.MIN_MASS_INV
-
         # 能量预测分支
         self.q_atom = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.k_atom = nn.Linear(hidden_dim, hidden_dim, bias=False)
@@ -316,7 +290,7 @@ class PredictionHead(nn.Module):
             lig_mol_feat: 配体分子特征 [B, H]
 
         Returns:
-            包含 v_atomic, binding_affinity, force_atomic 的字典
+            包含 binding_affinity, force_atomic 的字典
         """
 
         device = lig_atom_feat.device
@@ -328,7 +302,6 @@ class PredictionHead(nn.Module):
         if N_lig == 0 or N_pro == 0:
 
             return {
-                "v_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
                 "binding_affinity": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
                 "force_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
             }
@@ -388,19 +361,27 @@ class PredictionHead(nn.Module):
         if edge_index.size(1) == 0:
 
             return {
-                "v_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
                 "binding_affinity": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
                 "force_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
+                "steric_clash_batch": torch.zeros(B, device=device, dtype=torch.float32),
             }
 
         i_idx = edge_index[0]
         j_idx = edge_index[1]
 
-        # 2. 计算几何特征
-        lig_pos_sel = lig_atom_pos[i_idx]
-        pro_pos_sel = pro_atom_pos[j_idx]
+        # 2. 计算几何特征（升为 FP32 确保 AMP 下数值稳定）
+        lig_pos_sel = lig_atom_pos[i_idx].float()
+        pro_pos_sel = pro_atom_pos[j_idx].float()
         dist = torch.norm(lig_pos_sel - pro_pos_sel, dim=-1, p=2)
-
+        # 软位阻排斥惩罚 (Soft Steric Clash)
+        # 阈值 2.0 Å ≈ 两个碳原子范德华半径之和的保守估计
+        # ReLU 保证只有小于阈值的距离才产生惩罚；平方保证梯度平滑无跳跃
+        _clash_threshold = 2.0
+        clash_edge = torch.nn.functional.relu(_clash_threshold - dist).pow(2)   # [E]
+        # 映射边 → 配体原子 → 分子，得到每分子的总体碰撞量 [B]
+        steric_clash_batch = scatter_add(
+            clash_edge, lig_batch[i_idx], dim=0, dim_size=B
+        ).float()
         cutoff_weights = self.cutoff_fn(dist)
         force_cutoff_weights = self.force_cutoff_fn(dist)
 
@@ -424,6 +405,7 @@ class PredictionHead(nn.Module):
         # 软饱和替代硬截断，保持可导且保留强信号排序
         force_magnitude = self.force_limit * torch.tanh(force_magnitude_raw / self.force_limit)
 
+        # rel_pos/direction: 已在 FP32 空间（lig_pos_sel/pro_pos_sel 已 .float()）
         rel_pos = lig_pos_sel - pro_pos_sel
         direction = torch.nn.functional.normalize(
             rel_pos, dim=-1, eps=PredictionConstants.EPSILON
@@ -435,13 +417,7 @@ class PredictionHead(nn.Module):
 
         # 力分支使用更局部的相互作用，减少远距离噪声对几何更新的污染
         force_pairwise = force_magnitude * direction * force_cutoff_weights.unsqueeze(-1)
-        force_atomic = scatter_add(force_pairwise, i_idx, dim=0, dim_size=N_lig)
-
-        # 力 → 速度
-        # lig_atom_feat 包含 atomic_weight 信息，网络可以学习质量倒数
-        mass_inv_raw = self.velocity_projection(lig_atom_feat)
-        mass_inv = mass_inv_raw + self.min_mass_inv
-        v_atomic = force_atomic * mass_inv
+        force_atomic = scatter_add(force_pairwise, i_idx, dim=0, dim_size=N_lig).to(lig_atom_feat.dtype)
 
         # 4. 能量预测
         E_ij_raw = self.pairwise_energy_mlp(pair_input).squeeze(-1)
@@ -449,12 +425,12 @@ class PredictionHead(nn.Module):
 
         # 先在配体原子维度按有效边权做归一化，再在样本维度做均值归一化
         edge_mass_per_atom = scatter_add(cutoff_weights, i_idx, dim=0, dim_size=N_lig)
-        edge_mass_per_atom = edge_mass_per_atom.clamp(min=PredictionConstants.EPSILON)
-        E_lig_atom = scatter_add(E_ij, i_idx, dim=0, dim_size=N_lig) / edge_mass_per_atom
+        edge_mass_per_atom = edge_mass_per_atom.float().clamp(min=PredictionConstants.EPSILON)
+        E_lig_atom = scatter_add(E_ij.float(), i_idx, dim=0, dim_size=N_lig) / edge_mass_per_atom
 
         E_physical_sum = scatter_add(E_lig_atom, lig_batch, dim=0, dim_size=B)
         atom_counts = scatter_add(
-            torch.ones(N_lig, device=device), lig_batch, dim=0, dim_size=B
+            torch.ones(N_lig, device=device, dtype=torch.float32), lig_batch, dim=0, dim_size=B
         )
         E_physical = E_physical_sum / atom_counts.clamp(min=1.0)
 
@@ -508,13 +484,17 @@ class PredictionHead(nn.Module):
         # 神经网络输出归一化分数（与 y_energy 对齐）
         score_norm = E_physical + E_correction
 
+        # 物理软截断：E_physical 和 E_correction 在初期权重随机时均可爆炸
+        # 真实 pKd 范围 [2, 15]，将原始分数限制在 [-50, 50] 防止 Huber Loss 被击穿
+        score_norm = torch.clamp(score_norm, min=-50.0, max=50.0)
+
         # 模型端不做反归一化：保持训练目标与输出标度一致
         binding_affinity = score_norm.unsqueeze(-1)
 
         return {
-            "v_atomic": v_atomic,
             "binding_affinity": binding_affinity,
             "force_atomic": force_atomic,
+            "steric_clash_batch": steric_clash_batch,
         }
 
 

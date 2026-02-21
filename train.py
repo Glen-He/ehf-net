@@ -63,6 +63,7 @@ def main():
     parser.add_argument("--pocket_radius", type=float, default=20.0, help="Radius (A) for protein pocket extraction (default: 20.0)")
     parser.add_argument("--warmup_epochs", type=int, default=20, help="Number of warmup epochs for spatial curriculum learning (default: 20)")
     parser.add_argument("--rmsd_ratio", type=float, default=0.1, help="Ratio of validation set to compute RMSD (0.0-1.0)")
+    parser.add_argument("--accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
 
     args = parser.parse_args()
     
@@ -143,6 +144,7 @@ def main():
             normalization_stats=normalization_stats,
             warmup_epochs=args.warmup_epochs,
             rmsd_check_ratio=args.rmsd_ratio,
+            accumulation_steps=args.accumulation_steps,
         )
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)

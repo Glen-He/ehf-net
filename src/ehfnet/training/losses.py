@@ -1,7 +1,8 @@
 """
 流匹配损失函数
 
-基于同方差不确定性的自动任务平衡。
+移除同方差不确定性加权，采用静态几何尺度平衡。
+直接在 SE(3) x T^m 切空间计算 Huber Loss。
 """
 
 import torch
@@ -11,55 +12,46 @@ import torch.nn.functional as F
 from typing import Any
 from torch import Tensor
 
-from ehfnet.geometry.dynamics import VelocityDecomposer, PhysicsConstants
-
 
 class FlowMatchingLoss(nn.Module):
     """
     流匹配损失函数
 
-    通过可学习的对数方差参数自动加权不同损失分量，避免手动调参。
-    损失公式：L_total = sum(exp(-s_i) * L_i + 0.5 * s_i)
-    其中 s_i = log(sigma_i^2) 为可学习参数，exp(-s_i) 为自动学到的权重。
-    参考：Kendall 等，CVPR 2018。
+    直接对平移、旋转、扭转的切向量进行监督。
+    包含时间步 t 掩码机制，确保物理头仅在有效范围内优化。
     """
 
     def __init__(
         self,
-        *,
-        eps: float = PhysicsConstants.EPSILON,
-        log_var_min: float = -5.0,
-        log_var_max: float = 5.0,
         characteristic_scale: float = 5.0,
+        weight_trans: float = 1.0,
+        weight_rot: float = 1.0,
+        weight_torsion: float = 0.2,
+        weight_energy: float = 0.05,
+        weight_clash: float = 0.001,  # 初始极小权重：clash_batch 量级 O(10²)，须防止压垮 SE(3) 损失
     ) -> None:
         """
-        Args:
-            eps: 数值稳定性保护参数
-            log_var_min: 对数方差最小值
-            log_var_max: 对数方差最大值
-            characteristic_scale: 特征长度尺度 L (Å)，用于平衡旋转和平移损失
-        """
+        初始化损失函数。
 
+        Args:
+            characteristic_scale: 特征长度尺度 L (Å)，用于平衡旋转和平移的量纲。
+            weight_trans: 平移损失权重。
+            weight_rot: 旋转损失权重。
+            weight_torsion: 扭转角损失权重。
+            weight_energy: 结合能损失权重。
+            weight_clash: 位阻惩罚权重，初始极小防止压垮 SE(3) 损失。
+        """
         super().__init__()
-        self.decomposer = VelocityDecomposer(eps=eps)
-        self.log_var_min = log_var_min
-        self.log_var_max = log_var_max
+
         self.L = characteristic_scale
 
-        # [修复] 可学习的对数方差 s = log(sigma^2)，初始化为 0.0（即初始权重 = 1.0）
-        # 让模型在训练初期获得充分的梯度信号，后续自动学习任务平衡
-        # 公式：weight = exp(-s)，loss = weight * raw_loss + 0.5 * s
-        # s=0.0 → weight=1.0（全权重）
-        # s=3.0 → weight=0.05（几乎忽略）
-        self.log_vars = nn.ParameterDict(
-            {
-                "trans": nn.Parameter(torch.tensor(0.0)),
-                "rot": nn.Parameter(torch.tensor(0.0)),
-                "torsion": nn.Parameter(torch.tensor(0.0)),
-                "energy": nn.Parameter(torch.tensor(0.0)),
-            }
-        )
-
+        self.weights = {
+            "trans": weight_trans,
+            "rot": weight_rot,
+            "torsion": weight_torsion,
+            "energy": weight_energy,
+            "clash": weight_clash,
+        }
 
     def forward(
         self,
@@ -68,147 +60,116 @@ class FlowMatchingLoss(nn.Module):
         data: Any,
     ) -> dict[str, Tensor]:
         """
-        前向传播
+        计算损失。
 
         Args:
-            predictions: 模型预测结果
-            targets: 目标值
-            data: 数据对象
+            predictions: 预测结果字典。
+            targets: 目标值字典。
+            data: 数据批次对象。
 
         Returns:
-            损失字典
+            损失字典。
         """
-
-        v_atomic = predictions["v_atomic"]
-        
-        if v_atomic is None:
-            raise ValueError("predictions['v_atomic'] must not be None.")
-
-        device = v_atomic.device
         loss_dict: dict[str, Tensor] = {}
 
-        # 1. 分解目标速度
-        v_target_atomic = targets["v_atomic_target"]
-
-        if v_target_atomic is None:
-            raise ValueError("targets['v_atomic_target'] must not be None.")
-            
-        masses = data["ligand_atom"].masses
-        batch = data["ligand_atom"].batch
-
-        torsion_indices = getattr(
-            data, "torsion_indices", torch.empty((0, 4), dtype=torch.long, device=device)
-        )
-        torsion_moving_mask = getattr(
-            data,
-            "torsion_moving_mask",
-            torch.empty((0, masses.size(0)), dtype=torch.bool, device=device),
-        )
-
-        pos_t = data["ligand_atom"].pos
-        gt_trans, gt_rot, gt_torsion = self.decomposer.decompose(
-            pos=pos_t,
-            vel=v_target_atomic,
-            masses=masses,
-            batch=batch,
-            torsion_indices=torsion_indices,
-            torsion_moving_mask=torsion_moving_mask,
-        )
-
-        # 2. 计算原始损失
-        pred_trans = predictions["v_translation"]
-
+        pred_trans = predictions.get("v_translation")
         if pred_trans is None:
-            raise ValueError("predictions['v_translation'] must not be None.")
+            raise ValueError("Key 'v_translation' is missing in predictions.")
+        device = pred_trans.device
 
-        # 使用 Huber Loss 替代 MSE，增强对离群值的鲁棒性
-        raw_loss_trans = F.huber_loss(pred_trans, gt_trans, delta=1.0)
-        loss_dict["raw_loss_trans"] = raw_loss_trans.detach()
+        # 1. 平移损失
+        gt_trans = targets.get("v_trans_target")
+        if gt_trans is None:
+            raise ValueError("Key 'v_trans_target' is missing in targets.")
 
-        pred_rot = predictions["v_rotation"]
+        loss_trans = F.huber_loss(pred_trans, gt_trans, delta=1.0)
+        loss_dict["loss_trans"] = loss_trans.detach()
 
-        if pred_rot is None:
-            raise ValueError("predictions['v_rotation'] must not be None.")
+        # 2. 旋转损失
+        pred_rot = predictions.get("v_rotation")
+        gt_rot = targets.get("v_rot_target")
+        if pred_rot is None or gt_rot is None:
+            raise ValueError("Missing rotation data in predictions or targets.")
 
-        # [修改] 引入特征尺度 L 进行归一化
-        # 旋转 1 rad 产生的位移约为 L * 1
-        # Loss = ||(v_rot_pred - v_rot_gt) * L||^2 = L^2 * MSE
-        # [修改] 全面启用 Huber Loss 防爆
-        # [优化] delta 从 1.0 增大到 5.0，让初期合理误差保持在二次惩罚区域
-        # delta=5.0 意味着缩放后误差在 ±5 范围内使用 MSE，超出后使用 MAE
-        raw_loss_rot = F.huber_loss(pred_rot * self.L, gt_rot * self.L, delta=5.0)
-        loss_dict["raw_loss_rot"] = raw_loss_rot.detach()
+        loss_rot = F.huber_loss(pred_rot * self.L, gt_rot * self.L, delta=1.0)
+        loss_dict["loss_rot"] = loss_rot.detach()
 
-        pred_torsion = predictions.get("v_torsion", None)
+        # 3. 扭转损失（周期性余弦损失）
+        loss_torsion = torch.tensor(0.0, device=device)
+        pred_tor = predictions.get("v_torsion")
+        gt_tor = targets.get("v_torsion_target")
 
-        if pred_torsion is not None and gt_torsion.numel() > 0:
+        if pred_tor is not None and gt_tor is not None and gt_tor.numel() > 0:
+            if pred_tor.dim() == 1:
+                pred_tor = pred_tor.view(-1, 1)
+            if gt_tor.dim() == 1:
+                gt_tor = gt_tor.view(-1, 1)
 
-            if pred_torsion.dim() == 1:
-                pred_torsion = pred_torsion.view(-1, 1)
+            # 物理周期性损失：1 - cos(pred - target)
+            # 自动处理 -π/+π 等价性，输出严格有界 [0, 2]，杜绝梯度爆炸
+            cos_diff = 1.0 - torch.cos(pred_tor - gt_tor)
+            loss_torsion = torch.mean(cos_diff) * (self.L / 2.0)
 
-            if gt_torsion.dim() == 1:
-                gt_torsion = gt_torsion.view(-1, 1)
+        # NaN 守卫（理论上 cos_diff 有界，但防御性保留）
+        if torch.isnan(loss_torsion.detach()):
+            loss_torsion = torch.tensor(0.0, device=device)
 
-            # [修改] 扭转半径通常较小，取 L/2
-            # [修改] 使用 Huber Loss 替代 MSE
-            # [优化] delta 同样增大到 5.0
-            scale_tor = self.L / 2.0
-            raw_loss_torsion = F.huber_loss(pred_torsion * scale_tor, gt_torsion * scale_tor, delta=5.0)
+        loss_dict["loss_torsion"] = loss_torsion.detach()
 
-        else:
-            raw_loss_torsion = torch.tensor(0.0, device=device)
-
-        loss_dict["raw_loss_torsion"] = raw_loss_torsion.detach()
-
-        pred_affinity = predictions.get("binding_affinity", None)
-        gt_affinity = targets.get("binding_affinity_target", None)
+        # 4. 物理亲和力损失 (带时间掩码)
+        loss_energy = torch.tensor(0.0, device=device)
+        pred_affinity = predictions.get("binding_affinity")
+        gt_affinity = targets.get("binding_affinity_target")
 
         if pred_affinity is not None and gt_affinity is not None:
-            # 最后的安全检查，确保 gt_affinity 也是有效的
-            # 增加对 pred_affinity 的 NaN 检查
-            if torch.isnan(gt_affinity).any() or torch.isnan(pred_affinity).any():
-                raw_loss_energy = torch.tensor(0.0, device=device)
+            # NaN 守卫：预测头在训练初期可能因权重随机而输出 NaN，直接跳过避免污染梯度
+            if torch.isnan(pred_affinity).any() or torch.isnan(gt_affinity).any():
+                pass
             else:
-                if pred_affinity.dim() == 1:
-                    pred_affinity = pred_affinity.unsqueeze(-1)
+                t_val = getattr(data, "t", None)
 
-                if gt_affinity.dim() == 1:
-                    gt_affinity = gt_affinity.unsqueeze(-1)
+                if t_val is not None:
+                    # 仅在 t > 0.5 时（配体已较为靠近真实结合态）计算亲和力损失
+                    valid_mask = t_val > 0.5
+                    if valid_mask.any():
+                        loss_energy = F.huber_loss(
+                            pred_affinity[valid_mask].view(-1),
+                            gt_affinity[valid_mask].view(-1),
+                            delta=2.0,
+                        )
+                else:
+                    # 兼容性回退：无时间步信息时直接计算
+                    loss_energy = F.huber_loss(
+                        pred_affinity.view(-1), gt_affinity.view(-1), delta=2.0
+                    )
 
-                raw_loss_energy = F.huber_loss(pred_affinity, gt_affinity, delta=2.0)
-        else:
-            raw_loss_energy = torch.tensor(0.0, device=device)
+        loss_dict["loss_energy"] = loss_energy.detach()
 
-        loss_dict["raw_loss_energy"] = raw_loss_energy.detach()
+        # 5. 物理位阻惩罚损失 (Time-Masked Steric Clash)
+        # 仅在 t > 0.8（配体已进入口袋微调阶段）施加；早期大位移阶段允许穿模
+        loss_clash = torch.tensor(0.0, device=device)
+        clash_batch = predictions.get("steric_clash_batch")
 
-        # 3. 不确定性加权
-        total_loss = torch.zeros((), device=device)
+        if clash_batch is not None and not torch.isnan(clash_batch).any():
+            t_val = getattr(data, "t", None)
+            if t_val is not None:
+                valid_mask = t_val > 0.8
+                if valid_mask.any():
+                    loss_clash = clash_batch[valid_mask].mean()
+            else:
+                # data.t 未设置时跳过（避免无掩码全量施加位阻损失破坏早期训练）
+                pass
 
-        s_trans = torch.clamp(self.log_vars["trans"], self.log_var_min, self.log_var_max)
-        loss_trans = torch.exp(-s_trans) * raw_loss_trans + 0.5 * s_trans
-        total_loss += loss_trans
+        loss_dict["loss_clash"] = loss_clash.detach()
 
-        s_rot = torch.clamp(self.log_vars["rot"], self.log_var_min, self.log_var_max)
-        loss_rot = torch.exp(-s_rot) * raw_loss_rot + 0.5 * s_rot
-        total_loss += loss_rot
-
-        s_torsion = torch.clamp(self.log_vars["torsion"], self.log_var_min, self.log_var_max)
-
-        if pred_torsion is not None and gt_torsion.numel() > 0:
-            loss_torsion = torch.exp(-s_torsion) * raw_loss_torsion + 0.5 * s_torsion
-            total_loss += loss_torsion
-
-        s_energy = torch.clamp(self.log_vars["energy"], self.log_var_min, self.log_var_max)
-
-        if pred_affinity is not None and gt_affinity is not None:
-            loss_energy = torch.exp(-s_energy) * raw_loss_energy + 0.5 * s_energy
-            total_loss += loss_energy
-
-        # 记录学到的权重
-        loss_dict["weight_trans"] = torch.exp(-s_trans).detach()
-        loss_dict["weight_rot"] = torch.exp(-s_rot).detach()
-        loss_dict["weight_torsion"] = torch.exp(-s_torsion).detach()
-        loss_dict["weight_energy"] = torch.exp(-s_energy).detach()
+        # 6. 总损失
+        total_loss = (
+            self.weights["trans"] * loss_trans
+            + self.weights["rot"] * loss_rot
+            + self.weights["torsion"] * loss_torsion
+            + self.weights["energy"] * loss_energy
+            + self.weights["clash"] * loss_clash
+        )
 
         loss_dict["total"] = total_loss
 

@@ -188,15 +188,15 @@ class VelocityDecomposer:
         b_vec = vel.view(-1)  # [3N]
 
         if not torch.isfinite(A).all() or not torch.isfinite(b_vec).all():
-            # 这种情况通常发生在某些极端几何结构（如原子重叠）或路径插值异常时
-            # 我们通过返回零速度来跳过该批次的贡献，确保训练不会中断
             nan_in_A = not torch.isfinite(A).all()
             nan_in_b = not torch.isfinite(b_vec).all()
             logger.debug(f"Numerical instability in decompose: NaN in A: {nan_in_A}, NaN in b: {nan_in_b}. Skipping batch.")
+            # 用 vel.sum()*0 锚定零张量，确保 grad_fn 不被切断
+            zero = b_vec.sum() * 0.0
             return (
-                torch.zeros(B, 3, device=device, dtype=dtype),
-                torch.zeros(B, 3, device=device, dtype=dtype),
-                torch.zeros(T, device=device, dtype=dtype),
+                torch.zeros(B, 3, device=device, dtype=dtype) + zero,
+                torch.zeros(B, 3, device=device, dtype=dtype) + zero,
+                torch.zeros(T, device=device, dtype=dtype) + zero,
             )
 
         # 为了数值稳定性，将计算移至 CPU 并使用更高精度
@@ -228,7 +228,9 @@ class VelocityDecomposer:
                 f"DECOMPOSE FAILED: B={B}, T={T}, N={N}. "
                 f"Error: {e}. Returning zeros."
             )
-            solution = torch.zeros(total_dofs, device=device, dtype=dtype)
+            # 同样锚定到 b_vec，保持梯度通路
+            zero = b_vec.sum() * 0.0
+            solution = torch.zeros(total_dofs, device=device, dtype=dtype) + zero
 
         # 4. 拆解结果
         rigid_sol = solution[: 6 * B].view(B, 6)
@@ -356,20 +358,25 @@ class PoseUpdater:
         theta = torch.norm(d_rot_vec, dim=-1, keepdim=True)
         rot_axis = d_rot_vec / (theta + self.eps)
 
-        for b in range(B):
-            mask = batch == b
+        # 向量化刚体更新：避免 Python for 循环，所有分子并行处理
+        # 计算全体分子的旋转矩阵 [B, 3, 3]
+        R_all = self._axis_angle_to_matrix_batched(rot_axis, theta.squeeze(-1))  # [B, 3, 3]
 
-            if not mask.any():
-                continue
+        # 小角掩码：角度过小时跳过旋转（保持原坐标），防止数值噪声
+        small_angle = (theta.squeeze(-1) <= PhysicsConstants.MIN_ROTATION_ANGLE)  # [B]
+        # 对小角分子，旋转矩阵退化为单位矩阵
+        eye_B = torch.eye(3, device=new_pos.device, dtype=new_pos.dtype).unsqueeze(0).expand(B, -1, -1)
+        R_all = torch.where(small_angle[:, None, None], eye_B, R_all)  # [B, 3, 3]
 
-            angle = theta[b, 0]
+        # 展开到原子维度
+        com_per_atom   = com[batch]          # [N, 3]
+        R_per_atom     = R_all[batch]        # [N, 3, 3]
+        d_trans_per_atom = d_trans[batch]    # [N, 3]
 
-            if angle > PhysicsConstants.MIN_ROTATION_ANGLE:
-                R = self._axis_angle_to_matrix(rot_axis[b], angle)
-                rel = new_pos[mask] - com[b]
-                new_pos[mask] = torch.matmul(rel, R.T) + com[b]
-
-            new_pos[mask] += d_trans[b]
+        # 中心化 → 旋转 → 移回质心 → 平移
+        pos_centered = new_pos - com_per_atom                                  # [N, 3]
+        pos_rotated  = torch.einsum('nij,nj->ni', R_per_atom, pos_centered)    # [N, 3]
+        new_pos = pos_rotated + com_per_atom + d_trans_per_atom                # [N, 3]
 
         return new_pos
 
@@ -395,6 +402,35 @@ class PoseUpdater:
 
         identity_mat = torch.eye(3, device=axis.device, dtype=axis.dtype)
         return identity_mat + torch.sin(angle) * K + (1.0 - torch.cos(angle)) * torch.matmul(K, K)
+
+
+    @staticmethod
+    def _axis_angle_to_matrix_batched(axis: Tensor, angle: Tensor) -> Tensor:
+        """
+        批量 Rodrigues 公式：一次为所有分子计算旋转矩阵。
+
+        Args:
+            axis: 旋转轴（单位向量）[B, 3]
+            angle: 旋转角度（弧度）[B]
+
+        Returns:
+            旋转矩阵 [B, 3, 3]
+        """
+        x, y, z = axis.unbind(-1)          # 各 [B]
+        zeros = torch.zeros_like(x)
+
+        # 反对称矩阵 K [B, 3, 3]
+        K = torch.stack([
+            torch.stack([zeros,  -z,      y    ], dim=-1),
+            torch.stack([z,       zeros,  -x   ], dim=-1),
+            torch.stack([-y,      x,      zeros], dim=-1),
+        ], dim=-2)
+
+        I = torch.eye(3, device=axis.device, dtype=axis.dtype).unsqueeze(0)  # [1, 3, 3]
+        s = torch.sin(angle)[:, None, None]          # [B, 1, 1]
+        c = (1.0 - torch.cos(angle))[:, None, None]  # [B, 1, 1]
+
+        return I + s * K + c * torch.bmm(K, K)       # [B, 3, 3]
 
 
 class PathInterpolator:
