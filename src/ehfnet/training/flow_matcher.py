@@ -115,14 +115,11 @@ class ConditionalFlowMatcher:
                 translation_scale=current_scale,
             )
 
-        # 2. 采样时间 t ~ U[0, 1]
-        # 时间课程学习：随着训练进行，逐渐降低 sigma_min，从容易（高噪声）到困难（低噪声）
-        sigma_start = 0.1
-        sigma_end = 1e-4
-        progress = min(1.0, current_epoch / max(1, total_epochs))
-        current_sigma = sigma_start + (sigma_end - sigma_start) * progress
-        
-        t = torch.rand(B, device=device) * (1.0 - 2 * current_sigma) + current_sigma
+        # 2. 采样时间 t，显式避开边界：t ~ U[sigma_min, 1-sigma_min]
+        # 防止 t 接近 0/1 导致时间嵌入数值不稳定
+        sigma = float(self.sigma_min)
+        sigma = max(0.0, min(0.49, sigma))
+        t = torch.rand(B, device=device) * (1.0 - 2 * sigma) + sigma
 
         # 3. 计算物理插值路径参数
         path_params = self.interpolator.compute_path_parameters(
@@ -138,14 +135,12 @@ class ConditionalFlowMatcher:
         try:
             x_t, v_t = self.interpolator.interpolate(path_params, t)
             
-            # [修改] 提高速度限制阈值到物理合理范围
-            # 在训练初期，由于空间扰动较大，速度可能达到 60-80 Å/s，这是可接受的
-            # 只有超过 80 Å/s 才认为是异常
+            # 配套放宽硬裁剪阈值，减少对目标速度分布的截断
             v_norm = torch.norm(v_t, dim=-1)
-            max_v = 80.0
+            max_v = 150.0
             if (v_norm > max_v).any():
-                logger.warning(f"Extreme velocity detected (max={v_norm.max().item():.2f}). Clipping to {max_v}.")
-                v_t = torch.clamp(v_t, min=-max_v, max=max_v)
+                logger.warning(f"Extreme velocity detected (max={v_norm.max().item():.2f}). Soft-saturating to {max_v}.")
+                v_t = max_v * torch.tanh(v_t / max_v)
                 
         except Exception as e:
             logger.error(f"Error during interpolation: {e}")

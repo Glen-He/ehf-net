@@ -232,6 +232,7 @@ class PDBBindDataset(Dataset):
         affinities = self.index_df["affinity"].values
         mean = float(affinities.mean())
         std = float(affinities.std())
+        std = max(std, 1e-3)
         
         logger.info(f"Affinity stats: mean={mean:.4f}, std={std:.4f}")
         return {"mean": mean, "std": std}

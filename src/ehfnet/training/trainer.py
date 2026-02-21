@@ -113,6 +113,15 @@ def train(
         pocket_radius=pocket_radius,
     )
 
+    # 统一亲和力统计来源：以当前 Dataset 统计为准，避免外部 stats 与训练集不一致
+    if normalization_stats is None:
+        normalization_stats = {}
+
+    normalization_stats["affinity"] = {
+        "mean": torch.tensor(dataset.affinity_stats["mean"], dtype=torch.float32),
+        "std": torch.tensor(dataset.affinity_stats["std"], dtype=torch.float32),
+    }
+
     # [修改] 使用工程级 Scaffold Splitter
     logger.info("Splitting dataset by Scaffold...")
     
@@ -173,7 +182,7 @@ def train(
     ).to(device)
 
     matcher = ConditionalFlowMatcher(
-        sigma_min=1e-4,
+        sigma_min=1e-3,
         warmup_epochs=warmup_epochs,
     )
     criterion = FlowMatchingLoss().to(device)
@@ -412,11 +421,13 @@ def compute_validation_loss(
                     # 双重检查：预测值本身也不能含 NaN
                     if not torch.isnan(pred_aff).any():
                         affinity_preds.append(pred_aff.cpu())
-                        # 优先使用 raw 值，如果没有则使用归一化值（稍后统一处理）
+                        # target 统一为 raw（若已提供 raw 则直接用，否则做一次反归一化）
                         if hasattr(batch, "y_energy_raw"):
                             affinity_targets.append(batch.y_energy_raw.cpu())
                         else:
-                            affinity_targets.append(batch.get("y_energy").cpu())
+                            y_norm = batch.get("y_energy", None)
+                            if y_norm is not None:
+                                affinity_targets.append(dataset.denormalize_affinity(y_norm.cpu()))
 
             # 2. 全量 RMSD 推演
             # -----------------------------------------------------------
@@ -452,8 +463,8 @@ def compute_validation_loss(
                     final_pos, _ = matcher.ode_solve(
                         model=model,
                         data=infer_batch,
-                        steps=20,       # 保持 20 步以兼顾速度和精度
-                        method="euler"
+                        steps=40,
+                        method="rk4"
                     )
                     
                     # 记录最终 RMSD
@@ -476,13 +487,8 @@ def compute_validation_loss(
         cat_preds = torch.cat(affinity_preds).view(-1)
         cat_targets = torch.cat(affinity_targets).view(-1)
         
-        # 反归一化预测值
+        # 模型输出是 norm，验证时仅在这里做一次反归一化
         raw_preds = dataset.denormalize_affinity(cat_preds)
-        
-        # 如果 targets 已经是 raw 的（因为我们存了 y_energy_raw），则不需要反归一化
-        # 如果 dataset 中没有 y_energy_raw，说明 target 也是归一化的，需要反归一化
-        # 但我们在 Dataset.get 中已经强制添加了 y_energy_raw，所以 cat_targets 应该是 raw 的
-        # 为了保险起见，这里假设 cat_targets 是 raw 的 (pKd)
         
         mse_val = F.mse_loss(raw_preds, cat_targets)
         rmse_val = torch.sqrt(mse_val).item()

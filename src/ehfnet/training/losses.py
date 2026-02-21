@@ -175,7 +175,7 @@ class FlowMatchingLoss(nn.Module):
                 if gt_affinity.dim() == 1:
                     gt_affinity = gt_affinity.unsqueeze(-1)
 
-                raw_loss_energy = F.mse_loss(pred_affinity, gt_affinity)
+                raw_loss_energy = F.huber_loss(pred_affinity, gt_affinity, delta=2.0)
         else:
             raw_loss_energy = torch.tensor(0.0, device=device)
 

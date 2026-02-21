@@ -510,12 +510,41 @@ class GraphBuilder:
                 edge_index = torch.stack([src_idx, dst_idx], dim=0)
 
             else:
+                cutoff = self._resolve_inter_cutoff(src, dst)
+                max_neighbors = self._resolve_inter_max_neighbors(src, dst)
                 edge_index = self._bipartite_radius_graph(
                     data[src].pos,
                     data[dst].pos,
-                    self.r_cutoff_inter,
-                    max_num_neighbors=self.max_neighbors_inter,
+                    cutoff,
+                    max_num_neighbors=max_neighbors,
                 )
+
+                # 半径边为空时，回退到 kNN，防止跨图交互完全断开
+                if edge_index.numel() == 0:
+                    edge_index = self._bipartite_knn_graph(
+                        data[src].pos,
+                        data[dst].pos,
+                        k=min(8, max_neighbors),
+                    )
+
+                # 保证每个目标节点至少有一条入边（避免部分节点无跨图信息）
+                if edge_index.numel() > 0:
+                    covered_dst = torch.unique(edge_index[1])
+                    all_dst = torch.arange(int(data[dst].num_nodes), device=edge_device)
+                    uncovered_mask = torch.ones_like(all_dst, dtype=torch.bool)
+                    uncovered_mask[covered_dst] = False
+                    uncovered_dst = all_dst[uncovered_mask]
+
+                    if uncovered_dst.numel() > 0:
+                        extra_edges = self._bipartite_knn_graph(
+                            data[src].pos,
+                            data[dst].pos,
+                            k=1,
+                            dst_indices=uncovered_dst,
+                        )
+                        if extra_edges.numel() > 0:
+                            edge_index = torch.cat([edge_index, extra_edges], dim=1)
+                            edge_index = torch.unique(edge_index, dim=1)
 
             data[src, rel, dst].edge_index = edge_index
             reverse_edge_type = (dst, rel, src)
@@ -531,6 +560,28 @@ class GraphBuilder:
             processed_edges.add(edge_key)
 
         return data
+
+
+    def _resolve_inter_cutoff(self, src: str, dst: str) -> float:
+        """
+        按节点类型选择跨图半径阈值。
+        """
+
+        if "residue" in src or "residue" in dst:
+            return self.r_cutoff_inter * 2.0
+
+        return self.r_cutoff_inter
+
+
+    def _resolve_inter_max_neighbors(self, src: str, dst: str) -> int:
+        """
+        按节点类型选择跨图最大邻居数。
+        """
+
+        if "residue" in src or "residue" in dst:
+            return max(self.max_neighbors_inter, 64)
+
+        return self.max_neighbors_inter
 
 
     def _build_broadcast_edges(self, data: HeteroData) -> HeteroData:
@@ -649,6 +700,39 @@ class GraphBuilder:
             edge_index = edge_index.flip(0)
 
         return edge_index
+
+
+    @staticmethod
+    def _bipartite_knn_graph(
+        pos_src: Tensor,
+        pos_dst: Tensor,
+        k: int,
+        *,
+        dst_indices: Tensor | None = None,
+    ) -> Tensor:
+        """
+        构建 src->dst 的 kNN 边，保证在远距离时仍有跨图连接。
+        """
+
+        device = pos_src.device
+
+        if pos_src.numel() == 0 or pos_dst.numel() == 0:
+            return torch.zeros((2, 0), dtype=torch.long, device=device)
+
+        if dst_indices is None:
+            dst_indices = torch.arange(pos_dst.size(0), device=device)
+
+        if dst_indices.numel() == 0:
+            return torch.zeros((2, 0), dtype=torch.long, device=device)
+
+        dist = torch.cdist(pos_dst[dst_indices], pos_src)
+        k_eff = min(max(1, int(k)), pos_src.size(0))
+        nn_src = torch.topk(dist, k=k_eff, largest=False, dim=1).indices
+
+        dst_rep = dst_indices.repeat_interleave(k_eff)
+        src_sel = nn_src.reshape(-1)
+
+        return torch.stack([src_sel, dst_rep], dim=0)
 
 
 def create_graph_tools(

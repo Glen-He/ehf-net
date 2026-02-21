@@ -241,14 +241,16 @@ class VelocityDecomposer:
             else torch.zeros(0, device=device, dtype=dtype)
         )
         
-        # [新增] 对分解后的速度分量添加物理约束，防止病态几何产生极端值
-        # 平移速度：±30 Å/s 是合理上限（分子扩散速度）
-        v_trans = torch.clamp(v_trans, min=-30.0, max=30.0)
-        # 旋转角速度：±10 rad/s 是合理上限（约 1.6 转/秒）
-        v_rot = torch.clamp(v_rot, min=-10.0, max=10.0)
-        # 扭转角速度：±15 rad/s 是合理上限
+        # 对分解后的速度分量做软饱和（避免硬截断造成梯度与目标信号塌缩）
+        trans_limit = 60.0
+        rot_limit = 25.0
+        torsion_limit = 30.0
+
+        v_trans = trans_limit * torch.tanh(v_trans / trans_limit)
+        v_rot = rot_limit * torch.tanh(v_rot / rot_limit)
+
         if v_torsion.numel() > 0:
-            v_torsion = torch.clamp(v_torsion, min=-15.0, max=15.0)
+            v_torsion = torsion_limit * torch.tanh(v_torsion / torsion_limit)
 
         return v_trans, v_rot, v_torsion
 

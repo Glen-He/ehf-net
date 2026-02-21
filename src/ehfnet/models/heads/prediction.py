@@ -28,8 +28,8 @@ class PredictionConstants:
     RBF_STOP = 10.0                 # Å, 非键相互作用截断距离
 
     # 邻居搜索
-    BASE_MAX_NEIGHBORS = 128        # 基础最大邻居数
-    MIN_MAX_NEIGHBORS = 32          # 最小最大邻居数
+    BASE_MAX_NEIGHBORS = 256        # 基础最大邻居数（提升以减少高密度样本截断）
+    MIN_MAX_NEIGHBORS = 64          # 最小最大邻居数
 
     # 数值稳定性
     MIN_DISTANCE = 1e-6             # Å, 最小距离阈值
@@ -38,6 +38,8 @@ class PredictionConstants:
     # 物理参数
     MIN_MASS_INV = 0.01             # 最小质量倒数（防止梯度消失）
     BASELINE_BINDING_ENERGY = -7.0  # kcal/mol, 典型结合能
+    FORCE_CUTOFF = 6.0              # Å, 力场局部相互作用半径
+    FORCE_LIMIT = 20.0              # 力幅值软饱和上限
 
 
 class GaussianSmearing(nn.Module):
@@ -155,7 +157,7 @@ class PredictionHead(nn.Module):
     物理一致的统一预测头
 
     架构设计理念：
-    1. 能量势场：E(r) → 结合亲和力 ΔG [B, 1]
+    1. 能量势场：E(r) → 结合亲和力 score_norm [B, 1]
     2. 力场预测：F ≈ -∇E，通过 MLP 近似能量梯度
     3. 速度转换：v = F/m_eff，学习有效质量倒数
 
@@ -172,6 +174,10 @@ class PredictionHead(nn.Module):
         r_cutoff: float = PredictionConstants.RBF_STOP,
         dropout_rate: float = 0.1,
         affinity_stats: dict | None = None,
+        max_neighbors: int = PredictionConstants.BASE_MAX_NEIGHBORS,
+        force_cutoff: float = PredictionConstants.FORCE_CUTOFF,
+        force_limit: float = PredictionConstants.FORCE_LIMIT,
+        knn_fallback_k: int = 8,
     ) -> None:
         """
         Args:
@@ -179,7 +185,11 @@ class PredictionHead(nn.Module):
             num_rbf: RBF 基函数数量
             r_cutoff: 截断距离（单位：Å）
             dropout_rate: Dropout 比例
-            affinity_stats: 结合能统计数据 (mean, std) 用于反归一化
+            affinity_stats: 保留兼容参数（当前不在模型内做反归一化）
+            max_neighbors: 跨图邻居上限，过小会导致高密度样本信息截断
+            force_cutoff: 力分支局部交互半径（Å）
+            force_limit: 力幅值软饱和上限
+            knn_fallback_k: 半径边缺失时的最近邻回退数量
         """
 
         super().__init__()
@@ -188,22 +198,20 @@ class PredictionHead(nn.Module):
         self.num_rbf = num_rbf
         self.r_cutoff = float(r_cutoff)
         self.scale = hidden_dim**-0.5
+        self.base_max_neighbors = int(max_neighbors)
+        self.force_cutoff = float(min(force_cutoff, self.r_cutoff))
+        self.force_limit = float(force_limit)
+        self.knn_fallback_k = max(1, int(knn_fallback_k))
         
-        # 注册结合能标准化参数
-        if affinity_stats:
-            self.register_buffer("aff_mean", affinity_stats["mean"])
-            self.register_buffer("aff_std", affinity_stats["std"])
-        else:
-            # 默认 fallback
-            self.register_buffer("aff_mean", torch.tensor(6.0))
-            self.register_buffer("aff_std", torch.tensor(1.5))
+        # 兼容保留：亲和力统计由 trainer/数据集侧用于反归一化评估
+        _ = affinity_stats
 
-        # 动态调整邻居数
+        # 动态调整邻居数：保证高密度样本不被过度截断
         self.adaptive_max_neighbors = True
-        self.base_max_neighbors = PredictionConstants.BASE_MAX_NEIGHBORS
 
         # 共享模块
         self.cutoff_fn = CosineCutoff(cutoff=self.r_cutoff)
+        self.force_cutoff_fn = CosineCutoff(cutoff=self.force_cutoff)
 
         # 距离 RBF 编码 + 边特征 MLP
         self.distance_expansion = GaussianSmearing(0.0, self.r_cutoff, num_rbf)
@@ -321,15 +329,16 @@ class PredictionHead(nn.Module):
 
             return {
                 "v_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
-                "binding_affinity": self.aff_mean.expand(B).unsqueeze(-1),
+                "binding_affinity": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
                 "force_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
             }
 
         # 1. 邻居搜索
         if self.adaptive_max_neighbors:
+            # 对高密度口袋场景提高上限，减少半径图邻接被截断
             max_k = min(
                 self.base_max_neighbors,
-                max(PredictionConstants.MIN_MAX_NEIGHBORS, N_pro // 10),
+                max(PredictionConstants.MIN_MAX_NEIGHBORS, N_pro // 4),
             )
 
         else:
@@ -344,11 +353,43 @@ class PredictionHead(nn.Module):
             max_num_neighbors=max_k,
         )
 
+        # 半径边为空时，使用批内 kNN 回退，保证配体原子至少有跨图连接
+        if edge_index.size(1) == 0:
+            edge_index = self._build_knn_edges(
+                lig_pos=lig_atom_pos,
+                lig_batch=lig_batch,
+                pro_pos=pro_atom_pos,
+                pro_batch=pro_atom_batch,
+                k=self.knn_fallback_k,
+            )
+
+        # 若半径图遗漏了部分配体原子，也为遗漏原子补 1-NN 边
+        if edge_index.size(1) > 0:
+            covered_lig = torch.unique(edge_index[0])
+            all_lig = torch.arange(N_lig, device=device)
+            uncovered_mask = torch.ones(N_lig, dtype=torch.bool, device=device)
+            uncovered_mask[covered_lig] = False
+            uncovered_lig = all_lig[uncovered_mask]
+
+            if uncovered_lig.numel() > 0:
+                extra_edges = self._build_knn_edges(
+                    lig_pos=lig_atom_pos,
+                    lig_batch=lig_batch,
+                    pro_pos=pro_atom_pos,
+                    pro_batch=pro_atom_batch,
+                    k=1,
+                    lig_indices=uncovered_lig,
+                )
+
+                if extra_edges.numel() > 0:
+                    edge_index = torch.cat([edge_index, extra_edges], dim=1)
+                    edge_index = torch.unique(edge_index, dim=1)
+
         if edge_index.size(1) == 0:
 
             return {
                 "v_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
-                "binding_affinity": self.aff_mean.expand(B).unsqueeze(-1),
+                "binding_affinity": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
                 "force_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
             }
 
@@ -361,6 +402,15 @@ class PredictionHead(nn.Module):
         dist = torch.norm(lig_pos_sel - pro_pos_sel, dim=-1, p=2)
 
         cutoff_weights = self.cutoff_fn(dist)
+        force_cutoff_weights = self.force_cutoff_fn(dist)
+
+        # 当全部边都落在 cutoff 外时，启用长程衰减权重，避免“有边无信号”
+        if torch.all(cutoff_weights <= PredictionConstants.EPSILON):
+            cutoff_weights = torch.exp(-dist / max(self.r_cutoff, PredictionConstants.EPSILON))
+
+        if torch.all(force_cutoff_weights <= PredictionConstants.EPSILON):
+            force_cutoff_weights = torch.exp(-dist / max(self.force_cutoff, PredictionConstants.EPSILON))
+
         rbf = self.distance_expansion(dist)
         edge_feat = self.edge_mlp(rbf)
 
@@ -370,9 +420,9 @@ class PredictionHead(nn.Module):
         # 3. 力场预测
         pair_input = torch.cat([lig_feat_sel, pro_feat_sel, edge_feat], dim=-1)
 
-        force_magnitude = self.force_magnitude_mlp(pair_input)
-        # [Fix] 截断力场幅值，防止训练初期梯度爆炸导致 RMSD 变差
-        force_magnitude = torch.clamp(force_magnitude, min=-10.0, max=10.0)
+        force_magnitude_raw = self.force_magnitude_mlp(pair_input)
+        # 软饱和替代硬截断，保持可导且保留强信号排序
+        force_magnitude = self.force_limit * torch.tanh(force_magnitude_raw / self.force_limit)
 
         rel_pos = lig_pos_sel - pro_pos_sel
         direction = torch.nn.functional.normalize(
@@ -383,7 +433,8 @@ class PredictionHead(nn.Module):
             zero_mask.unsqueeze(-1), torch.zeros_like(direction), direction
         )
 
-        force_pairwise = force_magnitude * direction * cutoff_weights.unsqueeze(-1)
+        # 力分支使用更局部的相互作用，减少远距离噪声对几何更新的污染
+        force_pairwise = force_magnitude * direction * force_cutoff_weights.unsqueeze(-1)
         force_atomic = scatter_add(force_pairwise, i_idx, dim=0, dim_size=N_lig)
 
         # 力 → 速度
@@ -396,8 +447,16 @@ class PredictionHead(nn.Module):
         E_ij_raw = self.pairwise_energy_mlp(pair_input).squeeze(-1)
         E_ij = E_ij_raw * cutoff_weights
 
-        E_lig_atom = scatter_add(E_ij, i_idx, dim=0, dim_size=N_lig)
-        E_physical = scatter_add(E_lig_atom, lig_batch, dim=0, dim_size=B)
+        # 先在配体原子维度按有效边权做归一化，再在样本维度做均值归一化
+        edge_mass_per_atom = scatter_add(cutoff_weights, i_idx, dim=0, dim_size=N_lig)
+        edge_mass_per_atom = edge_mass_per_atom.clamp(min=PredictionConstants.EPSILON)
+        E_lig_atom = scatter_add(E_ij, i_idx, dim=0, dim_size=N_lig) / edge_mass_per_atom
+
+        E_physical_sum = scatter_add(E_lig_atom, lig_batch, dim=0, dim_size=B)
+        atom_counts = scatter_add(
+            torch.ones(N_lig, device=device), lig_batch, dim=0, dim_size=B
+        )
+        E_physical = E_physical_sum / atom_counts.clamp(min=1.0)
 
         # 交叉注意力
         lig_atoms_with_neighbors = torch.unique(i_idx, sorted=False)
@@ -438,9 +497,6 @@ class PredictionHead(nn.Module):
         context_atom = self.norm(context_atom + lig_atom_feat)
 
         # 归一化聚合
-        atom_counts = scatter_add(
-            torch.ones(N_lig, device=device), lig_batch, dim=0, dim_size=B
-        )
         context_sum = scatter_add(context_atom, lig_batch, dim=0, dim_size=B)
         context_global = context_sum / atom_counts.clamp(min=1).unsqueeze(-1)
 
@@ -449,14 +505,61 @@ class PredictionHead(nn.Module):
         E_correction = self.global_correction_mlp(global_input).squeeze(-1)
 
         # 最终能量 (Score)
-        # 神经网络输出的是归一化的分数 (期望在 0 附近)
+        # 神经网络输出归一化分数（与 y_energy 对齐）
         score_norm = E_physical + E_correction
-        
-        # 反归一化，输出真实物理值
-        binding_affinity = (score_norm * self.aff_std + self.aff_mean).unsqueeze(-1)
+
+        # 模型端不做反归一化：保持训练目标与输出标度一致
+        binding_affinity = score_norm.unsqueeze(-1)
 
         return {
             "v_atomic": v_atomic,
             "binding_affinity": binding_affinity,
             "force_atomic": force_atomic,
         }
+
+
+    @staticmethod
+    def _build_knn_edges(
+        *,
+        lig_pos: Tensor,
+        lig_batch: Tensor,
+        pro_pos: Tensor,
+        pro_batch: Tensor,
+        k: int,
+        lig_indices: Tensor | None = None,
+    ) -> Tensor:
+        """
+        构建批内 ligand->protein 的 kNN 边，返回格式与 radius 一致：[lig_idx, pro_idx]
+        """
+
+        device = lig_pos.device
+
+        if lig_indices is None:
+            lig_indices = torch.arange(lig_pos.size(0), device=device)
+
+        if lig_indices.numel() == 0 or pro_pos.numel() == 0:
+            return torch.zeros((2, 0), dtype=torch.long, device=device)
+
+        edges: list[Tensor] = []
+        unique_batches = torch.unique(lig_batch[lig_indices])
+
+        for b in unique_batches:
+            lig_mask = lig_batch[lig_indices] == b
+            lig_ids = lig_indices[lig_mask]
+            pro_ids = torch.where(pro_batch == b)[0]
+
+            if lig_ids.numel() == 0 or pro_ids.numel() == 0:
+                continue
+
+            d = torch.cdist(lig_pos[lig_ids], pro_pos[pro_ids])
+            k_eff = min(k, int(pro_ids.numel()))
+            nn_local = torch.topk(d, k=k_eff, largest=False, dim=1).indices
+
+            lig_rep = lig_ids.repeat_interleave(k_eff)
+            pro_sel = pro_ids[nn_local.reshape(-1)]
+            edges.append(torch.stack([lig_rep, pro_sel], dim=0))
+
+        if not edges:
+            return torch.zeros((2, 0), dtype=torch.long, device=device)
+
+        return torch.cat(edges, dim=1)

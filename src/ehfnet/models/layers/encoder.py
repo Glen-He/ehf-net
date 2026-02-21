@@ -10,6 +10,7 @@ import torch
 from typing import Any, cast
 from torch import nn, Tensor
 from torch.nn import ModuleList
+from torch_cluster import radius
 from torch_geometric.data import HeteroData
 from torch_geometric import nn as pyg_nn
 from torch_geometric.nn.conv import MessagePassing
@@ -62,6 +63,10 @@ class EHFEncoder(nn.Module):
         dropout_rate: float = 0.0,
         fix_protein: bool = True,
         stats: dict | None = None,
+        dynamic_inter_cutoff: float = 10.0,
+        dynamic_inter_knn_k: int = 8,
+        dynamic_residue_cutoff: float = 14.0,
+        dynamic_residue_knn_k: int = 6,
     ) -> None:
         """
         Args:
@@ -76,11 +81,19 @@ class EHFEncoder(nn.Module):
             dropout_rate: Dropout 比例
             fix_protein: 是否冻结蛋白坐标
             stats: 统计数据字典 (用于输入归一化)
+            dynamic_inter_cutoff: 动态跨图原子边半径
+            dynamic_inter_knn_k: 半径为空时的 kNN 回退邻居数
+            dynamic_residue_cutoff: 动态 ligand-residue 跨图边半径
+            dynamic_residue_knn_k: ligand-residue 边为空时的 kNN 回退邻居数
         """
         super().__init__()
 
         self.hidden_dim = hidden_dim
         self.fix_protein = fix_protein
+        self.dynamic_inter_cutoff = float(dynamic_inter_cutoff)
+        self.dynamic_inter_knn_k = max(1, int(dynamic_inter_knn_k))
+        self.dynamic_residue_cutoff = float(dynamic_residue_cutoff)
+        self.dynamic_residue_knn_k = max(1, int(dynamic_residue_knn_k))
 
         # 1. 特征嵌入
         self.ligand_atom_embedder = LigandAtomEmbedding(
@@ -493,6 +506,223 @@ class EHFEncoder(nn.Module):
         return x_dict, pos_dict
 
 
+    @staticmethod
+    def _get_node_batch(data: HeteroData, node_type: str, num_nodes: int, device: torch.device) -> Tensor:
+        """
+        获取节点 batch 索引；若缺失则默认为单图 batch=0。
+        """
+
+        if hasattr(data[node_type], "batch") and data[node_type].batch is not None:
+            node_batch = data[node_type].batch
+
+            if node_batch.numel() == num_nodes:
+                return node_batch
+
+        return torch.zeros(num_nodes, dtype=torch.long, device=device)
+
+
+    @staticmethod
+    def _bipartite_knn_edges(
+        *,
+        src_pos: Tensor,
+        src_batch: Tensor,
+        dst_pos: Tensor,
+        dst_batch: Tensor,
+        k: int,
+    ) -> Tensor:
+        """
+        为 dst 节点构建 src->dst 的批内 kNN 边。
+        返回格式：[src_idx, dst_idx]
+        """
+
+        device = src_pos.device
+
+        if src_pos.numel() == 0 or dst_pos.numel() == 0:
+            return torch.zeros((2, 0), dtype=torch.long, device=device)
+
+        edges: list[Tensor] = []
+        batch_ids = torch.unique(dst_batch)
+
+        for b in batch_ids:
+            src_ids = torch.where(src_batch == b)[0]
+            dst_ids = torch.where(dst_batch == b)[0]
+
+            if src_ids.numel() == 0 or dst_ids.numel() == 0:
+                continue
+
+            dist = torch.cdist(dst_pos[dst_ids], src_pos[src_ids])
+            k_eff = min(k, int(src_ids.numel()))
+            nn_src_local = torch.topk(dist, k=k_eff, largest=False, dim=1).indices
+
+            dst_rep = dst_ids.repeat_interleave(k_eff)
+            src_sel = src_ids[nn_src_local.reshape(-1)]
+            edges.append(torch.stack([src_sel, dst_rep], dim=0))
+
+        if not edges:
+            return torch.zeros((2, 0), dtype=torch.long, device=device)
+
+        return torch.cat(edges, dim=1)
+
+
+    def _build_dynamic_inter_atom_edges(
+        self,
+        *,
+        data: HeteroData,
+        pos_dict: dict[str, Tensor],
+        edge_dict: dict[tuple[str, str, str], Tensor],
+    ) -> dict[tuple[str, str, str], Tensor]:
+        """
+        动态重建 ligand_atom<->protein_atom 跨图边。
+        半径图为空时回退 kNN，确保跨图信息不断链。
+        """
+
+        key_fw = ("ligand_atom", "inter_proximity", "protein_atom")
+        key_bw = ("protein_atom", "inter_proximity", "ligand_atom")
+
+        if "ligand_atom" not in pos_dict or "protein_atom" not in pos_dict:
+            return edge_dict
+
+        lig_pos = pos_dict["ligand_atom"]
+        pro_pos = pos_dict["protein_atom"]
+
+        if lig_pos.numel() == 0 or pro_pos.numel() == 0:
+            return edge_dict
+
+        device = lig_pos.device
+        lig_batch = self._get_node_batch(data, "ligand_atom", lig_pos.size(0), device)
+        pro_batch = self._get_node_batch(data, "protein_atom", pro_pos.size(0), device)
+
+        # radius 返回 [dst(y), src(x)]，此处 y=ligand, x=protein
+        # 输出正向边使用 [lig_idx, pro_idx]
+        radius_edges = radius(
+            x=pro_pos,
+            y=lig_pos,
+            r=self.dynamic_inter_cutoff,
+            batch_x=pro_batch,
+            batch_y=lig_batch,
+            max_num_neighbors=max(64, self.dynamic_inter_knn_k * 4),
+        )
+
+        if radius_edges.numel() > 0:
+            edge_fw = torch.stack([radius_edges[0], radius_edges[1]], dim=0)
+        else:
+            edge_fw = self._bipartite_knn_edges(
+                src_pos=pro_pos,
+                src_batch=pro_batch,
+                dst_pos=lig_pos,
+                dst_batch=lig_batch,
+                k=self.dynamic_inter_knn_k,
+            )
+
+        # 覆盖性修复：确保每个 ligand 原子至少有一条跨图边
+        if edge_fw.numel() > 0:
+            covered_lig = torch.unique(edge_fw[1])
+            all_lig = torch.arange(lig_pos.size(0), device=device)
+            uncovered = all_lig[~torch.isin(all_lig, covered_lig)]
+
+            if uncovered.numel() > 0:
+                extra = self._bipartite_knn_edges(
+                    src_pos=pro_pos,
+                    src_batch=pro_batch,
+                    dst_pos=lig_pos[uncovered],
+                    dst_batch=lig_batch[uncovered],
+                    k=1,
+                )
+
+                if extra.numel() > 0:
+                    # extra 的 dst 索引是局部 0..len(uncovered)-1，需要映射回全局 ligand 索引
+                    extra_dst_global = uncovered[extra[1]]
+                    extra_fw = torch.stack([extra[0], extra_dst_global], dim=0)
+                    edge_fw = torch.cat([edge_fw, extra_fw], dim=1)
+
+        if edge_fw.numel() > 0:
+            edge_fw = torch.unique(edge_fw, dim=1)
+
+        # key_fw 约定为 [lig_idx, pro_idx]
+        edge_dict[key_fw] = torch.stack([edge_fw[1], edge_fw[0]], dim=0) if edge_fw.numel() > 0 else edge_fw
+        edge_dict[key_bw] = edge_dict[key_fw].flip(0) if edge_dict[key_fw].numel() > 0 else edge_dict[key_fw]
+
+        return edge_dict
+
+
+    def _build_dynamic_ligand_residue_edges(
+        self,
+        *,
+        data: HeteroData,
+        pos_dict: dict[str, Tensor],
+        edge_dict: dict[tuple[str, str, str], Tensor],
+    ) -> dict[tuple[str, str, str], Tensor]:
+        """
+        动态重建 ligand_atom<->protein_residue 跨图边（Stage-3 多尺度交互）。
+        """
+
+        key_fw = ("ligand_atom", "inter_proximity", "protein_residue")
+        key_bw = ("protein_residue", "inter_proximity", "ligand_atom")
+
+        if "ligand_atom" not in pos_dict or "protein_residue" not in data.node_types:
+            return edge_dict
+
+        lig_pos = pos_dict["ligand_atom"]
+        res_pos = data["protein_residue"].pos
+
+        if lig_pos.numel() == 0 or res_pos.numel() == 0:
+            return edge_dict
+
+        device = lig_pos.device
+        lig_batch = self._get_node_batch(data, "ligand_atom", lig_pos.size(0), device)
+        res_batch = self._get_node_batch(data, "protein_residue", res_pos.size(0), device)
+
+        radius_edges = radius(
+            x=res_pos,
+            y=lig_pos,
+            r=self.dynamic_residue_cutoff,
+            batch_x=res_batch,
+            batch_y=lig_batch,
+            max_num_neighbors=max(64, self.dynamic_residue_knn_k * 6),
+        )
+
+        if radius_edges.numel() > 0:
+            # [lig_idx, res_idx]
+            edge_fw = torch.stack([radius_edges[0], radius_edges[1]], dim=0)
+        else:
+            edge_fw = self._bipartite_knn_edges(
+                src_pos=res_pos,
+                src_batch=res_batch,
+                dst_pos=lig_pos,
+                dst_batch=lig_batch,
+                k=self.dynamic_residue_knn_k,
+            )
+            # 转为 [lig_idx, res_idx]
+            if edge_fw.numel() > 0:
+                edge_fw = edge_fw.flip(0)
+
+        if edge_fw.numel() > 0:
+            covered_lig = torch.unique(edge_fw[0])
+            all_lig = torch.arange(lig_pos.size(0), device=device)
+            uncovered = all_lig[~torch.isin(all_lig, covered_lig)]
+
+            if uncovered.numel() > 0:
+                extra = self._bipartite_knn_edges(
+                    src_pos=res_pos,
+                    src_batch=res_batch,
+                    dst_pos=lig_pos[uncovered],
+                    dst_batch=lig_batch[uncovered],
+                    k=1,
+                )
+                if extra.numel() > 0:
+                    # extra 为 [res_idx, local_lig_idx]
+                    extra_lig_global = uncovered[extra[1]]
+                    extra_fw = torch.stack([extra_lig_global, extra[0]], dim=0)
+                    edge_fw = torch.cat([edge_fw, extra_fw], dim=1)
+
+            edge_fw = torch.unique(edge_fw, dim=1)
+
+        edge_dict[key_fw] = edge_fw if edge_fw.numel() > 0 else torch.zeros((2, 0), dtype=torch.long, device=device)
+        edge_dict[key_bw] = edge_dict[key_fw].flip(0) if edge_dict[key_fw].numel() > 0 else edge_dict[key_fw]
+
+        return edge_dict
+
+
     def forward(self, data: HeteroData, t: Tensor) -> dict[str, Any]:
         """
         前向传播
@@ -527,7 +757,7 @@ class EHFEncoder(nn.Module):
                     f"num_nodes={x.shape[0]}, num_time_steps={t_emb.shape[0]}."
                 )
 
-        edge_dict = data.edge_index_dict
+        edge_dict = dict(data.edge_index_dict)
 
         # 保存初始位置用于速度计算（在 GNN 更新之前）
         pos_input: dict[str, Tensor] = {
@@ -537,6 +767,16 @@ class EHFEncoder(nn.Module):
 
         # 运行 GNN 块
         for block in self.gnn_blocks:
+            edge_dict = self._build_dynamic_inter_atom_edges(
+                data=data,
+                pos_dict=pos_dict,
+                edge_dict=edge_dict,
+            )
+            edge_dict = self._build_dynamic_ligand_residue_edges(
+                data=data,
+                pos_dict=pos_dict,
+                edge_dict=edge_dict,
+            )
             x_dict, pos_dict = self._run_block(
                 cast(nn.ModuleDict, block), x_dict, pos_dict, edge_dict
             )

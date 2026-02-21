@@ -16,6 +16,12 @@
     *   内置物理能量预测头，确保生成的构象符合生物物理约束。
 *   **🎓 空间课程学习 (Spatial Curriculum)**: 采用动态难度调度策略，从局部微调逐步过渡到全局搜索，显著加速模型收敛。
 *   **🧬 层次化编码**: 融合原子级几何特征与 ESM-2 蛋白质语言模型特征，捕获深层生物学语义。
+*   **🔗 动态跨图构边 (Dynamic Cross-Graph Edges)**:
+    *   每个 GNN Block 按当前坐标动态重建 `ligand_atom ↔ protein_atom` 与 `ligand_atom ↔ protein_residue` 边。
+    *   采用 `radius + kNN fallback`，避免远距离场景下跨图交互断链。
+*   **📏 标度一致的亲和力学习 (Consistent Affinity Scaling)**:
+    *   模型输出保持在归一化空间，验证阶段仅做一次反归一化。
+    *   能量聚合采用边/原子归一化，降低“边越多能量越大”的偏置。
 
 ## 🛠️ 安装 (Installation)
 
@@ -105,13 +111,34 @@ uv run python scripts/organize_data.py \
 ### 推荐命令
 
 ```bash
-# 单卡训练 (启用课程学习)
+# 单卡训练（推荐）
 uv run python train.py \
     --data_root ./data/processed/pdbbind \
     --index_file ./data/processed/pdbbind/index.csv \
+    --epochs 180 \
     --batch_size 16 \
-    --warmup_epochs 20 \
+    --lr 2e-5 \
+    --clip_grad 2.0 \
+    --warmup_epochs 40 \
+    --rmsd_ratio 0.1 \
     --device cuda:0
+```
+
+如果显存不足（OOM），优先按 `16 -> 8 -> 4 -> 2` 递减 `--batch_size`。
+
+### 后台稳定运行（SSH 断开仍继续）
+
+```bash
+nohup /pavo/glen/Code/EHFNet/.venv/bin/python /pavo/glen/Code/EHFNet/train.py \
+    --epochs 180 --batch_size 16 --lr 2e-5 --clip_grad 2.0 \
+    --warmup_epochs 40 --rmsd_ratio 0.1 --device cuda:0 \
+    > /pavo/glen/Code/EHFNet/logs/nohup.log 2>&1 & echo $!
+```
+
+实时查看进度：
+
+```bash
+tail -f /pavo/glen/Code/EHFNet/logs/nohup.log
 ```
 
 ### 关键参数说明
@@ -126,7 +153,9 @@ uv run python train.py \
 | **训练超参** | | | |
 | `--epochs` | int | 100 | 总训练轮数 |
 | `--batch_size` | int | 8 | 批次大小 |
-| `--lr` | float | 1e-4 | 学习率 (配合 ReduceLROnPlateau) |
+| `--lr` | float | 1e-5 | 学习率 (配合 ReduceLROnPlateau) |
+| `--clip_grad` | float | 1.0 | 全局梯度裁剪阈值 |
+| `--rmsd_ratio` | float | 0.1 | 验证集中执行 RMSD 推演的 batch 比例 |
 | `--warmup_epochs` | int | 20 | **[重要]** 空间课程学习的预热轮数 |
 | **模型结构** | | | |
 | `--hidden_dim` | int | 128 | 隐藏层维度 |
@@ -144,6 +173,16 @@ uv run python train.py \
     *   **Success Rate (<5Å)**: 中等精度对接成功率。
 
 日志文件默认保存在 `logs/train/train_{timestamp}.log`。
+
+## 🔧 近期稳定性改进（2026）
+
+如果你是从旧版本迁移，以下行为是当前版本的默认最佳实践：
+
+1. **跨图边动态重建**：避免配体位姿变化后静态边失效。
+2. **亲和力标度统一**：训练和验证使用一致标度链路，避免 RMSE 异常放大。
+3. **能量聚合归一化**：降低样本边密度差异导致的能量偏置。
+4. **软饱和替代硬裁剪**：在稳住数值的同时保留困难样本梯度。
+5. **验证推演一致化**：默认使用更稳定的 ODE 推演配置进行指标评估。
 
 ## 🧹 数据清理
 
