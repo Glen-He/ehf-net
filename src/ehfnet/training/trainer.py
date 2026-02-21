@@ -55,6 +55,7 @@ def train(
     warmup_epochs: int = 20,
     rmsd_check_ratio: float = 0.1,
     accumulation_steps: int = 1,
+    ema_decay: float = 0.999,
 ):
     """
     训练 EHFNet 模型
@@ -81,7 +82,8 @@ def train(
         normalization_stats: 归一化统计数据
         warmup_epochs: 空间课程学习预热轮数
         rmsd_check_ratio: 验证集中计算 RMSD 的样本比例 (0.0 ~ 1.0)
-                          例如 0.1 表示随机抽取 10% 的 batch 进行耗时的 RMSD 推演        accumulation_steps: 梯度累积步数。当显存较小时，可设为 2/4 模拟更大 batch_size    """
+                          例如 0.1 表示随机抽取 10% 的 batch 进行耗时的 RMSD 推演        accumulation_steps: 梯度累积步数。当显存较小时，可设为 2/4 模拟更大 batch_size
+        ema_decay: EMA 衰减率，默认 0.999；小规模试跑可设为 0.99 加快吸收    """
 
     # 1. 准备环境
     if device == "auto":
@@ -198,8 +200,11 @@ def train(
     )
 
     # Warmup + 余弦退火（Step 级），防止初期梯度冲击 + 中后期平滑收敛
-    total_steps = epochs * len(train_loader)
-    warmup_steps = max(1, epochs // 10) * len(train_loader)  # 前 10% Epoch 线性升温
+    # [修复] 以 optimizer.step() 次数（而非 batch 数）定义里程碑，
+    # 确保 accumulation_steps > 1 时 warmup/cosine 阶段长度不被错误拉伸
+    updates_per_epoch = math.ceil(len(train_loader) / accumulation_steps)
+    total_steps = epochs * updates_per_epoch
+    warmup_steps = max(1, epochs // 10) * updates_per_epoch  # 前 10% Epoch 线性升温
     scheduler_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
     scheduler_cosine = CosineAnnealingLR(
         optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=1e-6
@@ -213,7 +218,7 @@ def train(
     # EMA 模型：惰性初始化——EHFNet 含 LazyModule，参数在首次前向后才完成初始化；
     # 若在此处立即构建 AveragedModel 会对未初始化参数调用 .detach() 而崩溃。
     # 解决方案：首次 optimizer.step() 后再构建，此时 lazy 参数已确定。
-    ema_decay = 0.999
+    # ema_decay 由外部传入，小规模试跑可设 0.99，正式训练用 0.999。
     ema_model: AveragedModel | None = None
 
     # 5. 训练循环
@@ -447,21 +452,32 @@ def compute_validation_loss(
                 valid_batches += 1
                 
             # [新增] 收集亲和力预测 (用于计算 RMSE)
-            # 只有当 Loss 有效时，才收集预测值，避免 NaN 污染统计数据
+            # 只有当 Loss 有效时，且 t > 0.5 时，才收集预测值，避免无监督的噪声污染统计数据
             if not torch.isnan(loss) and not torch.isinf(loss) and loss.item() < 1e6:
-                pred_aff = predictions.get("binding_affinity", None)
-                if pred_aff is not None:
-                    # 双重检查：预测值本身也不能含 NaN
-                    if not torch.isnan(pred_aff).any():
-                        affinity_preds.append(pred_aff.cpu())
-                        # target 统一为 raw（若已提供 raw 则直接用，否则做一次反归一化）
-                        if hasattr(batch, "y_energy_raw"):
-                            affinity_targets.append(batch.y_energy_raw.cpu())
-                        else:
-                            y_norm = batch.get("y_energy", None)
-                            if y_norm is not None and dataset is not None:
-                                affinity_targets.append(dataset.denormalize_affinity(y_norm.cpu()))
-
+                # 遵循 losses.py 中的物理约束，仅在 t > 0.5 时监督能量
+                if t is not None:
+                    valid_mask = t > 0.5
+                else:
+                    valid_mask = torch.ones_like(batch.get("y_energy", torch.zeros(1)), dtype=torch.bool)
+                
+                if valid_mask.any():
+                    pred_aff = predictions.get("binding_affinity", None)
+                    if pred_aff is not None:
+                        # 仅选取 t > 0.5 的预测值
+                        pred_aff_valid = pred_aff[valid_mask]
+                        # 双重检查：预测值本身也不能含 NaN
+                        if not torch.isnan(pred_aff_valid).any():
+                            affinity_preds.append(pred_aff_valid.cpu())
+                            # target 统一为 raw（若已提供 raw 则直接用，否则做一次反归一化）
+                            if hasattr(batch, "y_energy_raw"):
+                                target_raw_valid = batch.y_energy_raw[valid_mask]
+                                affinity_targets.append(target_raw_valid.cpu())
+                            else:
+                                y_norm = batch.get("y_energy", None)
+                                if y_norm is not None and dataset is not None:
+                                    target_raw_valid = dataset.denormalize_affinity(y_norm[valid_mask].cpu())
+                                    affinity_targets.append(target_raw_valid)
+            
             # 2. 全量 RMSD 推演
             # -----------------------------------------------------------
             if i < max_rmsd_batches:

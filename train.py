@@ -31,6 +31,7 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 def main():
+    torch.autograd.set_detect_anomaly(True)
     parser = argparse.ArgumentParser(description="Train EHFNet for molecular docking prediction")
     
     # 数据相关参数
@@ -64,6 +65,7 @@ def main():
     parser.add_argument("--warmup_epochs", type=int, default=20, help="Number of warmup epochs for spatial curriculum learning (default: 20)")
     parser.add_argument("--rmsd_ratio", type=float, default=0.1, help="Ratio of validation set to compute RMSD (0.0-1.0)")
     parser.add_argument("--accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--ema_decay", type=float, default=0.999, help="EMA decay rate (default: 0.999; use 0.99 for quick smoke tests)")
 
     args = parser.parse_args()
     
@@ -145,6 +147,7 @@ def main():
             warmup_epochs=args.warmup_epochs,
             rmsd_check_ratio=args.rmsd_ratio,
             accumulation_steps=args.accumulation_steps,
+            ema_decay=args.ema_decay,
         )
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)

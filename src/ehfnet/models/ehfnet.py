@@ -9,6 +9,7 @@ import torch
 from typing import TypedDict
 from torch import nn, Tensor
 from torch_geometric.data import HeteroData
+from torch_scatter import scatter_mean
 
 from ehfnet.models.layers.encoder import EHFEncoder
 from ehfnet.models.heads.prediction import PredictionHead
@@ -100,20 +101,7 @@ class EHFNet(nn.Module):
             affinity_stats=normalization_stats.get("affinity") if normalization_stats else None,
         )
 
-        # SE(3) 切空间直接读出头（基于分子级特征 [B, H]）
-        # 平移 readout：R^3 平移速度
-        self.trans_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 3),
-        )
 
-        # 旋转 readout：轴角 × 幅度 (so(3) 元素)
-        self.rot_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 3),
-        )
 
         # 扭转 readout：每个扭转键的标量角速度
         # 输入: [T, H*2] (键轴两端原子特征拼接)
@@ -138,17 +126,29 @@ class EHFNet(nn.Module):
 
         # 1. 编码器
         ctx = self.encoder(data, t)
-        x_dict = ctx["x_dict"]
+        x_dict  = ctx["x_dict"]
         pos_dict = ctx["pos_dict"]
+        vel_dict = ctx["vel_dict"]           # pos_final - pos_init，等变向量
+        initial_lig_pos = ctx["initial_ligand_pos"]
 
-        lig_atom_feat  = x_dict["ligand_atom"]       # [N_lig, H]
-        lig_mol_feat   = x_dict["ligand_molecule"]   # [B, H]
+        lig_atom_feat = x_dict["ligand_atom"]     # [N_lig, H]
+        lig_mol_feat  = x_dict["ligand_molecule"] # [B, H]
+        lig_batch     = data["ligand_atom"].batch  # [N_lig]
+        lig_vel       = vel_dict["ligand_atom"]    # [N_lig, 3] — 等变位移向量
 
-        # 2. SE(3) 平移 / 旋转 直接读出
-        v_translation = self.trans_head(lig_mol_feat)   # [B, 3]
-        v_rotation    = self.rot_head(lig_mol_feat)     # [B, 3]
+        # 2. 等变宏观运动读出
+        B = lig_mol_feat.shape[0]
 
-        # 3. 扮转角速度：基于键轴原子特征 (a1, a2)
+        # 平移：各原子位移方向的质心均值
+        v_translation = scatter_mean(lig_vel, lig_batch, dim=0, dim_size=B)  # [B, 3]
+
+        # 旋转：原子位移方向产生的角动量均值 L = r × v_trans
+        com_init  = scatter_mean(initial_lig_pos, lig_batch, dim=0, dim_size=B)  # [B, 3]
+        r         = initial_lig_pos - com_init[lig_batch]                        # [N, 3]
+        L         = torch.linalg.cross(r, lig_vel)                               # [N, 3]
+        v_rotation = scatter_mean(L, lig_batch, dim=0, dim_size=B)               # [B, 3]
+
+        # 3. 扭转角速度（角度是旋转不变量，MLP 读出合法）
         device = lig_atom_feat.device
         torsion_indices = getattr(
             data,
@@ -164,13 +164,13 @@ class EHFNet(nn.Module):
         else:
             v_torsion = torch.zeros(0, device=device, dtype=lig_mol_feat.dtype)
 
-        # 4. PredictionHead: 结合亲和力 + 原子力场
+        # 4. PredictionHead：使用初始坐标规避 EGNN 坐标漂移
         predictions = self.prediction_head(
             lig_atom_feat=lig_atom_feat,
-            lig_atom_pos=pos_dict["ligand_atom"],
-            lig_batch=data["ligand_atom"].batch,
+            lig_atom_pos=initial_lig_pos,              # 使用编码前的初始坐标
+            lig_batch=lig_batch,
             pro_atom_feat=x_dict["protein_atom"],
-            pro_atom_pos=pos_dict["protein_atom"],
+            pro_atom_pos=data["protein_atom"].pos,     # 始终使用原始蛋白坐标
             pro_atom_batch=data["protein_atom"].batch,
             lig_mol_feat=lig_mol_feat,
         )

@@ -6,15 +6,29 @@ EHFNet 编码器
 
 import logging
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from typing import Any, cast
-from torch import nn, Tensor
+from torch import Tensor
 from torch.nn import ModuleList
-from torch_cluster import radius
 from torch_geometric.data import HeteroData
+from torch_geometric.nn import radius
 from torch_geometric import nn as pyg_nn
 from torch_geometric.nn.conv import MessagePassing
 from egnn_pytorch import EGNN_Sparse
+from egnn_pytorch.egnn_pytorch import CoorsNorm
+
+# [修复] Monkey Patch egnn_pytorch.CoorsNorm
+# PyTorch 的 tensor.norm(dim=-1) 在输入为严格 0 时会产生 NaN 梯度。
+# 在分子对接随机初始化或完全重合场景下，这是 grad_norm=nan 的直接原因。
+original_coors_norm_forward = CoorsNorm.forward
+def safe_coors_norm_forward(self, coors):
+    # 在 sum 之后立即加 eps 再开根号，彻底杜绝开根号 0 的梯度问题
+    norm = torch.sqrt((coors ** 2).sum(dim=-1, keepdim=True) + self.eps)
+    normed_coors = coors / norm
+    return normed_coors * self.scale
+CoorsNorm.forward = safe_coors_norm_forward
 
 from ehfnet.graph.hetero_schema import (
     NODE_TYPES,
@@ -204,7 +218,7 @@ class EHFEncoder(nn.Module):
                 in_channels=-1, out_channels=hidden_dim, aggr=aggr
             )
 
-        return pyg_nn.HeteroConv(conv_layers, aggr="sum")
+        return pyg_nn.HeteroConv(conv_layers, aggr="mean")
 
 
     @staticmethod
@@ -227,8 +241,10 @@ class EHFEncoder(nn.Module):
             feats_dim=hidden_dim,
             pos_dim=3,
             m_dim=m_dim_scalar,
-            aggr="add",
-            update_coors=True,
+            aggr="mean",
+            update_coors=True,    # [修复] 启用坐标更新：EGNN 的位置增量即等变速度信号，
+                                  # encoder 通过 vel_dict = pos_final - pos_init 返回给 EHFNet。
+                                  # PredictionHead 使用 initial_lig_pos 规避坐标漂移问题。
             update_feats=True,
             dropout=dropout_rate,
             norm_feats=True,

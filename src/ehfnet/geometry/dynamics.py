@@ -155,12 +155,12 @@ class VelocityDecomposer:
             if n_atoms_b >= 2:
                 r = r_rel[idx_rows]
                 cross_mat = torch.zeros((n_atoms_b, 3, 3), device=device, dtype=dtype)
-                cross_mat[:, 0, 1] = -r[:, 2]
-                cross_mat[:, 0, 2] = r[:, 1]
-                cross_mat[:, 1, 0] = r[:, 2]
-                cross_mat[:, 1, 2] = -r[:, 0]
-                cross_mat[:, 2, 0] = -r[:, 1]
-                cross_mat[:, 2, 1] = r[:, 0]
+                cross_mat[:, 0, 1] = r[:, 2]
+                cross_mat[:, 0, 2] = -r[:, 1]
+                cross_mat[:, 1, 0] = -r[:, 2]
+                cross_mat[:, 1, 2] = r[:, 0]
+                cross_mat[:, 2, 0] = r[:, 1]
+                cross_mat[:, 2, 1] = -r[:, 0]
 
                 row_indices = (
                     idx_rows.unsqueeze(1) * 3 + torch.arange(3, device=device).unsqueeze(0)
@@ -243,17 +243,11 @@ class VelocityDecomposer:
             else torch.zeros(0, device=device, dtype=dtype)
         )
         
-        # 对分解后的速度分量做软饱和（避免硬截断造成梯度与目标信号塌缩）
-        trans_limit = 60.0
-        rot_limit = 25.0
-        torsion_limit = 30.0
-
-        v_trans = trans_limit * torch.tanh(v_trans / trans_limit)
-        v_rot = rot_limit * torch.tanh(v_rot / rot_limit)
-
-        if v_torsion.numel() > 0:
-            v_torsion = torsion_limit * torch.tanh(v_torsion / torsion_limit)
-
+        # [修复] 移除 tanh 软饱和截断：
+        # tanh 会将平移速度限制在 ±60 Å/unit-t，配体若初始偏移 > 60 Å
+        # 则 ODE 积分无论如何也无法到达目标口袋（宇宙限速问题）。
+        # losses.py 已使用 Huber Loss，本身对大数值线性衰减，无需在数据
+        # 源头做有损压缩；极端速度的梯度爆炸由 grad_clip 在 trainer 侧兜底。
         return v_trans, v_rot, v_torsion
 
 
@@ -440,13 +434,15 @@ class PathInterpolator:
     计算两个构象之间的物理合理插值路径（Kabsch对齐 + 扭转角插值）。
     """
 
-    def __init__(self, eps: float = PhysicsConstants.EPSILON):
+    def __init__(self, eps: float = PhysicsConstants.EPSILON, fd_dt: float = 0.05):
         """
         Args:
-            eps: 数值稳定性保护参数
+            eps:   数值稳定性保护参数
+            fd_dt: 速度有限差分步长，v = Δpos / fd_dt（默认 0.05 Å/unit-t）
         """
 
         self.eps = eps
+        self.fd_dt = fd_dt
 
 
     def compute_path_parameters(
@@ -602,17 +598,20 @@ class PathInterpolator:
             vel_t: t 时刻的速度 [N, 3]
         """
 
-        # [修复] 增大 dt 从 1e-3 到 5e-2，减少数值放大
-        # dt 越大，计算出的速度越小：v = Δpos / dt
-        # 5e-2 的步长对于分子动力学插值是合理的
-        dt = 5e-2
         t_float = t.view(-1, 1)
         pos_t = self._compute_pose_at_t(params, t_float)
 
-        t_next = torch.clamp(t_float + dt, max=1.0)
+        t_next = torch.clamp(t_float + self.fd_dt, max=1.0)
         pos_next = self._compute_pose_at_t(params, t_next)
 
-        return pos_t, (pos_next - pos_t) / dt
+        # 用实际步长而非固定 fd_dt 做归一化：
+        # 当 t 接近 1.0 时 clamp 会压缩实际步长，若仍除以 fd_dt 会
+        # 系统性低估目标速度，导致模型在 t→1 阶段学到"刹车"行为。
+        # actual_dt 形状 [B, 1]，需按原子 batch 索引展开为 [N, 1]
+        # 才能与 pos 差值 [N, 3] 正确广播。
+        actual_dt = (t_next - t_float).clamp(min=self.eps)       # [B, 1]
+        actual_dt_per_atom = actual_dt[params["batch"]]           # [N, 1]
+        return pos_t, (pos_next - pos_t) / actual_dt_per_atom
 
 
     def _compute_pose_at_t(self, params: dict[str, Any], t: Tensor) -> Tensor:
@@ -634,7 +633,11 @@ class PathInterpolator:
 
         if params["delta_torsions"].numel() > 0:
             torsion_batch_idx = batch[params["torsion_indices"][:, 1]]
-            current_angles = params["delta_torsions"] * t[torsion_batch_idx].squeeze()
+            # [修复] 用 squeeze(-1) 代替 squeeze()：
+            # t 为 [B, 1]，索引后得 [T, 1]，squeeze(-1) 安全压为 [T]；
+            # 原 squeeze() 在 T=1 时会产生 0-d 标量，而直接删除则会使
+            # [T, 1] * [T] 广播成 [T, T]，导致后续 if 判断报歧义错误。
+            current_angles = params["delta_torsions"] * t[torsion_batch_idx].squeeze(-1)
 
             for i in range(current_angles.shape[0]):
                 ang = current_angles[i]

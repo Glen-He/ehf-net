@@ -25,11 +25,12 @@ class ConditionalFlowMatcher:
     """
 
     def __init__(
-        self, 
+        self,
         sigma_min: float = 1e-4,
         spatial_sigma_min: float = 1.0,
         spatial_sigma_max: float = 6.0,
-        warmup_epochs: int = 20
+        warmup_epochs: int = 20,
+        fd_dt: float = 0.05,
     ) -> None:
         """
         Args:
@@ -37,16 +38,18 @@ class ConditionalFlowMatcher:
             spatial_sigma_min: 空间课程学习起始尺度 (Å)
             spatial_sigma_max: 空间课程学习结束尺度 (Å)
             warmup_epochs: 空间课程学习预热轮数
+            fd_dt: 速度有限差分步长，透传至 PathInterpolator（v = Δpos / fd_dt）
         """
 
         self.sigma_min = sigma_min
-        
+        self.fd_dt = fd_dt
+
         # 课程学习参数
         self.spatial_sigma_min = spatial_sigma_min
         self.spatial_sigma_max = spatial_sigma_max
         self.warmup_epochs = warmup_epochs
-        
-        self.interpolator = PathInterpolator(eps=PhysicsConstants.EPSILON)
+
+        self.interpolator = PathInterpolator(eps=PhysicsConstants.EPSILON, fd_dt=fd_dt)
         self.updater = PoseUpdater(eps=PhysicsConstants.EPSILON)
         # [新增] 在流匹配器中直接持有分解器，训练时生成纯净的 SE(3) x T^m 目标
         self.decomposer = VelocityDecomposer(eps=PhysicsConstants.EPSILON)
@@ -208,129 +211,129 @@ class ConditionalFlowMatcher:
         dt = (1.0 - inference_t_start) / steps
         B = int(batch.max().item()) + 1
 
-        for i in range(steps):
-            t_val = inference_t_start + i * dt
+        with torch.inference_mode():
+            for i in range(steps):
+                t_val = inference_t_start + i * dt
 
-            if method == "euler":
-                v_trans, v_rot, v_torsion = self._predict_velocity(
-                    model=model,
-                    data=data,
-                    pos=current_pos,
-                    t_val=t_val,
-                    B=B,
-                    device=device,
-                    dtype=dtype,
-                )
+                if method == "euler":
+                    v_trans, v_rot, v_torsion = self._predict_velocity(
+                        model=model,
+                        data=data,
+                        pos=current_pos,
+                        t_val=t_val,
+                        B=B,
+                        device=device,
+                        dtype=dtype,
+                    )
 
-                current_pos = self.updater.update(
-                    pos=current_pos,
-                    masses=masses,
-                    batch=batch,
-                    v_trans=v_trans,
-                    v_rot=v_rot,
-                    v_torsion=v_torsion,
-                    torsion_indices=torsion_indices,
-                    torsion_moving_mask=torsion_moving_mask,
-                    dt=dt,
-                )
+                    current_pos = self.updater.update(
+                        pos=current_pos,
+                        masses=masses,
+                        batch=batch,
+                        v_trans=v_trans,
+                        v_rot=v_rot,
+                        v_torsion=v_torsion,
+                        torsion_indices=torsion_indices,
+                        torsion_moving_mask=torsion_moving_mask,
+                        dt=dt,
+                    )
 
-            elif method == "rk4":
-                # RK4 积分器
-                v1_trans, v1_rot, v1_tor = self._predict_velocity(
-                    model=model,
-                    data=data,
-                    pos=current_pos,
-                    t_val=t_val,
-                    B=B,
-                    device=device,
-                    dtype=dtype,
-                )
-                k1_pos = self.updater.update(
-                    pos=current_pos,
-                    masses=masses,
-                    batch=batch,
-                    v_trans=v1_trans,
-                    v_rot=v1_rot,
-                    v_torsion=v1_tor,
-                    torsion_indices=torsion_indices,
-                    torsion_moving_mask=torsion_moving_mask,
-                    dt=dt / 2.0,
-                )
+                elif method == "rk4":
+                    # RK4 积分器
+                    v1_trans, v1_rot, v1_tor = self._predict_velocity(
+                        model=model,
+                        data=data,
+                        pos=current_pos,
+                        t_val=t_val,
+                        B=B,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    k1_pos = self.updater.update(
+                        pos=current_pos,
+                        masses=masses,
+                        batch=batch,
+                        v_trans=v1_trans,
+                        v_rot=v1_rot,
+                        v_torsion=v1_tor,
+                        torsion_indices=torsion_indices,
+                        torsion_moving_mask=torsion_moving_mask,
+                        dt=dt / 2.0,
+                    )
 
-                v2_trans, v2_rot, v2_tor = self._predict_velocity(
-                    model=model,
-                    data=data,
-                    pos=k1_pos,
-                    t_val=t_val + dt / 2.0,
-                    B=B,
-                    device=device,
-                    dtype=dtype,
-                )
-                k2_pos = self.updater.update(
-                    pos=current_pos,
-                    masses=masses,
-                    batch=batch,
-                    v_trans=v2_trans,
-                    v_rot=v2_rot,
-                    v_torsion=v2_tor,
-                    torsion_indices=torsion_indices,
-                    torsion_moving_mask=torsion_moving_mask,
-                    dt=dt / 2.0,
-                )
+                    v2_trans, v2_rot, v2_tor = self._predict_velocity(
+                        model=model,
+                        data=data,
+                        pos=k1_pos,
+                        t_val=t_val + dt / 2.0,
+                        B=B,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    k2_pos = self.updater.update(
+                        pos=current_pos,
+                        masses=masses,
+                        batch=batch,
+                        v_trans=v2_trans,
+                        v_rot=v2_rot,
+                        v_torsion=v2_tor,
+                        torsion_indices=torsion_indices,
+                        torsion_moving_mask=torsion_moving_mask,
+                        dt=dt / 2.0,
+                    )
 
-                v3_trans, v3_rot, v3_tor = self._predict_velocity(
-                    model=model,
-                    data=data,
-                    pos=k2_pos,
-                    t_val=t_val + dt / 2.0,
-                    B=B,
-                    device=device,
-                    dtype=dtype,
-                )
-                k3_pos = self.updater.update(
-                    pos=current_pos,
-                    masses=masses,
-                    batch=batch,
-                    v_trans=v3_trans,
-                    v_rot=v3_rot,
-                    v_torsion=v3_tor,
-                    torsion_indices=torsion_indices,
-                    torsion_moving_mask=torsion_moving_mask,
-                    dt=dt,
-                )
+                    v3_trans, v3_rot, v3_tor = self._predict_velocity(
+                        model=model,
+                        data=data,
+                        pos=k2_pos,
+                        t_val=t_val + dt / 2.0,
+                        B=B,
+                        device=device,
+                        dtype=dtype,
+                    )
+                    k3_pos = self.updater.update(
+                        pos=current_pos,
+                        masses=masses,
+                        batch=batch,
+                        v_trans=v3_trans,
+                        v_rot=v3_rot,
+                        v_torsion=v3_tor,
+                        torsion_indices=torsion_indices,
+                        torsion_moving_mask=torsion_moving_mask,
+                        dt=dt,
+                    )
 
-                v4_trans, v4_rot, v4_tor = self._predict_velocity(
-                    model=model,
-                    data=data,
-                    pos=k3_pos,
-                    t_val=t_val + dt,
-                    B=B,
-                    device=device,
-                    dtype=dtype,
-                )
+                    v4_trans, v4_rot, v4_tor = self._predict_velocity(
+                        model=model,
+                        data=data,
+                        pos=k3_pos,
+                        t_val=t_val + dt,
+                        B=B,
+                        device=device,
+                        dtype=dtype,
+                    )
 
-                v_trans_avg = (v1_trans + 2 * v2_trans + 2 * v3_trans + v4_trans) / 6.0
-                v_rot_avg = (v1_rot + 2 * v2_rot + 2 * v3_rot + v4_rot) / 6.0
+                    v_trans_avg = (v1_trans + 2 * v2_trans + 2 * v3_trans + v4_trans) / 6.0
+                    v_rot_avg = (v1_rot + 2 * v2_rot + 2 * v3_rot + v4_rot) / 6.0
 
-                if v1_tor is not None:
-                    v_tor_avg = (v1_tor + 2 * v2_tor + 2 * v3_tor + v4_tor) / 6.0
-                    
-                else:
-                    v_tor_avg = None
+                    if v1_tor is not None:
+                        v_tor_avg = (v1_tor + 2 * v2_tor + 2 * v3_tor + v4_tor) / 6.0
+                    else:
+                        v_tor_avg = None
 
-                current_pos = self.updater.update(
-                    pos=current_pos,
-                    masses=masses,
-                    batch=batch,
-                    v_trans=v_trans_avg,
-                    v_rot=v_rot_avg,
-                    v_torsion=v_tor_avg,
-                    torsion_indices=torsion_indices,
-                    torsion_moving_mask=torsion_moving_mask,
-                    dt=dt,
-                )
+                    current_pos = self.updater.update(
+                        pos=current_pos,
+                        masses=masses,
+                        batch=batch,
+                        v_trans=v_trans_avg,
+                        v_rot=v_rot_avg,
+                        v_torsion=v_tor_avg,
+                        torsion_indices=torsion_indices,
+                        torsion_moving_mask=torsion_moving_mask,
+                        dt=dt,
+                    )
 
-            trajectory.append(current_pos.clone())
+                trajectory.append(current_pos.clone())
 
         return current_pos, trajectory
 

@@ -372,7 +372,11 @@ class PredictionHead(nn.Module):
         # 2. 计算几何特征（升为 FP32 确保 AMP 下数值稳定）
         lig_pos_sel = lig_atom_pos[i_idx].float()
         pro_pos_sel = pro_atom_pos[j_idx].float()
-        dist = torch.norm(lig_pos_sel - pro_pos_sel, dim=-1, p=2)
+        # [修复] 用手动 sqrt(sum²+ε) 代替 torch.norm：
+        # torch.norm 在距离=0 处梯度为 x/‖x‖，分母为零 → grad_norm=nan；
+        # 加上 1e-8 偏移量使导数始终有界，彻底消除 nan 梯度。
+        sq_dist = torch.sum((lig_pos_sel - pro_pos_sel) ** 2, dim=-1)
+        dist = torch.sqrt(sq_dist + 1e-8)
         # 软位阻排斥惩罚 (Soft Steric Clash)
         # 阈值 2.0 Å ≈ 两个碳原子范德华半径之和的保守估计
         # ReLU 保证只有小于阈值的距离才产生惩罚；平方保证梯度平滑无跳跃
