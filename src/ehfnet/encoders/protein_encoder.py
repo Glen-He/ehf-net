@@ -276,7 +276,12 @@ class ProteinEncoder:
             valid_residues = protein_atoms[mask].residues
             
             if len(valid_residues) == 0:
-                logger.warning(f"No residues found within {pocket_radius}A of ligand. Falling back to full protein.")
+                # [修复] 永远不要偷偷回退到全量蛋白质 (会导致下游 OOM 怪兽)，而是直接硬报错让 dataset 清理器它捕捉并丢弃
+                raise ValueError(
+                    f"No valid residues found within {pocket_radius}A of the ligand! "
+                    "This complex's structural coordinates are likely severely corrupted (massive drift). "
+                    "Refusing to fall back to the full protein."
+                )
             else:
                 protein_atoms = valid_residues.atoms
                 logger.info(f"Extracted pocket with {len(valid_residues)} residues within {pocket_radius}A.")

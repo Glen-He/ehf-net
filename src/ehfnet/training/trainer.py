@@ -240,6 +240,19 @@ def train(
         for batch_idx, batch in enumerate(pbar):
             batch = batch.to(device)
 
+            # [新增防爆显存保护] 如果蛋白图依然因为某些意外没截断好，包含极大的原子树，
+            # 这里硬拦截一次，避免它进入下方极其吃显存的 O(N) GNN 运算。
+            # (由于 DataLoader 设置了 shuffle=True，每轮的 batch 组合都不同，
+            # 两个各自含有五六千原子的图可能恰好在第 5 轮被配对到了同一个 batch 中引发 OOM)
+            num_protein_atoms = batch["protein_atom"].pos.shape[0]
+            if num_protein_atoms > 10000:
+                logger.warning(
+                    f"Batch {batch_idx}: Found {num_protein_atoms} protein atoms (> 600k edges). "
+                    f"Skipping to prevent dense MessagePassing CUDA OOM!"
+                )
+                optimizer.zero_grad() # 连带清空这一个坏 batch 不小心累挂的图
+                continue
+
             # 梯度累积：仅在累积周期开头清零梯度
             if batch_idx % accumulation_steps == 0:
                 optimizer.zero_grad()

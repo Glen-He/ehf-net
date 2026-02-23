@@ -14,15 +14,14 @@ from torch import Tensor
 from torch.nn import ModuleList
 from torch_geometric.data import HeteroData
 from torch_geometric.nn import radius
-from torch_geometric import nn as pyg_nn
-from torch_geometric.nn.conv import MessagePassing
+from torch_scatter import scatter_mean
 from egnn_pytorch import EGNN_Sparse
+from ehfnet.models.layers.frame_conv import FrameAwareConv, FrameAwareHeteroConv
 from egnn_pytorch.egnn_pytorch import CoorsNorm
 
 # [修复] Monkey Patch egnn_pytorch.CoorsNorm
 # PyTorch 的 tensor.norm(dim=-1) 在输入为严格 0 时会产生 NaN 梯度。
 # 在分子对接随机初始化或完全重合场景下，这是 grad_norm=nan 的直接原因。
-original_coors_norm_forward = CoorsNorm.forward
 def safe_coors_norm_forward(self, coors):
     # 在 sum 之后立即加 eps 再开根号，彻底杜绝开根号 0 的梯度问题
     norm = torch.sqrt((coors ** 2).sum(dim=-1, keepdim=True) + self.eps)
@@ -74,6 +73,7 @@ class EHFEncoder(nn.Module):
         pro_res_cont_count: int,
         *,
         m_dim_scalar: int = 16,
+        num_rbf: int = 32,
         dropout_rate: float = 0.0,
         fix_protein: bool = True,
         stats: dict | None = None,
@@ -92,6 +92,7 @@ class EHFEncoder(nn.Module):
             pro_atom_cont_count: 蛋白原子连续特征数量
             pro_res_cont_count: 蛋白残基连续特征数量
             m_dim_scalar: EGNN 消息维度
+            num_rbf: 帧感知卷的高斯 RBF 基函数数量
             dropout_rate: Dropout 比例
             fix_protein: 是否冻结蛋白坐标
             stats: 统计数据字典 (用于输入归一化)
@@ -102,7 +103,8 @@ class EHFEncoder(nn.Module):
         """
         super().__init__()
 
-        self.hidden_dim = hidden_dim
+        self.hidden_dim  = hidden_dim
+        self.num_rbf     = num_rbf
         self.fix_protein = fix_protein
         self.dynamic_inter_cutoff = float(dynamic_inter_cutoff)
         self.dynamic_inter_knn_k = max(1, int(dynamic_inter_knn_k))
@@ -159,15 +161,15 @@ class EHFEncoder(nn.Module):
                 )
 
             if self.intra_feat_edges:
-                block["1_intra_gnn"] = self._build_gnn_block(
-                    self.intra_feat_edges, hidden_dim, aggr="add"
+                block["1_intra_gnn"] = self._build_frame_conv_block(
+                    self.intra_feat_edges, hidden_dim, num_rbf
                 )
                 block["1_intra_update"] = self._build_update_mlp(hidden_dim, dropout_rate)
 
             # 阶段 2：自下而上聚合
             if self.agg_edges:
-                block["2_agg_gnn"] = self._build_gnn_block(
-                    self.agg_edges, hidden_dim, aggr="mean"
+                block["2_agg_gnn"] = self._build_frame_conv_block(
+                    self.agg_edges, hidden_dim, num_rbf
                 )
                 block["2_agg_update"] = self._build_update_mlp(hidden_dim, dropout_rate)
 
@@ -178,15 +180,15 @@ class EHFEncoder(nn.Module):
                 )
 
             if self.inter_feat_edges:
-                block["3_inter_gnn"] = self._build_gnn_block(
-                    self.inter_feat_edges, hidden_dim, aggr="add"
+                block["3_inter_gnn"] = self._build_frame_conv_block(
+                    self.inter_feat_edges, hidden_dim, num_rbf
                 )
                 block["3_inter_update"] = self._build_update_mlp(hidden_dim, dropout_rate)
 
             # 阶段 4：自上而下广播
             if self.bcast_edges:
-                block["4_bcast_gnn"] = self._build_gnn_block(
-                    self.bcast_edges, hidden_dim, aggr="add"
+                block["4_bcast_gnn"] = self._build_frame_conv_block(
+                    self.bcast_edges, hidden_dim, num_rbf
                 )
                 block["4_bcast_update"] = self._build_update_mlp(hidden_dim, dropout_rate)
 
@@ -197,28 +199,27 @@ class EHFEncoder(nn.Module):
 
 
     @staticmethod
-    def _build_gnn_block(
-        edges: list[tuple[str, str, str]], hidden_dim: int, aggr: str = "add"
-    ) -> pyg_nn.HeteroConv:
+    def _build_frame_conv_block(
+        edges: list[tuple[str, str, str]], hidden_dim: int, num_rbf: int
+    ) -> FrameAwareHeteroConv:
         """
-        构建异构图 GNN 模块
+        构建帧感知异构图消息传递模块（取代 SAGEConv / HeteroConv）。
+
+        每种边类型分配独立的 FrameAwareConv，共享 hidden_dim 和 num_rbf。
 
         Args:
-            edges: 边类型列表 [(src, rel, dst), ...]
-            hidden_dim: 隐藏层维度
-            aggr: 聚合方式（"add" 或 "mean"）
+            edges:      边类型列表 [(src, rel, dst), ...]
+            hidden_dim: 所有节点的特征维度 H
+            num_rbf:    高斯 RBF 基函数数量
 
         Returns:
-            异构图卷积模块
+            FrameAwareHeteroConv 实例
         """
-        conv_layers: dict[tuple[str, str, str], MessagePassing] = {}
-
-        for src, rel, dst in edges:
-            conv_layers[(src, rel, dst)] = pyg_nn.SAGEConv(
-                in_channels=-1, out_channels=hidden_dim, aggr=aggr
-            )
-
-        return pyg_nn.HeteroConv(conv_layers, aggr="mean")
+        convs: dict[tuple[str, str, str], FrameAwareConv] = {
+            edge_key: FrameAwareConv(hidden_dim, num_rbf)
+            for edge_key in edges
+        }
+        return FrameAwareHeteroConv(convs)
 
 
     @staticmethod
@@ -242,9 +243,9 @@ class EHFEncoder(nn.Module):
             pos_dim=3,
             m_dim=m_dim_scalar,
             aggr="mean",
-            update_coors=True,    # [修复] 启用坐标更新：EGNN 的位置增量即等变速度信号，
+            update_coors=True,    # 全部 block 启用坐标更新：每层 EGNN 输出的坐标增量
+                                  # 通过多步迭代积累等变位移信号；
                                   # encoder 通过 vel_dict = pos_final - pos_init 返回给 EHFNet。
-                                  # PredictionHead 使用 initial_lig_pos 规避坐标漂移问题。
             update_feats=True,
             dropout=dropout_rate,
             norm_feats=True,
@@ -457,9 +458,18 @@ class EHFEncoder(nn.Module):
         x_dict: dict[str, Tensor],
         pos_dict: dict[str, Tensor],
         edge_dict: dict[tuple[str, str, str], Tensor],
+        full_pos_dict: dict[str, Tensor],
     ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
         """
-        运行单个 GNN 块
+        运行单个 GNN 块。
+
+        Args:
+            block:         当前 GNN 块的 ModuleDict
+            x_dict:        节点特征字典
+            pos_dict:      原子层节点坐标字典（EGNN 可更新）
+            edge_dict:     边索密字典
+            full_pos_dict: 包含所有 5 种节点类型坐标的字典
+                           （为 FrameAwareHeteroConv 提供几何参考）
         """
         typed_block = cast(nn.ModuleDict, block)
 
@@ -474,14 +484,14 @@ class EHFEncoder(nn.Module):
             )
 
         if "1_intra_gnn" in typed_block:
-            out = typed_block["1_intra_gnn"](x_dict, edge_dict)
+            out = typed_block["1_intra_gnn"](x_dict, full_pos_dict, edge_dict)
             x_dict = self._apply_residual_update(
                 x_dict, out, cast(nn.ModuleDict, typed_block["1_intra_update"])
             )
 
         # 阶段 2: 自下而上聚合
         if "2_agg_gnn" in typed_block:
-            out = typed_block["2_agg_gnn"](x_dict, edge_dict)
+            out = typed_block["2_agg_gnn"](x_dict, full_pos_dict, edge_dict)
             x_dict = self._apply_residual_update(
                 x_dict, out, cast(nn.ModuleDict, typed_block["2_agg_update"])
             )
@@ -497,14 +507,14 @@ class EHFEncoder(nn.Module):
             )
 
         if "3_inter_gnn" in typed_block:
-            out = typed_block["3_inter_gnn"](x_dict, edge_dict)
+            out = typed_block["3_inter_gnn"](x_dict, full_pos_dict, edge_dict)
             x_dict = self._apply_residual_update(
                 x_dict, out, cast(nn.ModuleDict, typed_block["3_inter_update"])
             )
 
         # 阶段 4: 自上而下广播
         if "4_bcast_gnn" in typed_block:
-            out = typed_block["4_bcast_gnn"](x_dict, edge_dict)
+            out = typed_block["4_bcast_gnn"](x_dict, full_pos_dict, edge_dict)
             x_dict = self._apply_residual_update(
                 x_dict, out, cast(nn.ModuleDict, typed_block["4_bcast_update"])
             )
@@ -782,7 +792,35 @@ class EHFEncoder(nn.Module):
         }
 
         # 运行 GNN 块
+        device    = t.device
+        lig_batch = data["ligand_atom"].batch
+        B         = int(lig_batch.max().item()) + 1
+
+        # 蓋白质和口袋的固定坐标（蛋白不动，仅计算一次）
+        pro_res_pos   = data["protein_residue"].pos                      # [N_res, 3] Cα 坐标
+        pro_res_batch = self._get_node_batch(
+            data, "protein_residue", pro_res_pos.shape[0], device
+        )
+        # 口袋几何中心：每个 batch 内所有残基坐标的均值
+        pro_pocket_pos = scatter_mean(
+            pro_res_pos.detach(), pro_res_batch, dim=0, dim_size=B
+        )                                                                # [B, 3]
+
         for block in self.gnn_blocks:
+            # 配体分子质心每个 block 重算（配体坐标随 EGNN 更新而移动）
+            pos_mol = scatter_mean(
+                pos_dict["ligand_atom"].detach(), lig_batch, dim=0, dim_size=B
+            )                                                            # [B, 3]
+
+            # full_pos_dict 为 FrameAwareHeteroConv 提供所有节点类型的坐标
+            full_pos_dict: dict[str, Tensor] = {
+                "ligand_atom":     pos_dict["ligand_atom"],
+                "protein_atom":    pos_dict["protein_atom"],
+                "ligand_molecule": pos_mol,
+                "protein_residue": pro_res_pos,
+                "protein_pocket":  pro_pocket_pos,
+            }
+
             edge_dict = self._build_dynamic_inter_atom_edges(
                 data=data,
                 pos_dict=pos_dict,
@@ -794,7 +832,7 @@ class EHFEncoder(nn.Module):
                 edge_dict=edge_dict,
             )
             x_dict, pos_dict = self._run_block(
-                cast(nn.ModuleDict, block), x_dict, pos_dict, edge_dict
+                cast(nn.ModuleDict, block), x_dict, pos_dict, edge_dict, full_pos_dict
             )
 
         # 计算速度：v = pos_out - pos_in

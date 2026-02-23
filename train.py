@@ -31,7 +31,6 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 def main():
-    torch.autograd.set_detect_anomaly(True)
     parser = argparse.ArgumentParser(description="Train EHFNet for molecular docking prediction")
     
     # 数据相关参数
@@ -46,14 +45,14 @@ def main():
     
     # 训练相关参数
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=8, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-5, help="Learning rate")
+    parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-6, help="Weight decay")
     parser.add_argument("--clip_grad", type=float, default=1.0, help="Gradient clipping value")
     
     # 模型相关参数
     parser.add_argument("--hidden_dim", type=int, default=128, help="Hidden dimension size")
-    parser.add_argument("--num_gnn_blocks", type=int, default=6, help="Number of GNN blocks")
+    parser.add_argument("--num_gnn_blocks", type=int, default=4, help="Number of GNN blocks")
     
     # 特征相关参数（通常固定，但为灵活性暴露）
     parser.add_argument("--lig_atom_cont_count", type=int, default=9, help="Ligand atom continuous feature count")
@@ -64,7 +63,7 @@ def main():
     parser.add_argument("--pocket_radius", type=float, default=20.0, help="Radius (A) for protein pocket extraction (default: 20.0)")
     parser.add_argument("--warmup_epochs", type=int, default=20, help="Number of warmup epochs for spatial curriculum learning (default: 20)")
     parser.add_argument("--rmsd_ratio", type=float, default=0.1, help="Ratio of validation set to compute RMSD (0.0-1.0)")
-    parser.add_argument("--accumulation_steps", type=int, default=1, help="Gradient accumulation steps")
+    parser.add_argument("--accumulation_steps", type=int, default=8, help="Gradient accumulation steps")
     parser.add_argument("--ema_decay", type=float, default=0.999, help="EMA decay rate (default: 0.999; use 0.99 for quick smoke tests)")
 
     args = parser.parse_args()

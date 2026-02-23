@@ -48,6 +48,108 @@ def compute_center_of_mass(
     return com
 
 
+def compute_principal_frame(
+    pos: Tensor,
+    batch: Tensor,
+    masses: Tensor,
+    dim_size: int | None = None,
+    eps: float = 1e-8,
+) -> Tensor:
+    """
+    计算每个分子的主惯量帧（质量加权协方差矩阵 SVD）。
+
+    原理：
+        C_b = Σ_i m_i · r_i · r_i^T  （3×3 惯量张量近似）
+        C_b = U S V^T  →  R_b = U V^T
+        R_b 的列向量即三个主轴方向（世界坐标系表达）。
+
+    坐标变换约定：
+        体帧坐标：x_body = R^T @ (x_world - com)
+        世界帧向量：v_world = R @ v_body  ← 等变投影
+
+    退化处理：
+        - 原子数 < 2 → 单位矩阵
+        - C 奇异或含 NaN → 单位矩阵
+        - θ ≈ π 旋转（线性/平面分子第三轴近零）→ 翻转最小奇异向量符号
+
+    Args:
+        pos:      原子坐标 [N, 3]
+        batch:    批次索引 [N]
+        masses:   原子质量 [N] 或 [N, 1]
+        dim_size: 批次大小（可选，None 则自动推断）
+        eps:      数值稳定性参数
+
+    Returns:
+        R: 主惯量帧旋转矩阵 [B, 3, 3]，列向量为主轴（body→world）
+    """
+    if masses.dim() == 1:
+        masses = masses.unsqueeze(-1)      # [N, 1]
+
+    if dim_size is None:
+        dim_size = int(batch.max().item()) + 1
+
+    B      = dim_size
+    device = pos.device
+    dtype  = pos.dtype
+
+    # 使用 detach 的坐标——主惯量帧仅作几何参考基，不需要反向传播
+    pos_d = pos.detach()
+
+    # 质心（质量加权）
+    masses_clamped = masses.clamp(min=eps)
+    mass_per_mol = scatter_sum(masses_clamped, batch, dim=0, dim_size=B).clamp(min=eps)
+    com = scatter_sum(pos_d * masses_clamped, batch, dim=0, dim_size=B) / mass_per_mol
+
+    r = pos_d - com[batch]                 # [N, 3] 质心系坐标
+
+    R = torch.zeros(B, 3, 3, device=device, dtype=dtype)
+
+    for b in range(B):
+        mask   = batch == b
+        r_b    = r[mask]                   # [N_b, 3]
+        m_b    = masses_clamped[mask]      # [N_b, 1]
+        n_atoms = r_b.shape[0]
+
+        if n_atoms < 2:
+            R[b] = torch.eye(3, device=device, dtype=dtype)
+            continue
+
+        # 质量加权协方差矩阵 [3, 3]
+        C = (m_b * r_b).T @ r_b
+
+        if not torch.isfinite(C).all() or C.norm() < eps:
+            R[b] = torch.eye(3, device=device, dtype=dtype)
+            continue
+
+        try:
+            # CPU SVD（LAPACK 比 cuSOLVER 在小矩阵上更稳定）
+            C_cpu  = C.to("cpu", dtype=torch.float64)
+            U_cpu, S_cpu, Vh_cpu = torch.linalg.svd(C_cpu)
+
+            U  = U_cpu.to(device, dtype=dtype)
+            Vh = Vh_cpu.to(device, dtype=dtype)
+
+            if not torch.isfinite(U).all() or not torch.isfinite(Vh).all():
+                R[b] = torch.eye(3, device=device, dtype=dtype)
+                continue
+
+            # R_b = U @ V^T，列向量 = 主轴（world 坐标系表达）
+            R_b = U @ Vh
+
+            # 保证右手系：det(R) = +1
+            if torch.linalg.det(R_b) < 0:
+                U_corr = U.clone()
+                U_corr[:, -1] *= -1        # 翻转最小主轴符号
+                R_b = U_corr @ Vh
+
+            R[b] = R_b
+
+        except Exception:
+            R[b] = torch.eye(3, device=device, dtype=dtype)
+
+    return R   # [B, 3, 3]
+
+
 class PhysicsConstants:
     """
     物理化学常量定义
