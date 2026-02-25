@@ -175,6 +175,7 @@ def prepare_graph(
     # 如果指定了 pocket_radius，获取配体坐标用于裁剪
     # 将 list 转换为 np.ndarray 以匹配 ProteinEncoder 的类型要求
     ligand_positions = None
+    
     if pocket_radius is not None:
         ligand_positions = np.array(ligand_result["positions"], dtype=np.float32)
 

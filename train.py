@@ -45,7 +45,7 @@ def main():
     
     # 训练相关参数
     parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs")
-    parser.add_argument("--batch_size", type=int, default=2, help="Batch size")
+
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=1e-6, help="Weight decay")
     parser.add_argument("--clip_grad", type=float, default=1.0, help="Gradient clipping value")
@@ -59,11 +59,12 @@ def main():
     parser.add_argument("--lig_mol_cont_count", type=int, default=9, help="Ligand molecule continuous feature count")
     parser.add_argument("--pro_atom_cont_count", type=int, default=5, help="Protein atom continuous feature count")
     parser.add_argument("--esm_dim", type=int, default=960, help="ESM embedding dimension (default: 960 for ESMC-300M)")
-    parser.add_argument("--device", type=str, default="auto", help="Device to use for training (e.g., 'cuda:0', 'cuda:1', 'cpu')")
-    parser.add_argument("--pocket_radius", type=float, default=20.0, help="Radius (A) for protein pocket extraction (default: 20.0)")
+    parser.add_argument("--device", type=str, default="cuda:0", help="Device to use for training (e.g., 'cuda:0', 'cuda:1', 'cpu')")
+    parser.add_argument("--pocket_radius", type=float, default=12.0, help="Radius (A) for protein pocket extraction (default: 12.0)")
     parser.add_argument("--warmup_epochs", type=int, default=20, help="Number of warmup epochs for spatial curriculum learning (default: 20)")
     parser.add_argument("--rmsd_ratio", type=float, default=0.1, help="Ratio of validation set to compute RMSD (0.0-1.0)")
     parser.add_argument("--accumulation_steps", type=int, default=8, help="Gradient accumulation steps")
+    parser.add_argument("--max_nodes_per_batch", type=int, default=20000, help="Max nodes per batch for DynamicBatchSampler.")
     parser.add_argument("--ema_decay", type=float, default=0.999, help="EMA decay rate (default: 0.999; use 0.99 for quick smoke tests)")
 
     args = parser.parse_args()
@@ -129,7 +130,7 @@ def main():
             save_dir=args.save_dir,
             esm_path=args.esm_path,
             epochs=args.epochs,
-            batch_size=args.batch_size,
+
             lr=args.lr,
             weight_decay=args.weight_decay,
             clip_grad=args.clip_grad,
@@ -146,6 +147,7 @@ def main():
             warmup_epochs=args.warmup_epochs,
             rmsd_check_ratio=args.rmsd_ratio,
             accumulation_steps=args.accumulation_steps,
+            max_nodes_per_batch=args.max_nodes_per_batch,
             ema_decay=args.ema_decay,
         )
     except Exception as e:

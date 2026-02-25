@@ -7,13 +7,13 @@ PDBBind 数据集
 import os
 import os.path as osp
 import logging
-
 import torch
-from torch import Tensor
 import pandas as pd
 
+from torch import Tensor
 from tqdm import tqdm
-from typing import Any, Callable, cast, overload
+from collections.abc import Callable
+from typing import Any, cast, overload
 
 from rdkit.Chem import ChemicalFeatures, RDConfig
 
@@ -21,6 +21,7 @@ from torch_geometric.data import Dataset, HeteroData
 
 from ehfnet.graph import GraphBuilder, ESMEmbeddingFiller
 from ehfnet.datasets.prepare import prepare_graph, get_esm_model
+
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +119,7 @@ def esm_cache_paths(pdb_id: str, pdb_dir: str, esm_root: str | None) -> tuple[st
         (read_path, write_path)
     """
 
+
     local_path = osp.join(pdb_dir, f"{pdb_id}_esm.npz")
 
     if osp.exists(local_path):
@@ -140,6 +142,7 @@ class PDBBindDataset(Dataset):
 
     读取 index_file 并在 processed_dir 下缓存每个复合物的图数据文件 data_{pdb_id}.pt。
     """
+
 
     def __init__(
         self,
@@ -222,6 +225,7 @@ class PDBBindDataset(Dataset):
         super().__init__(root, transform, pre_transform, pre_filter)
         self._build_valid_index()
 
+
     def _compute_affinity_stats(self) -> dict[str, float]:
         """
         计算亲和力标签的均值和标准差。
@@ -229,7 +233,7 @@ class PDBBindDataset(Dataset):
         if self.index_df.empty:
             return {"mean": 0.0, "std": 1.0}
             
-        affinities = self.index_df["affinity"].values
+        affinities = self.index_df["affinity"].to_numpy(dtype=float)
         mean = float(affinities.mean())
         std = float(affinities.std())
         std = max(std, 1e-3)
@@ -245,6 +249,7 @@ class PDBBindDataset(Dataset):
         """
         将归一化的亲和力值还原为 pKd。
         """
+        
         return val * self.affinity_stats["std"] + self.affinity_stats["mean"]
 
     @property

@@ -1,13 +1,7 @@
 """
-数据集划分模块 (Splitting Strategy)
+数据集划分模块
 
-提供基于分子骨架 (Bemis-Murcko Scaffold) 的数据集划分策略。
-相比随机划分，骨架划分能更真实地评估模型对未知化学空间的泛化能力。
-
-Features:
-- 确定性排序：保证可复现性
-- 鲁棒的 RDKit 处理：自动处理解析失败的分子
-- 贪心平衡算法：确保划分比例尽可能精准
+基于 Bemis-Murcko 骨架的确定性划分策略。
 """
 
 import os
@@ -138,120 +132,91 @@ class ScaffoldSplitter:
             frac_train: 训练集比例
             frac_val: 验证集比例
             frac_test: 测试集比例
-            index_df: 数据集的索引 DataFrame (用于加速路径查找)
+            index_df: 数据集的索引 DataFrame
 
         Returns:
             (train_subset, val_subset, test_subset)
         """
-
-        # 参数校验
+        
         if not np.isclose(frac_train + frac_val + frac_test, 1.0):
             raise ValueError(f"Split ratios must sum to 1.0, got {frac_train + frac_val + frac_test}")
 
         if index_df is None:
+
             if hasattr(dataset, "index_df") and hasattr(dataset, "raw_dir"):
-                index_df = getattr(dataset, "index_df")
+                index_df = cast(pd.DataFrame, getattr(dataset, "index_df"))
             else:
                 raise ValueError("Dataset must have 'index_df' attribute or it must be provided.")
-        
-        # [关键新增 1] 检查 dataset 是否有 PDB ID 到 Index 的映射
-        # PDBBindDataset 应该有 _pdb_to_idx 属性
+
         if not hasattr(dataset, "_pdb_to_idx"):
             raise AttributeError("Dataset must have '_pdb_to_idx' attribute mapping pdb_id to index.")
-        
+
         pdb_to_idx = getattr(dataset, "_pdb_to_idx")
+        raw_dir = getattr(dataset, "raw_dir", ".")
 
         logger.info(f"Start Scaffold Split (seed={self.seed})...")
-        
-        # 1. 生成所有样本的骨架
+
         # scaffold_map: dict[scaffold_smiles, list[dataset_index]]
         scaffold_map = defaultdict(list)
         invalid_count = 0
-        missing_in_dataset_count = 0 # [新增] 统计在 CSV 中但不在 Dataset 中的样本
-        
-        # 获取 raw_dir (假设 dataset 结构)
-        raw_dir = getattr(dataset, "raw_dir", ".")
+        missing_in_dataset_count = 0
 
-        # 使用 tqdm 显示进度，因为 I/O 较慢
-        pbar = tqdm(index_df.iterrows(), total=len(index_df), desc="Analyzing Scaffolds")
-        
-        for idx, row in pbar:
-            pdb_id = str(row["pdb_id"]).lower() # 确保格式统一
+        for _, row in tqdm(index_df.iterrows(), total=len(index_df), desc="Analyzing Scaffolds"):
+            pdb_id = str(row["pdb_id"]).lower()
             
-            # [关键修改 2] 先检查该 PDB ID 是否在 Dataset 中有效
-            # 如果 Dataset 没加载这个样本（处理失败等），直接跳过，防止索引越界
             if pdb_id not in pdb_to_idx:
                 missing_in_dataset_count += 1
                 continue
-                
-            # 获取真实的 dataset index
+
             real_dataset_idx = pdb_to_idx[pdb_id]
-            
-            # 构建文件路径逻辑 (复用 pdbbind.py 的逻辑)
-            # 这里为了解耦，重新构建路径检查，也可以让 dataset 提供 helper
+
             pdb_dir = os.path.join(raw_dir, pdb_id)
             lig_sdf = os.path.join(pdb_dir, f"{pdb_id}_ligand.sdf")
             lig_mol2 = os.path.join(pdb_dir, f"{pdb_id}_ligand.mol2")
-            
             mol_path = lig_sdf if os.path.exists(lig_sdf) else lig_mol2
-            
+
             mol = _read_ligand_safe(mol_path)
-            
+
             if mol is None:
-                # 读取失败的分子归入 "null_scaffold"，防止丢数据
                 scaffold = "null_scaffold_error"
                 invalid_count += 1
 
             else:
                 scaffold = generate_scaffold(mol, self.include_chirality)
 
-            # [关键修改 3] 这里存入 real_dataset_idx，而不是 CSV 的 idx
             scaffold_map[scaffold].append(real_dataset_idx)
 
         if invalid_count > 0:
             logger.warning(f"Failed to generate scaffolds for {invalid_count} ligands.")
-            
-        if missing_in_dataset_count > 0:
-            logger.warning(f"Skipped {missing_in_dataset_count} entries present in CSV but missing in Dataset (processing failed?).")
 
-        # 2. 排序骨架组
-        # 关键步骤：按每个骨架包含的分子数量降序排列
-        # 这样处理是为了先分配“大块头”，防止最后剩下的大簇导致比例严重失衡
+        if missing_in_dataset_count > 0:
+            logger.warning(f"Skipped {missing_in_dataset_count} entries present in CSV but missing in Dataset.")
+
+        # 按骨架大小降序排列（先分配大簇，保证比例均衡）；排序键包含首元素以保证确定性
         scaffold_sets = list(scaffold_map.values())
-        # 排序键：(分子数量, 第一个分子的索引) -> 保证确定性
         scaffold_sets.sort(key=lambda x: (len(x), x[0]), reverse=True)
 
-        # 3. 贪心分配 (Greedy Allocation)
         train_indices: list[int] = []
         val_indices: list[int] = []
         test_indices: list[int] = []
 
-        # 确保 dataset 支持 len() 操作
-        if not hasattr(dataset, '__len__'):
-            raise TypeError("Dataset must have __len__ method")
-        
         sized_dataset = cast(SizedDataset, dataset)
         dataset_size = len(sized_dataset)
         train_cutoff = int(dataset_size * frac_train)
         val_cutoff = int(dataset_size * (frac_train + frac_val))
 
         for group in scaffold_sets:
-            # 当前 group 的长度
-            l = len(group)
-            
-            # 逻辑：只要训练集没满，就往训练集塞
-            # 这种策略保证了训练集的骨架多样性最大化
-            if len(train_indices) + l <= train_cutoff:
+            group_size = len(group)
+
+            if len(train_indices) + group_size <= train_cutoff:
                 train_indices.extend(group)
 
-            elif len(train_indices) + len(val_indices) + l <= val_cutoff:
+            elif len(train_indices) + len(val_indices) + group_size <= val_cutoff:
                 val_indices.extend(group)
-                
+
             else:
                 test_indices.extend(group)
 
-        # 4. 组内 Shuffle
-        # 骨架分组完成后，我们在各个集内部打乱顺序，方便 DataLoader 取样
         rng = random.Random(self.seed)
         rng.shuffle(train_indices)
         rng.shuffle(val_indices)
@@ -262,8 +227,7 @@ class ScaffoldSplitter:
             f"Val: {len(val_indices)} ({len(val_indices)/dataset_size:.1%}), "
             f"Test: {len(test_indices)} ({len(test_indices)/dataset_size:.1%})"
         )
-        
-        # 检查是否因为大骨架导致验证集过小
+
         if len(val_indices) == 0 and frac_val > 0:
             logger.warning("Validation set is empty! This happens when one huge scaffold dominates the dataset.")
 

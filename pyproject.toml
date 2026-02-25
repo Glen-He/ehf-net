@@ -31,6 +31,3 @@ find-links = [
     "https://data.pyg.org/whl/torch-2.8.0+cu128.html",
     "https://download.pytorch.org/whl/cu128"
 ]
-
-[tool.ruff]
-ignore = ["E402"]

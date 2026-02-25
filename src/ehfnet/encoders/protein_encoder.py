@@ -36,8 +36,10 @@ def _get_vecs_by_names(
     vecs: list[np.ndarray] = []
 
     for name in names:
+
         if name not in source_atoms:
             return None
+
         vecs.append(source_atoms[name])
 
     return vecs
@@ -87,6 +89,7 @@ def _generate_atom14_symmetry_mask(res_type: ResidueType) -> list[float]:
     current_sym = 1.0
 
     for a1, a2 in res_type.atom_swap.items():
+
         if a1 in atom14_idx_map and a2 in atom14_idx_map:
             idx1, idx2 = atom14_idx_map[a1], atom14_idx_map[a2]
             mask[idx1] = current_sym
@@ -276,12 +279,12 @@ class ProteinEncoder:
             valid_residues = protein_atoms[mask].residues
             
             if len(valid_residues) == 0:
-                # [修复] 永远不要偷偷回退到全量蛋白质 (会导致下游 OOM 怪兽)，而是直接硬报错让 dataset 清理器它捕捉并丢弃
                 raise ValueError(
                     f"No valid residues found within {pocket_radius}A of the ligand! "
                     "This complex's structural coordinates are likely severely corrupted (massive drift). "
                     "Refusing to fall back to the full protein."
                 )
+
             else:
                 protein_atoms = valid_residues.atoms
                 logger.info(f"Extracted pocket with {len(valid_residues)} residues within {pocket_radius}A.")
@@ -384,13 +387,16 @@ class ProteinEncoder:
             # ESM Embedding
             if esm_embeddings and res.ix in esm_embeddings:
                 res_esm_feats.append(esm_embeddings[res.ix])
+
             else:
                 res_esm_feats.append(None)
 
             # 位置（CA 优先）
             ca = next((a for a in res.atoms if a.name == "CA"), None)
+
             if ca:
                 res_positions.append(ca.position.tolist())
+                
             else:
                 res_positions.append(res.atoms.center_of_geometry().tolist())
 

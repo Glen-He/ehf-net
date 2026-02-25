@@ -10,7 +10,7 @@ import numpy as np
 from typing import Any, cast
 from torch import Tensor
 from torch_geometric.data import HeteroData
-from torch_geometric.nn import radius, radius_graph
+from torch_geometric.nn import radius, radius_graph, knn_graph
 from ehfnet.encoders.ligand_encoder import LigandEncodingResult
 from ehfnet.encoders.protein_encoder import ProteinEncodingResult
 from ehfnet.encoders.feature_specs import (
@@ -393,17 +393,21 @@ class GraphBuilder:
 
         for src, rel, dst in INTRA_EDGES:
 
-            if not hasattr(data[src], "pos") or data[src].pos.numel() == 0:
-                continue
-
             pos = data[src].pos
-            # 残基尺度通常比原子尺度大，给予更大的 cutoff
-            r_cutoff = self.r_cutoff_intra * 2 if "residue" in src else self.r_cutoff_intra
-            edge_index = self._radius_graph(
-                pos,
-                r_cutoff,
-                max_num_neighbors=self.max_neighbors_intra,
-            )
+            # [修改] 使用 KNN 图替代半径图防止 OOM
+            # 用户要求: 使用 128 邻居。如果是配体内部本身原子很少，自适应缩小 K
+            k = 128 if "residue" in src or "protein" in src else 32
+            actual_k = min(k, pos.size(0) - 1)
+            
+            if actual_k > 0:
+                edge_index = knn_graph(
+                    pos,
+                    k=actual_k,
+                    loop=False,
+                )
+            else:
+                edge_index = torch.zeros((2, 0), dtype=torch.long, device=pos.device)
+
             data[src, rel, dst].edge_index = edge_index
 
         return data
@@ -510,22 +514,15 @@ class GraphBuilder:
                 edge_index = torch.stack([src_idx, dst_idx], dim=0)
 
             else:
-                cutoff = self._resolve_inter_cutoff(src, dst)
-                max_neighbors = self._resolve_inter_max_neighbors(src, dst)
-                edge_index = self._bipartite_radius_graph(
+                # [修改] 完全抛弃二部半径图，直接使用二部 KNN 进行关联
+                # 默认使用 K=128 (用户指定) 或者配体侧按需减少
+                k = 128 if "residue" in src or "residue" in dst else 32
+                
+                edge_index = self._bipartite_knn_graph(
                     data[src].pos,
                     data[dst].pos,
-                    cutoff,
-                    max_num_neighbors=max_neighbors,
+                    k=k,
                 )
-
-                # 半径边为空时，回退到 kNN，防止跨图交互完全断开
-                if edge_index.numel() == 0:
-                    edge_index = self._bipartite_knn_graph(
-                        data[src].pos,
-                        data[dst].pos,
-                        k=min(8, max_neighbors),
-                    )
 
                 # 保证每个目标节点至少有一条入边（避免部分节点无跨图信息）
                 if edge_index.numel() > 0:

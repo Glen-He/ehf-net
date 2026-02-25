@@ -9,6 +9,13 @@
 
 > **Note:** This project is under active development. APIs and model architectures are subject to change.
 
+## Highlights
+
+- **SE(3) × T^m 流形建模**：统一学习刚体平移、旋转与扭转速度场。
+- **层次化异构图编码**：原子与残基双尺度交互，兼顾几何细节与全局语义。
+- **动态节点预算批采样**：基于 `max_nodes_per_batch` 控制显存上限，训练更稳定。
+- **工程化训练策略**：Spatial Curriculum、EMA、梯度累积与裁剪协同提升收敛质量。
+
 ## Method
 
 ### Flow Matching on SE(3) × T^m
@@ -19,7 +26,7 @@ $$x_t = (1 - t)\,x_0 + t\,x_1, \quad t \in [0, 1]$$
 
 模型学习条件速度场 $v_\theta(x_t, t)$，使 ODE 积分 $\dot{x} = v_\theta(x, t)$ 从 $x_0$ 恢复 $x_1$。训练目标由 Kabsch 对齐 + 有限差分从插值路径分解得到，分别对应：
 
-- **平移速度** $v_\text{trans} \in \mathbb{R}^3$（质心刚体平移）
+- **平移速度** $v_{\mathrm{trans}} \in \mathbb{R}^3$（质心刚体平移）
 - **旋转角速度** $\omega \in \mathbb{R}^3$（Rodrigues 参数化，轴角表示）
 - **扭转角速度** $\dot{\tau} \in \mathbb{R}^T$（每个可旋转键一个标量）
 
@@ -40,9 +47,9 @@ prot residues ──[FrameConv]───→  ligand atoms       (Broadcast, SE(3
 
 非 EGNN 阶段的消息公式（严格旋转不变）：
 
-$$m_{i \to j} = \varphi_\text{msg}\!\left(h_i,\; h_j,\; \mathrm{RBF}(d_{ij}),\; \hat{R}_j^\top \hat{r}_{ij}\right) \cdot \sigma\!\left(\varphi_\text{gate}(\mathrm{RBF}(d_{ij}))\right)$$
+$$m_{i \to j} = \varphi_{\mathrm{msg}}\!\left(h_i,\; h_j,\; \mathrm{RBF}(d_{ij}),\; \hat{R}_j^\top \hat{r}_{ij}\right) \cdot \sigma\!\left(\varphi_{\mathrm{gate}}(\mathrm{RBF}(d_{ij}))\right)$$
 
-其中 $\hat{R}_j \in \mathrm{SO}(3)$ 是以 $j$ 节点邻域均值方向 Gram-Schmidt 正交化构造的局部帧，$\hat{R}_j^\top \hat{r}_{ij}$ 在任意全局旋转下严格不变：
+其中 $\hat{R}_j \in \mathrm{SO}(3)$ 是以 $j$ 节点邻域均值方向 Gram-Schmidt 正交化构造的局部帧。通过向该局部帧投影，相对位置特征在任意全局旋转 $Q$ 下保持严格不变：
 
 $$(Q\hat{R}_j)^\top (Q\hat{r}_{ij}) = \hat{R}_j^\top Q^\top Q\hat{r}_{ij} = \hat{R}_j^\top \hat{r}_{ij} \quad \checkmark$$
 
@@ -50,19 +57,19 @@ $$(Q\hat{R}_j)^\top (Q\hat{r}_{ij}) = \hat{R}_j^\top Q^\top Q\hat{r}_{ij} = \hat
 
 *平移*：先聚合 EGNN 配体原子速度的质心均值提取方向，再由分子级 MLP 预测幅度：
 
-$$v_\text{trans} = \frac{\bar{v}_\text{CoM}}{\|\bar{v}_\text{CoM}\|} \cdot \mathrm{softplus}(f_s(h_\text{mol}))$$
+$$v_{\mathrm{trans}} = \frac{\bar{v}_{\mathrm{CoM}}}{\|\bar{v}_{\mathrm{CoM}}\|} \cdot \mathrm{softplus}(f_s(h_{\mathrm{mol}}))$$
 
 先聚合再归一化（而非逐原子归一化后聚合），保留了原子速度场的力学权重。
 
 *旋转*：体帧角速度 MLP + 主惯量帧投影，规避角动量 $L$ 与角速度 $\omega = I^{-1}L$ 的量纲不匹配：
 
-$$v_\text{rot} = R_\text{frame} \cdot \frac{\omega_\text{body}}{\|\omega_\text{body}\|} \cdot \mathrm{softplus}(g_s(h_\text{mol}))$$
+$$v_{\mathrm{rot}} = R_{\mathrm{frame}} \cdot \frac{\omega_{\mathrm{body}}}{\|\omega_{\mathrm{body}}\|} \cdot \mathrm{softplus}(g_s(h_{\mathrm{mol}}))$$
 
-$R_\text{frame} \in \mathrm{SO}(3)$ 由当前坐标 SVD 主轴确定（detach），$h_\text{mol}$ 为 SE(3)-不变量，保证 $v_\text{rot}$ 等变。
+$R_{\mathrm{frame}} \in \mathrm{SO}(3)$ 由当前坐标 SVD 主轴确定（detach）， $h_{\mathrm{mol}}$ 为 SE(3)-不变量，保证 $v_{\mathrm{rot}}$ 等变。
 
 *扭转*：以旋转键两端原子特征拼接输入，MLP 直接输出标量（旋转不变量），无需坐标投影。
 
-**辅助任务：** 亲和力预测头（$t > 0.5$ 时激活）+ 位阻惩罚（$t > 0.8$ 时激活）。
+**辅助任务：** 亲和力预测头（ $t > 0.5$ 时激活）+ 位阻惩罚（ $t > 0.8$ 时激活）。
 
 **训练策略：**
 - 空间课程学习（Spatial Curriculum）：前 `warmup_epochs` 从局部扰动逐步扩展到全局搜索
@@ -78,8 +85,8 @@ $R_\text{frame} \in \mathrm{SO}(3)$ 由当前坐标 SVD 主轴确定（detach）
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 克隆仓库
-git clone https://github.com/your-lab/ehfnet.git
-cd ehfnet
+git clone https://github.com/Glen-He/EHFNet.git
+cd EHFNet
 
 # 安装所有依赖
 uv sync
@@ -135,12 +142,15 @@ uv run python scripts/organize_data.py \
 
 ### 推荐配置（24GB 单卡）
 
+说明：当前版本采用 **节点预算模式**。`--max_nodes_per_batch` 是显存占用的主控参数，
+`--accumulation_steps` 用于在不增加峰值显存的情况下提升等效 batch。
+
 ```bash
 uv run python train.py \
     --data_root  ./data/processed/pdbbind \
     --index_file ./data/processed/pdbbind/index.csv \
     --epochs 100 \
-    --batch_size 2 \
+    --max_nodes_per_batch 20000 \
     --accumulation_steps 8 \
     --lr 1e-4 \
     --hidden_dim 128 \
@@ -148,7 +158,7 @@ uv run python train.py \
     --warmup_epochs 20 \
     --ema_decay 0.999 \
     --rmsd_ratio 0.1 \
-    --device auto
+    --device cuda:0
 ```
 
 ### 后台运行
@@ -158,7 +168,7 @@ nohup uv run python train.py \
     --data_root  ./data/processed/pdbbind \
     --index_file ./data/processed/pdbbind/index.csv \
     --epochs 100 \
-    --batch_size 2 \
+    --max_nodes_per_batch 20000 \
     --accumulation_steps 8 \
     --lr 1e-4 \
     --hidden_dim 128 \
@@ -177,18 +187,19 @@ tail -f logs/nohup.log
 | `--data_root` | str | — | 数据根目录路径 |
 | `--index_file` | str | — | 索引 CSV 文件路径 |
 | `--save_dir` | str | `./checkpoints` | 检查点保存目录 |
-| `--device` | str | `auto` | 训练设备（`cuda:0`、`cpu` 等） |
+| `--device` | str | `cuda:0` | 训练设备（`cuda:0`、`cuda:1`、`cpu` 等） |
 | `--epochs` | int | 100 | 训练轮数 |
-| `--batch_size` | int | 8 | 批大小（显存受限时推荐 2） |
-| `--accumulation_steps` | int | 1 | 梯度累积步数，等效扩大 batch size |
-| `--lr` | float | 1e-5 | 学习率 |
+| `--max_nodes_per_batch` | int | 20000 | 动态批采样的单批最大节点数。决定了显存占用的上限。 |
+| `--accumulation_steps` | int | 8 | 梯度累积步数，等效扩大 batch size |
+| `--lr` | float | 1e-4 | 学习率 |
+| `--weight_decay` | float | 1e-6 | 权重衰减 |
 | `--clip_grad` | float | 1.0 | 梯度裁剪阈值 |
 | `--warmup_epochs` | int | 20 | 空间课程学习预热轮数 |
 | `--ema_decay` | float | 0.999 | EMA 衰减系数 |
 | `--rmsd_ratio` | float | 0.1 | 验证集中执行 RMSD 推演的样本比例 |
 | `--hidden_dim` | int | 128 | 隐藏层维度 |
-| `--num_gnn_blocks` | int | 6 | GNN Block 数量（显存不足时可降至 4） |
-| `--pocket_radius` | float | 20.0 | 口袋提取截断半径（Å） |
+| `--num_gnn_blocks` | int | 4 | GNN Block 数量（显存不足时可降至 3） |
+| `--pocket_radius` | float | 12.0 | 口袋提取截断半径（Å） |
 | `--esm_dim` | int | 960 | ESM Embedding 维度（ESMC-300M 为 960） |
 
 ## Monitoring

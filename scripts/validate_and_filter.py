@@ -22,6 +22,7 @@ def check_folder_consistency(ligand_dir, protein_dir):
     检查 ligand 和 protein 文件夹的一致性。
     规则: 每一个 xxx_ligand.sdf 必须对应一个 xxx_protein.pdb
     """
+
     logger.info(f"Checking consistency between:\n  Ligand: {ligand_dir}\n  Protein: {protein_dir}")
     
     if not ligand_dir.exists() or not protein_dir.exists():
@@ -29,7 +30,6 @@ def check_folder_consistency(ligand_dir, protein_dir):
         return False
 
     #以此为基准：获取所有 ligand 前缀
-    # 显式排序保证确定性
     ligand_files = sorted(list(ligand_dir.glob("*_ligand.sdf")))
     protein_files = sorted(list(protein_dir.glob("*_protein.pdb")))
     

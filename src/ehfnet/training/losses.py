@@ -70,15 +70,19 @@ class FlowMatchingLoss(nn.Module):
         Returns:
             损失字典。
         """
+
         loss_dict: dict[str, Tensor] = {}
 
         pred_trans = predictions.get("v_translation")
+
         if pred_trans is None:
             raise ValueError("Key 'v_translation' is missing in predictions.")
+
         device = pred_trans.device
 
         # 1. 平移损失
         gt_trans = targets.get("v_trans_target")
+
         if gt_trans is None:
             raise ValueError("Key 'v_trans_target' is missing in targets.")
 
@@ -88,6 +92,7 @@ class FlowMatchingLoss(nn.Module):
         # 2. 旋转损失
         pred_rot = predictions.get("v_rotation")
         gt_rot = targets.get("v_rot_target")
+
         if pred_rot is None or gt_rot is None:
             raise ValueError("Missing rotation data in predictions or targets.")
 
@@ -100,8 +105,10 @@ class FlowMatchingLoss(nn.Module):
         gt_tor = targets.get("v_torsion_target")
 
         if pred_tor is not None and gt_tor is not None and gt_tor.numel() > 0:
+
             if pred_tor.dim() == 1:
                 pred_tor = pred_tor.view(-1, 1)
+
             if gt_tor.dim() == 1:
                 gt_tor = gt_tor.view(-1, 1)
 
@@ -122,15 +129,18 @@ class FlowMatchingLoss(nn.Module):
         gt_affinity = targets.get("binding_affinity_target")
 
         if pred_affinity is not None and gt_affinity is not None:
+
             # NaN 守卫：预测头在训练初期可能因权重随机而输出 NaN，直接跳过避免污染梯度
             if torch.isnan(pred_affinity).any() or torch.isnan(gt_affinity).any():
                 pass
+
             else:
                 t_val = getattr(data, "t", None)
 
                 if t_val is not None:
                     # 仅在 t > 0.5 时（配体已较为靠近真实结合态）计算亲和力损失
                     valid_mask = t_val > 0.5
+
                     if valid_mask.any():
                         loss_energy = F.huber_loss(
                             pred_affinity[valid_mask].view(-1),
@@ -152,10 +162,13 @@ class FlowMatchingLoss(nn.Module):
 
         if clash_batch is not None and not torch.isnan(clash_batch).any():
             t_val = getattr(data, "t", None)
+
             if t_val is not None:
                 valid_mask = t_val > 0.8
+
                 if valid_mask.any():
                     loss_clash = clash_batch[valid_mask].mean()
+                    
             else:
                 # data.t 未设置时跳过（避免无掩码全量施加位阻损失破坏早期训练）
                 pass

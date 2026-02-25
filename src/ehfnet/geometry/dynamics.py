@@ -345,11 +345,6 @@ class VelocityDecomposer:
             else torch.zeros(0, device=device, dtype=dtype)
         )
         
-        # [修复] 移除 tanh 软饱和截断：
-        # tanh 会将平移速度限制在 ±60 Å/unit-t，配体若初始偏移 > 60 Å
-        # 则 ODE 积分无论如何也无法到达目标口袋（宇宙限速问题）。
-        # losses.py 已使用 Huber Loss，本身对大数值线性衰减，无需在数据
-        # 源头做有损压缩；极端速度的梯度爆炸由 grad_clip 在 trainer 侧兜底。
         return v_trans, v_rot, v_torsion
 
 
@@ -735,10 +730,6 @@ class PathInterpolator:
 
         if params["delta_torsions"].numel() > 0:
             torsion_batch_idx = batch[params["torsion_indices"][:, 1]]
-            # [修复] 用 squeeze(-1) 代替 squeeze()：
-            # t 为 [B, 1]，索引后得 [T, 1]，squeeze(-1) 安全压为 [T]；
-            # 原 squeeze() 在 T=1 时会产生 0-d 标量，而直接删除则会使
-            # [T, 1] * [T] 广播成 [T, T]，导致后续 if 判断报歧义错误。
             current_angles = params["delta_torsions"] * t[torsion_batch_idx].squeeze(-1)
 
             for i in range(current_angles.shape[0]):

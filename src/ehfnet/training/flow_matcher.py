@@ -51,7 +51,6 @@ class ConditionalFlowMatcher:
 
         self.interpolator = PathInterpolator(eps=PhysicsConstants.EPSILON, fd_dt=fd_dt)
         self.updater = PoseUpdater(eps=PhysicsConstants.EPSILON)
-        # [新增] 在流匹配器中直接持有分解器，训练时生成纯净的 SE(3) x T^m 目标
         self.decomposer = VelocityDecomposer(eps=PhysicsConstants.EPSILON)
 
 
@@ -59,6 +58,7 @@ class ConditionalFlowMatcher:
         """
         根据当前 epoch 计算空间扰动尺度
         """
+        
         if self.warmup_epochs <= 0:
             return self.spatial_sigma_max
             

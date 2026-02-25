@@ -67,8 +67,8 @@ def calculate_dihedral(
     b1 = b1 / (b1_norm + EPSILON)
 
     # 投影向量：计算 b0 和 b2 在垂直于 b1 的平面上的投影
-    v = b0 - np.dot(b0, b1) * b1  # b0 垂直于 b1 的分量
-    w = b2 - np.dot(b2, b1) * b1  # b2 垂直于 b1 的分量
+    v = b0 - np.dot(b0, b1) * b1        # b0 垂直于 b1 的分量
+    w = b2 - np.dot(b2, b1) * b1        # b2 垂直于 b1 的分量
 
     # 计算角度
     x = np.dot(v, w)  # |v||w|cos(θ)

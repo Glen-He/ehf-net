@@ -38,7 +38,7 @@ def train(
     save_dir: str = "./checkpoints",
     esm_path: str | None = None,
     epochs: int = 100,
-    batch_size: int = 8,
+
     lr: float = 1e-4,
     weight_decay: float = 1e-6,
     clip_grad: float = 10.0,
@@ -55,6 +55,7 @@ def train(
     warmup_epochs: int = 20,
     rmsd_check_ratio: float = 0.1,
     accumulation_steps: int = 1,
+    max_nodes_per_batch: int = 10000,
     ema_decay: float = 0.999,
 ):
     """
@@ -66,7 +67,7 @@ def train(
         save_dir: 模型保存目录
         esm_path: 预计算的 ESM 嵌入路径
         epochs: 训练轮数
-        batch_size: 批次大小
+
         lr: 学习率
         weight_decay: 权重衰减
         clip_grad: 梯度裁剪阈值
@@ -141,28 +142,46 @@ def train(
 
     logger.info(f"Final Dataset Sizes: Train={len(train_set)}, Val={len(val_set)}")
 
+    from torch_geometric.loader import DynamicBatchSampler
+    
+    logger.info(f"Using DynamicBatchSampler with max_num={max_nodes_per_batch} nodes per batch.")
+    # 注意: node mode 时, max_num 控制的是包含所有图累计的最大节点数
+    train_sampler = DynamicBatchSampler(
+        train_set,
+        max_num=max_nodes_per_batch,
+        mode="node",
+        shuffle=True,
+    )
     train_loader = DataLoader(
         train_set,
-        batch_size=batch_size,
-        shuffle=True,
+        collate_fn=collator.collate,
         num_workers=4,
         persistent_workers=True,
-        collate_fn=collator.collate,
         pin_memory=True,
+        batch_sampler=train_sampler,
     )
-
+    
+    val_sampler = DynamicBatchSampler(
+        val_set,
+        max_num=max_nodes_per_batch,
+        mode="node",
+        shuffle=False,
+    )
     val_loader = DataLoader(
         val_set,
-        batch_size=batch_size,
-        shuffle=False,
+        collate_fn=collator.collate,
         num_workers=4,
         persistent_workers=True,
-        collate_fn=collator.collate,
         pin_memory=True,
+        batch_sampler=val_sampler,
     )
 
-    # [新增逻辑] 计算需要检查的 Batch 数量
-    total_val_batches = len(val_loader)
+    # [新增逻辑] 动态计算 Batch 数量 (DynamicBatchSampler 没有固定的 len)
+    try:
+        total_val_batches = len(val_loader)
+    except ValueError:
+        total_val_batches = max(1, len(val_set) // 4)
+        
     rmsd_check_batches = int(total_val_batches * rmsd_check_ratio)
     # 确保至少检查 1 个 batch (如果 ratio > 0)
     if rmsd_check_ratio > 0 and rmsd_check_batches < 1:
@@ -201,8 +220,11 @@ def train(
 
     # Warmup + 余弦退火（Step 级），防止初期梯度冲击 + 中后期平滑收敛
     # [修复] 以 optimizer.step() 次数（而非 batch 数）定义里程碑，
-    # 确保 accumulation_steps > 1 时 warmup/cosine 阶段长度不被错误拉伸
-    updates_per_epoch = math.ceil(len(train_loader) / accumulation_steps)
+    try:
+        total_train_batches = len(train_loader)
+    except ValueError:
+        total_train_batches = max(1, len(train_set) // 4)
+    updates_per_epoch = math.ceil(total_train_batches / accumulation_steps)
     total_steps = epochs * updates_per_epoch
     warmup_steps = max(1, epochs // 10) * updates_per_epoch  # 前 10% Epoch 线性升温
     scheduler_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
@@ -235,25 +257,20 @@ def train(
         criterion.train()
 
         train_loss_meter = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
-
-        for batch_idx, batch in enumerate(pbar):
+        pbar = tqdm(total=len(train_loader.dataset), desc=f"Epoch {epoch+1}/{epochs} [Train]", unit="graphs")
+        
+        actual_batches = 0
+        for batch_idx, batch in enumerate(train_loader):
+            num_graphs = int(batch["ligand_atom"].batch.max().item()) + 1
+            pbar.update(num_graphs)
+            actual_batches += 1
+            
             batch = batch.to(device)
 
-            # [新增防爆显存保护] 如果蛋白图依然因为某些意外没截断好，包含极大的原子树，
-            # 这里硬拦截一次，避免它进入下方极其吃显存的 O(N) GNN 运算。
-            # (由于 DataLoader 设置了 shuffle=True，每轮的 batch 组合都不同，
-            # 两个各自含有五六千原子的图可能恰好在第 5 轮被配对到了同一个 batch 中引发 OOM)
-            num_protein_atoms = batch["protein_atom"].pos.shape[0]
-            if num_protein_atoms > 10000:
-                logger.warning(
-                    f"Batch {batch_idx}: Found {num_protein_atoms} protein atoms (> 600k edges). "
-                    f"Skipping to prevent dense MessagePassing CUDA OOM!"
-                )
-                optimizer.zero_grad() # 连带清空这一个坏 batch 不小心累挂的图
-                continue
+            # [移除] 防爆显存保护：既然用了 DynamicBatchSampler，它会自动截断图大小。不再直接丢弃 >10000 原子的批次，因为现在单个批次可能就只有1个刚好万原子左右的图。
 
-            # 梯度累积：仅在累积周期开头清零梯度
+            # 动态梯度累积：由于使用了 DynamicBatchSampler，每次循环的真实图数量不再是固定的 batch_size。
+            # 为了公平，我们可以退化成最简单的 batch 步数累积。
             if batch_idx % accumulation_steps == 0:
                 optimizer.zero_grad()
 
@@ -306,8 +323,7 @@ def train(
 
             # 仅在完成一个完整累积周期后才更新参数
             is_last_in_cycle = (batch_idx + 1) % accumulation_steps == 0
-            is_last_batch = (batch_idx + 1) == len(train_loader)
-            if is_last_in_cycle or is_last_batch:
+            if is_last_in_cycle:
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
                 # GradScaler 移除后需手动补回：Inf/NaN 梯度直接跳过，防止权重被污染
                 if torch.isnan(grad_norm) or torch.isinf(grad_norm):
@@ -338,7 +354,21 @@ def train(
                 }
             )
 
-        avg_train_loss = train_loss_meter / len(train_loader)
+        # 循环结束，如果有剩余积累的梯度，进行最后一次 step
+        if actual_batches > 0 and actual_batches % accumulation_steps != 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+            if not (torch.isnan(grad_norm) or torch.isinf(grad_norm)):
+                optimizer.step()
+                if ema_model is None:
+                    ema_model = AveragedModel(
+                        model,
+                        avg_fn=lambda avg_p, p, _: ema_decay * avg_p + (1.0 - ema_decay) * p,
+                    )
+                ema_model.update_parameters(model)
+                scheduler.step()
+
+        pbar.close()
+        avg_train_loss = train_loss_meter / max(1, actual_batches)
 
         # 验证
         if torch.cuda.is_available():
@@ -432,10 +462,12 @@ def compute_validation_loss(
         if torch.cuda.is_available():
             torch.cuda.manual_seed(42 + epoch)
 
-    # 使用 tqdm 显示验证进度，因为现在推演会稍微花点时间
-    pbar = tqdm(loader, desc=f"Epoch {(epoch or 0) + 1} [Val]", leave=False)
+    # 使用 tqdm 显示验证进度，按精确样本数统计
+    pbar = tqdm(total=len(loader.dataset), desc=f"Epoch {(epoch or 0) + 1} [Val]", leave=False, unit="graphs")
 
-    for i, batch in enumerate(pbar):
+    for i, batch in enumerate(loader):
+        num_graphs = int(batch["ligand_atom"].batch.max().item()) + 1
+        pbar.update(num_graphs)
         try:
             batch = batch.to(device)
             x_1 = batch["ligand_atom"].pos

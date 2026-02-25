@@ -7,7 +7,8 @@
 import logging
 import numpy as np
 
-from typing import TypedDict, Callable
+from collections.abc import Callable
+from typing import TypedDict
 from rdkit import Chem
 from rdkit.Chem import (
     rdMolDescriptors,
