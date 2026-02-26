@@ -5,11 +5,13 @@
 推理时：基于 PoseUpdater 进行刚体 ODE 演化
 """
 
+import math
 import torch
 import logging
 
 from torch import Tensor
 from torch_geometric.data import HeteroData
+import torch.nn.functional as F
 from ehfnet.geometry.dynamics import PathInterpolator, PoseUpdater, PhysicsConstants, compute_center_of_mass, VelocityDecomposer
 
 
@@ -31,39 +33,64 @@ class ConditionalFlowMatcher:
         spatial_sigma_max: float = 6.0,
         warmup_epochs: int = 20,
         fd_dt: float = 0.05,
+        rotation_angle_min: float = 0.2,
+        rotation_angle_max: float = math.pi,
+        torsion_scale_min: float = 0.1,
+        torsion_scale_max: float = 1.0,
     ) -> None:
         """
         Args:
             sigma_min: 最小噪声水平，用于防止 t=1 时的数值不稳定
-            spatial_sigma_min: 空间课程学习起始尺度 (Å)
-            spatial_sigma_max: 空间课程学习结束尺度 (Å)
-            warmup_epochs: 空间课程学习预热轮数
+            spatial_sigma_min: 空间课程学习起始平移尺度 (Å)
+            spatial_sigma_max: 空间课程学习结束平移尺度 (Å)
+            warmup_epochs: 课程学习预热轮数
             fd_dt: 速度有限差分步长，透传至 PathInterpolator（v = Δpos / fd_dt）
+            rotation_angle_min: 初始最大旋转角（弧度）
+            rotation_angle_max: 最终最大旋转角（弧度）
+            torsion_scale_min: 初始扭转角缩放系数
+            torsion_scale_max: 最终扭转角缩放系数
         """
 
         self.sigma_min = sigma_min
         self.fd_dt = fd_dt
 
-        # 课程学习参数
+        # 联合三自由度课程学习参数
         self.spatial_sigma_min = spatial_sigma_min
         self.spatial_sigma_max = spatial_sigma_max
         self.warmup_epochs = warmup_epochs
+        self.rotation_angle_min = rotation_angle_min
+        self.rotation_angle_max = rotation_angle_max
+        self.torsion_scale_min = torsion_scale_min
+        self.torsion_scale_max = torsion_scale_max
 
         self.interpolator = PathInterpolator(eps=PhysicsConstants.EPSILON, fd_dt=fd_dt)
         self.updater = PoseUpdater(eps=PhysicsConstants.EPSILON)
         self.decomposer = VelocityDecomposer(eps=PhysicsConstants.EPSILON)
 
 
-    def get_spatial_scale(self, epoch: int) -> float:
-        """
-        根据当前 epoch 计算空间扰动尺度
-        """
-        
+    def get_curriculum_ratio(self, epoch: int) -> float:
+        """统一的课程学习进度比例 [0.0, 1.0]"""
         if self.warmup_epochs <= 0:
-            return self.spatial_sigma_max
-            
-        progress = min(1.0, epoch / self.warmup_epochs)
-        return self.spatial_sigma_min + (self.spatial_sigma_max - self.spatial_sigma_min) * progress
+            return 1.0
+        return min(1.0, epoch / self.warmup_epochs)
+
+
+    def get_spatial_scale(self, epoch: int) -> float:
+        """根据当前 epoch 计算平移扰动尺度"""
+        ratio = self.get_curriculum_ratio(epoch)
+        return self.spatial_sigma_min + (self.spatial_sigma_max - self.spatial_sigma_min) * ratio
+
+
+    def get_rotation_scale(self, epoch: int) -> float:
+        """根据当前 epoch 计算最大旋转角"""
+        ratio = self.get_curriculum_ratio(epoch)
+        return self.rotation_angle_min + (self.rotation_angle_max - self.rotation_angle_min) * ratio
+
+
+    def get_torsion_scale(self, epoch: int) -> float:
+        """根据当前 epoch 计算扭转角缩放系数"""
+        ratio = self.get_curriculum_ratio(epoch)
+        return self.torsion_scale_min + (self.torsion_scale_max - self.torsion_scale_min) * ratio
 
 
     def sample_location_and_target(
@@ -109,9 +136,8 @@ class ConditionalFlowMatcher:
 
         B = int(batch.max().item()) + 1 if batch is not None else 1
 
-        # 1. 生成 x_0
+        # 1. 生成 x_0（联合三自由度课程学习）
         if x_0 is None:
-            current_scale = self.get_spatial_scale(current_epoch)
             x_0 = self._generate_random_pose(
                 x_ref=x_1,
                 batch=batch,
@@ -119,7 +145,7 @@ class ConditionalFlowMatcher:
                 masses=masses,
                 torsion_indices=torsion_indices,
                 torsion_moving_mask=torsion_moving_mask,
-                translation_scale=current_scale,
+                epoch=current_epoch,
             )
 
         # 2. 采样时间 t，显式避开边界：t ~ U[sigma_min, 1-sigma_min]
@@ -378,23 +404,34 @@ class ConditionalFlowMatcher:
         masses: Tensor,
         torsion_indices: Tensor | None,
         torsion_moving_mask: Tensor | None,
-        translation_scale: float = 10.0,
+        epoch: int = 0,
     ) -> Tensor:
         """
-        生成随机初始位姿（盲对接）
+        生成随机初始位姿（联合三自由度课程学习）
+
+        根据 epoch 进度同步控制平移尺度、旋转角度、扭转角范围。
         """
 
         device = x_ref.device
         dtype = x_ref.dtype
 
-        # 1. 随机扭转
+        # 计算当前 epoch 的三自由度扰动尺度
+        current_trans_scale = self.get_spatial_scale(epoch)
+        current_rot_max = self.get_rotation_scale(epoch)
+        current_tor_scale = self.get_torsion_scale(epoch)
+
+        # 1. 受控随机扭转
         x_torsioned = x_ref.clone()
 
         if torsion_indices is not None and torsion_moving_mask is not None:
             T = torsion_indices.shape[0]
 
             if T > 0:
-                rand_angles = (torch.rand(T, device=device, dtype=dtype) * 2 - 1) * torch.pi
+                # 范围从 [-π*scale, π*scale] 随课程学习逐步扩大
+                rand_angles = (
+                    (torch.rand(T, device=device, dtype=dtype) * 2 - 1)
+                    * math.pi * current_tor_scale
+                )
 
                 x_torsioned = self.updater.update(
                     pos=x_torsioned,
@@ -408,23 +445,42 @@ class ConditionalFlowMatcher:
                     dt=1.0,
                 )
 
-        # 2. 随机刚体位姿
-        # 获取当前（扭转后）的质心 (Center of Mass)
-        # 使用统一的质心计算工具
+        # 2. 受控随机刚体位姿
         center = compute_center_of_mass(x_torsioned, batch, masses, dim_size=B)
-        
         x_centered = x_torsioned - center[batch]
 
-        # 随机旋转
-        rot_matrices = self._random_rotation_matrix(B, device, dtype)
+        # 受控旋转：轴角采样，角度上限随课程学习逐步扩大
+        rot_matrices = self._random_bounded_rotation(B, device, dtype, max_angle=current_rot_max)
         x_rotated = torch.bmm(rot_matrices[batch], x_centered.unsqueeze(-1)).squeeze(-1)
 
-        # 随机位移（相对于原始中心 center 的偏移，而不是相对于原点）
-        # 使用传入的 translation_scale 控制随机初始范围
-        translation_offset = torch.randn(B, 3, device=device, dtype=dtype) * translation_scale
+        # 受控平移
+        translation_offset = torch.randn(B, 3, device=device, dtype=dtype) * current_trans_scale
 
-        # 最终坐标 = 旋转后的坐标 + 原始中心 + 随机位移偏移
         return x_rotated + center[batch] + translation_offset[batch]
+
+
+    @staticmethod
+    def _random_bounded_rotation(
+        B: int, device: torch.device, dtype: torch.dtype, max_angle: float = math.pi,
+    ) -> Tensor:
+        """
+        在 SO(3) 上采样旋转角不超过 max_angle 的随机旋转
+
+        Args:
+            B: 批次大小
+            device: 设备
+            dtype: 数据类型
+            max_angle: 最大旋转角（弧度）
+
+        Returns:
+            旋转矩阵 [B, 3, 3]
+        """
+        # 随机旋转轴（球面均匀分布）
+        axis = F.normalize(torch.randn(B, 3, device=device, dtype=dtype), dim=-1)
+        # 随机旋转角 [0, max_angle]
+        angle = torch.rand(B, device=device, dtype=dtype) * max_angle
+        # Rodrigues 公式生成旋转矩阵
+        return PoseUpdater._axis_angle_to_matrix_batched(axis, angle)
 
 
     @staticmethod
@@ -432,7 +488,7 @@ class ConditionalFlowMatcher:
         B: int, device: torch.device, dtype: torch.dtype
     ) -> Tensor:
         """
-        使用 Haar Measure 在 SO(3) 上均匀采样随机旋转矩阵
+        使用 Haar Measure 在 SO(3) 上均匀采样随机旋转矩阵（保留以兼容其他调用）
         """
 
         m = torch.randn(B, 3, 3, device=device, dtype=dtype)

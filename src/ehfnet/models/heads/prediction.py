@@ -211,7 +211,6 @@ class PredictionHead(nn.Module):
 
         # 共享模块
         self.cutoff_fn = CosineCutoff(cutoff=self.r_cutoff)
-        self.force_cutoff_fn = CosineCutoff(cutoff=self.force_cutoff)
 
         # 距离 RBF 编码 + 边特征 MLP
         self.distance_expansion = GaussianSmearing(0.0, self.r_cutoff, num_rbf)
@@ -220,16 +219,6 @@ class PredictionHead(nn.Module):
             nn.SiLU(),
             nn.Dropout(dropout_rate),
             nn.Linear(hidden_dim, hidden_dim),
-        )
-
-        # 力场预测分支
-        self.force_magnitude_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 1),
         )
 
         # 能量预测分支
@@ -290,7 +279,7 @@ class PredictionHead(nn.Module):
             lig_mol_feat: 配体分子特征 [B, H]
 
         Returns:
-            包含 binding_affinity, force_atomic 的字典
+            binding_affinity 和 steric_clash_batch 的字典
         """
 
         device = lig_atom_feat.device
@@ -303,7 +292,6 @@ class PredictionHead(nn.Module):
 
             return {
                 "binding_affinity": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
-                "force_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
             }
 
         # 1. 邻居搜索
@@ -362,7 +350,6 @@ class PredictionHead(nn.Module):
 
             return {
                 "binding_affinity": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
-                "force_atomic": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
                 "steric_clash_batch": torch.zeros(B, device=device, dtype=torch.float32),
             }
 
@@ -387,43 +374,19 @@ class PredictionHead(nn.Module):
             clash_edge, lig_batch[i_idx], dim=0, dim_size=B
         ).float()
         cutoff_weights = self.cutoff_fn(dist)
-        force_cutoff_weights = self.force_cutoff_fn(dist)
 
         # 当全部边都落在 cutoff 外时，启用长程衰减权重，避免“有边无信号”
         if torch.all(cutoff_weights <= PredictionConstants.EPSILON):
             cutoff_weights = torch.exp(-dist / max(self.r_cutoff, PredictionConstants.EPSILON))
-
-        if torch.all(force_cutoff_weights <= PredictionConstants.EPSILON):
-            force_cutoff_weights = torch.exp(-dist / max(self.force_cutoff, PredictionConstants.EPSILON))
 
         rbf = self.distance_expansion(dist)
         edge_feat = self.edge_mlp(rbf)
 
         lig_feat_sel = lig_atom_feat[i_idx]
         pro_feat_sel = pro_atom_feat[j_idx]
-
-        # 3. 力场预测
         pair_input = torch.cat([lig_feat_sel, pro_feat_sel, edge_feat], dim=-1)
 
-        force_magnitude_raw = self.force_magnitude_mlp(pair_input)
-        # 软饱和替代硬截断，保持可导且保留强信号排序
-        force_magnitude = self.force_limit * torch.tanh(force_magnitude_raw / self.force_limit)
-
-        # rel_pos/direction: 已在 FP32 空间（lig_pos_sel/pro_pos_sel 已 .float()）
-        rel_pos = lig_pos_sel - pro_pos_sel
-        direction = torch.nn.functional.normalize(
-            rel_pos, dim=-1, eps=PredictionConstants.EPSILON
-        )
-        zero_mask = dist < PredictionConstants.MIN_DISTANCE
-        direction = torch.where(
-            zero_mask.unsqueeze(-1), torch.zeros_like(direction), direction
-        )
-
-        # 力分支使用更局部的相互作用，减少远距离噪声对几何更新的污染
-        force_pairwise = force_magnitude * direction * force_cutoff_weights.unsqueeze(-1)
-        force_atomic = scatter_add(force_pairwise, i_idx, dim=0, dim_size=N_lig).to(lig_atom_feat.dtype)
-
-        # 4. 能量预测
+        # 3. 能量预测
         E_ij_raw = self.pairwise_energy_mlp(pair_input).squeeze(-1)
         E_ij = E_ij_raw * cutoff_weights
 
@@ -497,7 +460,6 @@ class PredictionHead(nn.Module):
 
         return {
             "binding_affinity": binding_affinity,
-            "force_atomic": force_atomic,
             "steric_clash_batch": steric_clash_batch,
         }
 

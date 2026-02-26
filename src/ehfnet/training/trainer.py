@@ -53,7 +53,7 @@ def train(
     pocket_radius: float | None = 20.0,
     normalization_stats: dict | None = None,
     warmup_epochs: int = 20,
-    rmsd_check_ratio: float = 0.1,
+    rmsd_check_ratio: float = 1.0,
     accumulation_steps: int = 1,
     max_nodes_per_batch: int = 10000,
     ema_decay: float = 0.999,
@@ -179,10 +179,12 @@ def train(
     # [新增逻辑] 动态计算 Batch 数量 (DynamicBatchSampler 没有固定的 len)
     try:
         total_val_batches = len(val_loader)
+
     except ValueError:
         total_val_batches = max(1, len(val_set) // 4)
         
     rmsd_check_batches = int(total_val_batches * rmsd_check_ratio)
+    
     # 确保至少检查 1 个 batch (如果 ratio > 0)
     if rmsd_check_ratio > 0 and rmsd_check_batches < 1:
         rmsd_check_batches = 1
@@ -226,7 +228,7 @@ def train(
         total_train_batches = max(1, len(train_set) // 4)
     updates_per_epoch = math.ceil(total_train_batches / accumulation_steps)
     total_steps = epochs * updates_per_epoch
-    warmup_steps = max(1, epochs // 10) * updates_per_epoch  # 前 10% Epoch 线性升温
+    warmup_steps = max(1, warmup_epochs) * updates_per_epoch  # LR warmup 与 Curriculum 同步
     scheduler_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
     scheduler_cosine = CosineAnnealingLR(
         optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=1e-6
@@ -245,6 +247,7 @@ def train(
 
     # 5. 训练循环
     best_val_loss = float("inf")
+    best_rmsd = float("inf")
 
     for epoch in range(epochs):
         # [新增] Epoch 开始前的深度清理
@@ -388,7 +391,8 @@ def train(
             epoch=epoch,
             total_epochs=epochs,
             max_rmsd_batches=rmsd_check_batches,
-            dataset=dataset, # [新增] 传入 dataset 用于反归一化
+            dataset=dataset,
+            warmup_epochs=warmup_epochs,
         )
         
         # [新增] 验证结束，下一轮开始前的清理
@@ -396,10 +400,20 @@ def train(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+        # 提取指标
+        if isinstance(avg_val_loss, dict):
+            val_metrics = avg_val_loss
+            avg_val_loss_scalar = val_metrics["val_loss"]
+            mean_rmsd = val_metrics["mean_rmsd_final"]
+        else:
+            avg_val_loss_scalar = avg_val_loss
+            mean_rmsd = float("inf")
+
         # ReduceLROnPlateau 已移除，scheduler 已在 Step 级自动推进
 
         logger.info(
-            f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}"
+            f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | "
+            f"Val Loss: {avg_val_loss_scalar:.4f} | Val RMSD: {mean_rmsd:.4f}"
         )
 
         # 准备保存数据
@@ -411,17 +425,19 @@ def train(
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
             "best_val_loss": best_val_loss,
+            "best_rmsd": best_rmsd,
         }
 
         # 1. 始终保存最新模型（作为保底）
         torch.save(checkpoint, os.path.join(save_dir, "latest_model.pt"))
 
-        # 2. 只有当 Val Loss 有效且创下新低时保存最佳模型
-        if not math.isnan(avg_val_loss) and avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            checkpoint["best_val_loss"] = best_val_loss
+        # 2. Best model：Curriculum 结束后 + RMSD 创新低时保存
+        is_warmup = epoch < warmup_epochs
+        if not is_warmup and mean_rmsd < best_rmsd:
+            best_rmsd = mean_rmsd
+            checkpoint["best_rmsd"] = best_rmsd
             torch.save(checkpoint, os.path.join(save_dir, "best_model.pt"))
-            logger.info(f"Saved best model with val_loss: {best_val_loss:.4f}")
+            logger.info(f"Saved best model with Mean Final RMSD: {best_rmsd:.4f}")
 
         # 3. 每 10 轮保存一个永久备份
         if (epoch + 1) % 10 == 0:
@@ -439,8 +455,9 @@ def compute_validation_loss(
     epoch: int | None = None,
     total_epochs: int = 1,
     max_rmsd_batches: int = 10,
-    dataset: PDBBindDataset | None = None, # [新增]
-) -> float:
+    dataset: PDBBindDataset | None = None,
+    warmup_epochs: int = 20,
+) -> dict | float:
     """
     验证函数：计算 Loss 并统计全量 RMSD 指标
     """
@@ -531,10 +548,7 @@ def compute_validation_loss(
                     infer_batch = batch.clone()
                     infer_batch["ligand_atom"].pos = x_1 
                     
-                    # 获取当前空间尺度
-                    current_scale = matcher.get_spatial_scale(epoch if epoch is not None else 0)
-
-                    # 生成随机初始位姿
+                    # 验证始终使用全难度扰动（与最终推理条件一致）
                     x_0_infer = matcher._generate_random_pose(
                         x_ref=x_1,
                         batch=infer_batch["ligand_atom"].batch,
@@ -542,7 +556,7 @@ def compute_validation_loss(
                         masses=infer_batch["ligand_atom"].masses,
                         torsion_indices=getattr(infer_batch, "torsion_indices", None),
                         torsion_moving_mask=getattr(infer_batch, "torsion_moving_mask", None),
-                        translation_scale=current_scale
+                        epoch=warmup_epochs,
                     )
                     
                     # 记录初始 RMSD
@@ -552,12 +566,12 @@ def compute_validation_loss(
                     # [修改] 强制转 CPU，切断 GPU 显存占用
                     all_rmsd_init.append(rmsd_init.detach().cpu())
 
-                    # 执行推演
+                    # 执行推演（100 步 RK4，与推理对齐）
                     infer_batch["ligand_atom"].pos = x_0_infer
                     final_pos, _ = matcher.ode_solve(
                         model=model,
                         data=infer_batch,
-                        steps=40,
+                        steps=100,
                         method="rk4"
                     )
                     
@@ -590,6 +604,9 @@ def compute_validation_loss(
         
         logger.info(f"[Validation Affinity] RMSE: {rmse_val:.4f} pKd | MAE: {mae_val:.4f} pKd")
 
+    mean_final = float("inf")
+    success_5a = 0.0
+
     if len(all_rmsd_final) > 0:
         # 拼接所有 batch 的 RMSD
         cat_rmsd_init = torch.cat(all_rmsd_init)
@@ -610,10 +627,9 @@ def compute_validation_loss(
         logger.info("-" * 60)
 
     if valid_batches == 0:
-        return float("nan")
+        return {"val_loss": float("nan"), "mean_rmsd_final": float("inf"), "success_5a": 0.0}
 
     # [新增] 显式清理现场
-    # 虽然 Python 有 GC，但显式删除能更快释放引用
     del all_rmsd_init
     del all_rmsd_final
     del affinity_preds
@@ -622,5 +638,9 @@ def compute_validation_loss(
     # 强制通知 CUDA 释放缓存
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-        
-    return total_loss / valid_batches
+
+    return {
+        "val_loss": total_loss / valid_batches,
+        "mean_rmsd_final": mean_final,
+        "success_5a": success_5a,
+    }

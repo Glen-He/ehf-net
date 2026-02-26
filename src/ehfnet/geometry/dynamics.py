@@ -102,52 +102,49 @@ def compute_principal_frame(
 
     r = pos_d - com[batch]                 # [N, 3] 质心系坐标
 
-    R = torch.zeros(B, 3, 3, device=device, dtype=dtype)
+    # ── 向量化构建协方差矩阵 [B, 3, 3] ────────────────────────────────────
+    weighted_r = r * masses_clamped                                    # [N, 3]
+    # 原子级外积：[N, 3, 1] @ [N, 1, 3] → [N, 3, 3]
+    atom_cov = torch.bmm(weighted_r.unsqueeze(-1), r.unsqueeze(-2))
+    # scatter 聚合到分子维度
+    C = scatter_sum(
+        atom_cov.reshape(-1, 9), batch, dim=0, dim_size=B
+    ).reshape(B, 3, 3)
 
-    for b in range(B):
-        mask   = batch == b
-        r_b    = r[mask]                   # [N_b, 3]
-        m_b    = masses_clamped[mask]      # [N_b, 1]
-        n_atoms = r_b.shape[0]
+    # ── 批量 SVD + 符号消歧 ─────────────────────────────────────────────
+    eye = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)        # [1, 3, 3]
 
-        if n_atoms < 2:
-            R[b] = torch.eye(3, device=device, dtype=dtype)
-            continue
+    try:
+        U, S, Vh = torch.linalg.svd(C)
 
-        # 质量加权协方差矩阵 [3, 3]
-        C = (m_b * r_b).T @ r_b
+        # 【关键】消除 SVD 符号歧义（Sign Ambiguity）
+        # 强制 U 对角线元素为正，保证同一分子在坐标微扰时帧方向连续
+        signs = torch.sign(torch.diagonal(U, dim1=-2, dim2=-1))        # [B, 3]
+        signs[signs == 0] = 1.0
+        U  = U * signs.unsqueeze(-2)                                   # [B, 3, 3]
+        Vh = Vh * signs.unsqueeze(-1)                                  # 补偿 V 侧
 
-        if not torch.isfinite(C).all() or C.norm() < eps:
-            R[b] = torch.eye(3, device=device, dtype=dtype)
-            continue
+        R_b = torch.bmm(U, Vh)
 
-        try:
-            # CPU SVD（LAPACK 比 cuSOLVER 在小矩阵上更稳定）
-            C_cpu  = C.to("cpu", dtype=torch.float64)
-            U_cpu, S_cpu, Vh_cpu = torch.linalg.svd(C_cpu)
+        # 保证右手系：det(R) = +1
+        det = torch.linalg.det(R_b)                                   # [B]
+        flip_mask = det < 0
+        if flip_mask.any():
+            U_corr = U.clone()
+            U_corr[flip_mask, :, -1] *= -1
+            R_flip = torch.bmm(U_corr[flip_mask], Vh[flip_mask])
+            R_b[flip_mask] = R_flip
 
-            U  = U_cpu.to(device, dtype=dtype)
-            Vh = Vh_cpu.to(device, dtype=dtype)
+        # 逐分子 NaN/Inf 修复（仅失败的退化为单位矩阵）
+        bad_mask = ~torch.isfinite(R_b).all(dim=-1).all(dim=-1)       # [B]
+        if bad_mask.any():
+            R_b[bad_mask] = eye.expand(int(bad_mask.sum()), -1, -1)
 
-            if not torch.isfinite(U).all() or not torch.isfinite(Vh).all():
-                R[b] = torch.eye(3, device=device, dtype=dtype)
-                continue
+        return R_b
 
-            # R_b = U @ V^T，列向量 = 主轴（world 坐标系表达）
-            R_b = U @ Vh
-
-            # 保证右手系：det(R) = +1
-            if torch.linalg.det(R_b) < 0:
-                U_corr = U.clone()
-                U_corr[:, -1] *= -1        # 翻转最小主轴符号
-                R_b = U_corr @ Vh
-
-            R[b] = R_b
-
-        except Exception:
-            R[b] = torch.eye(3, device=device, dtype=dtype)
-
-    return R   # [B, 3, 3]
+    except RuntimeError as e:
+        logger.warning(f"Batched SVD failed: {e}. Falling back to identity matrices.")
+        return eye.expand(B, -1, -1).clone()
 
 
 class PhysicsConstants:

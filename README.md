@@ -55,11 +55,9 @@ $$(Q\hat{R}_j)^\top (Q\hat{r}_{ij}) = \hat{R}_j^\top Q^\top Q\hat{r}_{ij} = \hat
 
 **等变运动读出：**
 
-*平移*：先聚合 EGNN 配体原子速度的质心均值提取方向，再由分子级 MLP 预测幅度：
-
-$$v_{\mathrm{trans}} = \frac{\bar{v}_{\mathrm{CoM}}}{\|\bar{v}_{\mathrm{CoM}}\|} \cdot \mathrm{softplus}(f_s(h_{\mathrm{mol}}))$$
-
-先聚合再归一化（而非逐原子归一化后聚合），保留了原子速度场的力学权重。
+*平移*：Hybrid Fusion。门控网络自适应融合两路信号：
+1. **物理先验**：EGNN 配体原子速度的质心均值。
+2. **体帧预测**：MLP 在主惯量帧内预测平移方向，并经 $R_{\mathrm{frame}}$ 投影至世界帧保障等变性。
 
 *旋转*：体帧角速度 MLP + 主惯量帧投影，规避角动量 $L$ 与角速度 $\omega = I^{-1}L$ 的量纲不匹配：
 
@@ -157,7 +155,7 @@ uv run python train.py \
     --num_gnn_blocks 4 \
     --warmup_epochs 20 \
     --ema_decay 0.999 \
-    --rmsd_ratio 0.1 \
+    --rmsd_ratio 1.0 \
     --device cuda:0
 ```
 
@@ -175,6 +173,7 @@ nohup uv run python train.py \
     --num_gnn_blocks 4 \
     --warmup_epochs 20 \
     --ema_decay 0.999 \
+    --rmsd_ratio 1.0 \
     > logs/nohup.log 2>&1 &
 
 tail -f logs/nohup.log
@@ -196,7 +195,7 @@ tail -f logs/nohup.log
 | `--clip_grad` | float | 1.0 | 梯度裁剪阈值 |
 | `--warmup_epochs` | int | 20 | 空间课程学习预热轮数 |
 | `--ema_decay` | float | 0.999 | EMA 衰减系数 |
-| `--rmsd_ratio` | float | 0.1 | 验证集中执行 RMSD 推演的样本比例 |
+| `--rmsd_ratio` | float | 1.0 | 验证集中执行 RMSD 推演的样本比例 |
 | `--hidden_dim` | int | 128 | 隐藏层维度 |
 | `--num_gnn_blocks` | int | 4 | GNN Block 数量（显存不足时可降至 3） |
 | `--pocket_radius` | float | 12.0 | 口袋提取截断半径（Å） |
