@@ -159,6 +159,7 @@ class PDBBindDataset(Dataset):
         r_cutoff_inter: float = 6.0,
         max_neighbors_intra: int = 64,
         max_neighbors_inter: int = 32,
+        interaction_profile: str = "full",
         force_reprocess: bool = False,
         esm_dim: int = 960,
         pocket_radius: float | None = 20.0,
@@ -177,6 +178,7 @@ class PDBBindDataset(Dataset):
             r_cutoff_inter: 跨图边半径阈值
             max_neighbors_intra: 图内最大邻居数
             max_neighbors_inter: 跨图最大邻居数
+            interaction_profile: 跨图交互配置（"full" 或 "atom_only"）
             force_reprocess: 是否强制重建缓存
             esm_dim: ESM embedding 维度
             pocket_radius: 口袋提取半径 (Å)。设为 None 则不进行裁剪。
@@ -215,6 +217,7 @@ class PDBBindDataset(Dataset):
             max_neighbors_intra=max_neighbors_intra,
             max_neighbors_inter=max_neighbors_inter,
             esm_filler=esm_filler,
+            interaction_profile=interaction_profile,
         )
 
         self._esm_model = None

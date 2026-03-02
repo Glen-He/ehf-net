@@ -138,8 +138,9 @@ class FlowMatchingLoss(nn.Module):
                 t_val = getattr(data, "t", None)
 
                 if t_val is not None:
-                    # 仅在 t > 0.5 时（配体已较为靠近真实结合态）计算亲和力损失
-                    valid_mask = t_val > 0.5
+                    # 仅在 t > 0.8 时（配体已较为靠近真实结合态）计算亲和力损失
+                    # 过早计算会用不靠谱的中间状态的能量信号挤压 SE(3) 梯度容量
+                    valid_mask = t_val > 0.8
 
                     if valid_mask.any():
                         loss_energy = F.huber_loss(
@@ -155,35 +156,36 @@ class FlowMatchingLoss(nn.Module):
 
         loss_dict["loss_energy"] = loss_energy.detach()
 
-        # 5. 物理位阻惩罚损失 (Time-Masked Steric Clash)
-        # 仅在 t > 0.8（配体已进入口袋微调阶段）施加；早期大位移阶段允许穿模
+        # 5. 位阻惩罚损失（时间感知动态惩罚 Time-Aware Dynamic Penalty）
+        # 使用 t⁴ 平滑曲线取代硬阈值 t>0.8，让惩罚在后期（配体已进入口袋）时急剧上升，
+        # 同时避免阈值跳变导致的梯度不连续震荡
+        max_clash_weight = 0.01  # t=1 时的最大有效权重
         loss_clash = torch.tensor(0.0, device=device)
         clash_batch = predictions.get("steric_clash_batch")
 
         if clash_batch is not None and not torch.isnan(clash_batch).any():
             t_val = getattr(data, "t", None)
 
-            if t_val is not None:
-                valid_mask = t_val > 0.8
-
-                if valid_mask.any():
-                    loss_clash = clash_batch[valid_mask].mean()
-                    
-            else:
-                # data.t 未设置时跳过（避免无掩码全量施加位阻损失破坏早期训练）
-                pass
+            if t_val is not None and t_val.numel() > 0:
+                # t⁴ 动态权重：t=0.5→0.004, t=0.7→0.015, t=0.8→0.026, t=0.9→0.043, t=1.0→0.065
+                # 在 t<0.5 时几乎为零，t>0.8 时快速增长
+                dynamic_weight = max_clash_weight * (t_val ** 4)         # [B]
+                # clash_batch [B] × dynamic_weight [B] → 加权后取平均
+                loss_clash = (clash_batch * dynamic_weight).mean()
 
         loss_dict["loss_clash"] = loss_clash.detach()
 
         # 6. 总损失
+        # 注意：loss_clash 已内含动态权重，不再乘以 self.weights["clash"]
         total_loss = (
             self.weights["trans"] * loss_trans
             + self.weights["rot"] * loss_rot
             + self.weights["torsion"] * loss_torsion
             + self.weights["energy"] * loss_energy
-            + self.weights["clash"] * loss_clash
+            + loss_clash  # 动态权重已内置
         )
 
         loss_dict["total"] = total_loss
 
         return loss_dict
+

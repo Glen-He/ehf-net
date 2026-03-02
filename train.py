@@ -18,13 +18,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.append(str(PROJECT_ROOT / "src"))
 
-from ehfnet.training.trainer import train
-import torch
-
-# [新增] 在 import torch 之前或刚开始设置
-# expandable_segments:True -> 允许分配器动态扩展显存段，极大缓解碎片化
+# [修复] 必须在 import torch 之前设置 CUDA allocator 配置，否则可能不生效
+# expandable_segments:True -> 允许分配器动态扩展显存段，缓解碎片化
 # max_split_size_mb:128 -> 避免大块显存被切得太碎
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+
+from ehfnet.training.trainer import train
+import torch
 
 # [新增] 全局开启 TF32 (提速神器)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -62,12 +62,57 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use for training (e.g., 'cuda:0', 'cuda:1', 'cpu')")
     parser.add_argument("--pocket_radius", type=float, default=12.0, help="Radius (A) for protein pocket extraction (default: 12.0)")
     parser.add_argument("--warmup_epochs", type=int, default=20, help="Number of warmup epochs for spatial curriculum learning (default: 20)")
-    parser.add_argument("--rmsd_ratio", type=float, default=0.1, help="Ratio of validation set to compute RMSD (0.0-1.0)")
+    parser.add_argument("--rmsd_ratio", type=float, default=0.2, help="Ratio of validation set to compute RMSD (0.0-1.0)")
     parser.add_argument("--accumulation_steps", type=int, default=8, help="Gradient accumulation steps")
     parser.add_argument("--max_nodes_per_batch", type=int, default=20000, help="Max nodes per batch for DynamicBatchSampler.")
+    parser.add_argument("--val_max_nodes_per_batch", type=int, default=None, help="Max nodes per batch for validation loader (default: min(train_budget, 6000))")
+    parser.add_argument("--test_max_nodes_per_batch", type=int, default=None, help="Max nodes per batch for final test loader (default: same as val budget)")
+    parser.add_argument("--topn_max_nodes_per_batch", type=int, default=None, help="Max nodes per batch for Top-N evaluation loader (default: same as test budget)")
     parser.add_argument("--ema_decay", type=float, default=0.999, help="EMA decay rate (default: 0.999; use 0.99 for quick smoke tests)")
+    parser.add_argument("--dataloader_num_workers", type=int, default=4, help="DataLoader worker count")
+    parser.add_argument("--dataloader_pin_memory", action="store_true", default=True, help="Enable DataLoader pin_memory")
+    parser.add_argument("--no_dataloader_pin_memory", dest="dataloader_pin_memory", action="store_false", help="Disable DataLoader pin_memory")
+    parser.add_argument("--dataloader_persistent_workers", action="store_true", default=True, help="Enable DataLoader persistent_workers")
+    parser.add_argument("--no_dataloader_persistent_workers", dest="dataloader_persistent_workers", action="store_false", help="Disable DataLoader persistent_workers")
+    parser.add_argument("--enable_oom_adaptive_batch", action="store_true", default=True, help="Auto-reduce max_nodes_per_batch when frequent CUDA OOM occurs")
+    parser.add_argument("--disable_oom_adaptive_batch", dest="enable_oom_adaptive_batch", action="store_false", help="Disable adaptive OOM batch protection")
+    parser.add_argument("--oom_reduce_threshold", type=int, default=3, help="Reduce batch node budget when OOM batches in an epoch reach this threshold")
+    parser.add_argument("--oom_reduce_factor", type=float, default=0.85, help="Factor to shrink max_nodes_per_batch after OOM threshold (0-1)")
+    parser.add_argument("--min_max_nodes_per_batch", type=int, default=12000, help="Lower bound for adaptive max_nodes_per_batch")
+    parser.add_argument("--enable_val_oom_adaptive_batch", action="store_true", default=True, help="Auto-reduce validation node budget when validation OOM is frequent")
+    parser.add_argument("--disable_val_oom_adaptive_batch", dest="enable_val_oom_adaptive_batch", action="store_false", help="Disable validation OOM adaptive protection")
+    parser.add_argument("--val_oom_reduce_threshold", type=int, default=3, help="Reduce validation node budget when validation OOM batches reach this threshold")
+    parser.add_argument("--val_oom_reduce_factor", type=float, default=0.85, help="Factor to shrink validation max_nodes_per_batch after OOM threshold (0-1)")
+    parser.add_argument("--min_val_max_nodes_per_batch", type=int, default=None, help="Lower bound for adaptive validation max_nodes_per_batch (default: same as min_max_nodes_per_batch)")
+    parser.add_argument("--oom_recover_epochs", type=int, default=3, help="Consecutive clean epochs before attempting batch budget recovery")
+    parser.add_argument("--oom_recover_factor", type=float, default=1.1, help="Factor to grow max_nodes_per_batch during recovery (>1)")
+    parser.add_argument("--split_train_frac", type=float, default=0.7, help="Train split fraction")
+    parser.add_argument("--split_val_frac", type=float, default=0.1, help="Validation split fraction")
+    parser.add_argument("--split_test_frac", type=float, default=0.2, help="Test split fraction")
+    parser.add_argument("--split_seed", type=int, default=42, help="Seed for scaffold split")
+    parser.add_argument("--split_cache_file", type=str, default=None, help="Path to persisted split JSON")
+    parser.add_argument("--force_resplit", action="store_true", help="Force regenerate split JSON")
+    parser.add_argument(
+        "--ablation_mode",
+        type=str,
+        default="none",
+        choices=["none", "inter_multiscale_off"],
+        help="Ablation mode: none (full model) or inter_multiscale_off (atom-atom only)",
+    )
+    parser.add_argument("--run_test_after_training", action="store_true", default=True, help="Run final test-set evaluation after training")
+    parser.add_argument("--skip_test_after_training", dest="run_test_after_training", action="store_false", help="Skip final test-set evaluation")
+    parser.add_argument("--test_topk", type=str, default="1,5,10", help="Comma-separated top-k values for final test evaluation")
+    parser.add_argument("--test_pose_samples", type=int, default=10, help="Number of candidate poses per complex for Top-N evaluation")
 
     args = parser.parse_args()
+
+    try:
+        parsed_topk = tuple(int(x.strip()) for x in args.test_topk.split(",") if x.strip())
+        if not parsed_topk:
+            raise ValueError("empty top-k list")
+        args.test_topk_values = parsed_topk
+    except Exception as e:
+        raise ValueError(f"Invalid --test_topk='{args.test_topk}': {e}") from e
     
     # 动态计算 pro_res_cont_count: 14 (扭转角) + esm_dim
     args.pro_res_cont_count = 14 + args.esm_dim
@@ -148,7 +193,33 @@ def main():
             rmsd_check_ratio=args.rmsd_ratio,
             accumulation_steps=args.accumulation_steps,
             max_nodes_per_batch=args.max_nodes_per_batch,
+            val_max_nodes_per_batch=args.val_max_nodes_per_batch,
+            test_max_nodes_per_batch=args.test_max_nodes_per_batch,
+            topn_max_nodes_per_batch=args.topn_max_nodes_per_batch,
             ema_decay=args.ema_decay,
+            dataloader_num_workers=args.dataloader_num_workers,
+            dataloader_pin_memory=args.dataloader_pin_memory,
+            dataloader_persistent_workers=args.dataloader_persistent_workers,
+            split_train_frac=args.split_train_frac,
+            split_val_frac=args.split_val_frac,
+            split_test_frac=args.split_test_frac,
+            split_seed=args.split_seed,
+            split_cache_file=args.split_cache_file,
+            force_resplit=args.force_resplit,
+            ablation_mode=args.ablation_mode,
+            run_test_after_training=args.run_test_after_training,
+            test_topk_values=args.test_topk_values,
+            test_pose_samples=args.test_pose_samples,
+            enable_oom_adaptive_batch=args.enable_oom_adaptive_batch,
+            oom_reduce_threshold=args.oom_reduce_threshold,
+            oom_reduce_factor=args.oom_reduce_factor,
+            min_max_nodes_per_batch=args.min_max_nodes_per_batch,
+            enable_val_oom_adaptive_batch=args.enable_val_oom_adaptive_batch,
+            val_oom_reduce_threshold=args.val_oom_reduce_threshold,
+            val_oom_reduce_factor=args.val_oom_reduce_factor,
+            min_val_max_nodes_per_batch=args.min_val_max_nodes_per_batch,
+            oom_recover_epochs=args.oom_recover_epochs,
+            oom_recover_factor=args.oom_recover_factor,
         )
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)

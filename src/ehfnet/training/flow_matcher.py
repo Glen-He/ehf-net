@@ -390,7 +390,7 @@ class ConditionalFlowMatcher:
         v_torsion = out.get("v_torsion", None)
 
         if v_torsion is not None:
-            v_torsion = v_torsion.squeeze(-1)
+            v_torsion = v_torsion.reshape(-1)  # ensure 1-D [T], avoid 0-dim when T=1
 
         return v_trans, v_rot, v_torsion
 

@@ -38,10 +38,10 @@ class ESMEmbeddingFiller:
     用于 residue 级别的 ESM embeddings 存在缺失时，提供一致的填充值。
     """
 
-    def __init__(self, *, embed_dim: int = 1152, fill_strategy: str = "zeros") -> None:
+    def __init__(self, *, embed_dim: int = 960, fill_strategy: str = "zeros") -> None:
         """
         Args:
-            embed_dim: embedding 维度（ESM-3 默认 1152）
+            embed_dim: embedding 维度（ESMC-300M 默认 960）
             fill_strategy: 缺失填充策略，支持 "zeros" 或 "learnable"
         """
         self.embed_dim = embed_dim
@@ -127,6 +127,7 @@ class GraphBuilder:
         max_neighbors_intra: int = 64,
         max_neighbors_inter: int = 32,
         esm_filler: ESMEmbeddingFiller | None = None,
+        interaction_profile: str = "full",
     ) -> None:
         """
         Args:
@@ -135,6 +136,9 @@ class GraphBuilder:
             max_neighbors_intra: 图内最大邻居数（PyG radius_graph）
             max_neighbors_inter: 跨图最大邻居数（PyG radius）
             esm_filler: ESM embedding 填充器（默认使用 ESMEmbeddingFiller）
+            interaction_profile: 跨图交互配置，支持：
+                - "full": 保留全部跨图边（默认）
+                - "atom_only": 仅保留 ligand_atom<->protein_atom（用于多尺度交互消融）
         """
 
         self.r_cutoff_intra = r_cutoff_intra
@@ -142,6 +146,28 @@ class GraphBuilder:
         self.max_neighbors_intra = max_neighbors_intra
         self.max_neighbors_inter = max_neighbors_inter
         self.esm_filler = esm_filler or ESMEmbeddingFiller()
+        self.interaction_profile = interaction_profile
+
+        if self.interaction_profile not in {"full", "atom_only"}:
+            raise ValueError(
+                f"Unsupported interaction_profile='{self.interaction_profile}'. "
+                "Use one of {'full', 'atom_only'}."
+            )
+
+
+    def _is_inter_edge_enabled(self, src: str, dst: str) -> bool:
+        """
+        判断当前跨图边是否在 interaction_profile 下启用。
+        """
+
+        if self.interaction_profile == "full":
+            return True
+
+        if self.interaction_profile == "atom_only":
+            atom_pair = {"ligand_atom", "protein_atom"}
+            return {src, dst} == atom_pair
+
+        return True
 
 
     def build(self, ligand_data: LigandEncodingResult, protein_data: ProteinEncodingResult) -> HeteroData:
@@ -479,6 +505,9 @@ class GraphBuilder:
         processed_edges: set[tuple[str, str, str]] = set()
 
         for src, rel, dst in INTER_EDGES:
+            if not self._is_inter_edge_enabled(src, dst):
+                continue
+
             sorted_nodes = sorted([src, dst])
             edge_key = (rel, sorted_nodes[0], sorted_nodes[1])
 
@@ -739,6 +768,7 @@ def create_graph_tools(
     max_neighbors_intra: int = 64,
     max_neighbors_inter: int = 32,
     esm_fill_strategy: str = "zeros",
+    interaction_profile: str = "full",
 ) -> tuple[GraphBuilder, GraphCollator]:
     """
     创建 GraphBuilder 与 GraphCollator。
@@ -749,18 +779,20 @@ def create_graph_tools(
         max_neighbors_intra: 图内最大邻居数
         max_neighbors_inter: 跨图最大邻居数
         esm_fill_strategy: ESM embedding 缺失时的填充策略
+        interaction_profile: 跨图交互配置（"full" 或 "atom_only"）
 
     Returns:
         (builder, collator)
     """
 
-    esm_filler = ESMEmbeddingFiller(embed_dim=1152, fill_strategy=esm_fill_strategy)
+    esm_filler = ESMEmbeddingFiller(embed_dim=960, fill_strategy=esm_fill_strategy)
     builder = GraphBuilder(
         r_cutoff_intra=r_cutoff_intra,
         r_cutoff_inter=r_cutoff_inter,
         max_neighbors_intra=max_neighbors_intra,
         max_neighbors_inter=max_neighbors_inter,
         esm_filler=esm_filler,
+        interaction_profile=interaction_profile,
     )
     collator = GraphCollator(follow_batch=["ligand_atom", "protein_atom"])
     return builder, collator

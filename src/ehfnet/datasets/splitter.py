@@ -7,6 +7,7 @@
 import os
 import random
 import logging
+import json
 from collections import defaultdict
 from typing import Protocol, cast
 
@@ -138,6 +139,30 @@ class ScaffoldSplitter:
             (train_subset, val_subset, test_subset)
         """
         
+        split_indices = self.split_indices(
+            dataset,
+            frac_train=frac_train,
+            frac_val=frac_val,
+            frac_test=frac_test,
+            index_df=index_df,
+        )
+
+        return self.subsets_from_indices(dataset, split_indices)
+
+
+    def split_indices(
+        self,
+        dataset: Dataset,
+        *,
+        frac_train: float = 0.9,
+        frac_val: float = 0.1,
+        frac_test: float = 0.0,
+        index_df: pd.DataFrame | None = None,
+    ) -> dict[str, list[int]]:
+        """
+        仅生成并返回划分索引，不创建 Subset。
+        """
+
         if not np.isclose(frac_train + frac_val + frac_test, 1.0):
             raise ValueError(f"Split ratios must sum to 1.0, got {frac_train + frac_val + frac_test}")
 
@@ -156,14 +181,13 @@ class ScaffoldSplitter:
 
         logger.info(f"Start Scaffold Split (seed={self.seed})...")
 
-        # scaffold_map: dict[scaffold_smiles, list[dataset_index]]
         scaffold_map = defaultdict(list)
         invalid_count = 0
         missing_in_dataset_count = 0
 
         for _, row in tqdm(index_df.iterrows(), total=len(index_df), desc="Analyzing Scaffolds"):
             pdb_id = str(row["pdb_id"]).lower()
-            
+
             if pdb_id not in pdb_to_idx:
                 missing_in_dataset_count += 1
                 continue
@@ -192,7 +216,6 @@ class ScaffoldSplitter:
         if missing_in_dataset_count > 0:
             logger.warning(f"Skipped {missing_in_dataset_count} entries present in CSV but missing in Dataset.")
 
-        # 按骨架大小降序排列（先分配大簇，保证比例均衡）；排序键包含首元素以保证确定性
         scaffold_sets = list(scaffold_map.values())
         scaffold_sets.sort(key=lambda x: (len(x), x[0]), reverse=True)
 
@@ -231,8 +254,68 @@ class ScaffoldSplitter:
         if len(val_indices) == 0 and frac_val > 0:
             logger.warning("Validation set is empty! This happens when one huge scaffold dominates the dataset.")
 
+        return {
+            "train": train_indices,
+            "val": val_indices,
+            "test": test_indices,
+        }
+
+
+    @staticmethod
+    def subsets_from_indices(
+        dataset: Dataset,
+        split_indices: dict[str, list[int]],
+    ) -> tuple[Subset, Subset, Subset]:
+        """
+        通过索引字典创建 (train, val, test) 子集。
+        """
+
         return (
-            Subset(dataset, train_indices),
-            Subset(dataset, val_indices),
-            Subset(dataset, test_indices)
+            Subset(dataset, split_indices.get("train", [])),
+            Subset(dataset, split_indices.get("val", [])),
+            Subset(dataset, split_indices.get("test", [])),
         )
+
+
+    @staticmethod
+    def save_split(
+        split_path: str,
+        split_indices: dict[str, list[int]],
+        *,
+        metadata: dict | None = None,
+    ) -> None:
+        """
+        将划分索引保存为 JSON，便于复现实验与专利材料留存。
+        """
+
+        os.makedirs(os.path.dirname(split_path), exist_ok=True)
+        payload = {
+            "metadata": metadata or {},
+            "indices": {
+                "train": [int(i) for i in split_indices.get("train", [])],
+                "val": [int(i) for i in split_indices.get("val", [])],
+                "test": [int(i) for i in split_indices.get("test", [])],
+            },
+        }
+
+        with open(split_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+    @staticmethod
+    def load_split(split_path: str) -> tuple[dict[str, list[int]], dict]:
+        """
+        从 JSON 加载划分索引与元信息。
+        """
+
+        with open(split_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        indices = payload.get("indices", {})
+        split_indices = {
+            "train": [int(i) for i in indices.get("train", [])],
+            "val": [int(i) for i in indices.get("val", [])],
+            "test": [int(i) for i in indices.get("test", [])],
+        }
+        metadata = payload.get("metadata", {})
+        return split_indices, metadata

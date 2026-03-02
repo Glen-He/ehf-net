@@ -406,7 +406,7 @@ class PoseUpdater:
             and torsion_indices is not None
             and torsion_moving_mask is not None
         ):
-            angles = v_torsion * dt
+            angles = (v_torsion * dt).reshape(-1)  # ensure 1-D [T]
 
             for i in range(T):
                 angle = angles[i]
@@ -803,7 +803,7 @@ class PathInterpolator:
         """
 
         angle = torch.norm(rot_vec, dim=-1, keepdim=True)
-        mask = angle.squeeze() < PhysicsConstants.MIN_ROTATION_ANGLE
+        mask = angle.squeeze(-1) < PhysicsConstants.MIN_ROTATION_ANGLE
         axis = rot_vec / (angle + PhysicsConstants.EPSILON)
 
         B = rot_vec.shape[0]

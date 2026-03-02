@@ -95,8 +95,6 @@ class EHFNet(nn.Module):
             affinity_stats=normalization_stats.get("affinity") if normalization_stats else None,
         )
 
-
-
         # 扭转角速度 readout [T, H*2] → [T]
         self.torsion_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim // 2),
@@ -187,12 +185,12 @@ class EHFNet(nn.Module):
         v_com_raw = scatter_mean(lig_vel, lig_batch, dim=0, dim_size=B)                 # [B, 3] Equivariant
 
         # 分支 2：MLP 体帧方向 → 世界帧等变向量（严格保持 SE(3) 等变性）
-        v_body_trans = self.trans_body_head(lig_mol_feat)                                # [B, 3] Invariant
-        v_mlp_trans = (R_frame @ v_body_trans.unsqueeze(-1)).squeeze(-1)                 # [B, 3] Equivariant
+        v_body_trans = self.trans_body_head(lig_mol_feat)                               # [B, 3] Invariant
+        v_mlp_trans = (R_frame @ v_body_trans.unsqueeze(-1)).squeeze(-1)                # [B, 3] Equivariant
 
         # 门控融合：网络自适应选择信任 EGNN 还是 MLP
         gate = torch.sigmoid(self.fusion_gate(lig_mol_feat))                            # [B, 1] in (0,1)
-        trans_scale = F.softplus(self.trans_scale_head(lig_mol_feat))                    # [B, 1]
+        trans_scale = F.softplus(self.trans_scale_head(lig_mol_feat))                   # [B, 1]
         v_translation = (gate * v_com_raw + (1.0 - gate) * v_mlp_trans) * trans_scale   # [B, 3]
 
         # 旋转：体帧 MLP → 世界帧等变角速度

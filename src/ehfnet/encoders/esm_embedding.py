@@ -114,7 +114,7 @@ def compute_esm_embeddings(universe: Universe, esm_model: ESMC) -> dict[int, np.
         esm_model: ESM 模型实例
         
     Returns:
-        {residue_index: embedding} 字典，embedding 形状为 (1152,)（ESM-3）
+        {residue_index: embedding} 字典，embedding 形状为 (960,)（ESMC-300M）
     """
 
     esm_map: dict[int, np.ndarray] = {}
