@@ -291,6 +291,14 @@ def train(
         if topn_max_nodes_per_batch is not None
         else configured_test_max_nodes_per_batch
     )
+    # [修复] 降低边预算因子
+    # 旧值 60 + protein_atom k=128 bug 导致 batch 静态边已接近显存上限，
+    # 而编码器 forward 中还会通过 radius() 动态创建跨图边（对 Sampler 不可见），
+    # 使实际 GPU 边数远超预算 → OOM。
+    # 修复 k→32 后静态边/图大幅下降，Sampler 会装入更多图，
+    # 必须同步下调因子为动态边预留 ~40-50% 显存 headroom。
+    # 注意：batch 变小不影响精度——accumulation_steps=8 保证了有效梯度规模。
+    train_edge_budget_factor = 40
 
     effective_min_train_nodes_per_batch = max(1, int(min_max_nodes_per_batch))
     effective_min_val_nodes_per_batch = max(
@@ -332,15 +340,17 @@ def train(
         _prev_loaders.clear()
         gc.collect()
 
+        train_edge_budget = max(1, int(train_max_nodes * train_edge_budget_factor))
+        val_edge_budget = max(1, int(val_max_nodes * train_edge_budget_factor))
         logger.info(
-            f"Using DynamicBatchSampler budgets: train_max_num={train_max_nodes}, "
-            f"val_max_num={val_max_nodes}."
+            f"Using DynamicBatchSampler budgets: train_max_num={train_edge_budget} (mode=edge), "
+            f"val_max_num={val_edge_budget} (mode=edge)."
         )
 
         train_sampler = DynamicBatchSampler(
             cast(Any, train_set),
-            max_num=train_max_nodes,
-            mode="node",
+            max_num=train_edge_budget,
+            mode="edge",
             shuffle=True,
         )
         train_loader_local = DataLoader(
@@ -352,10 +362,13 @@ def train(
             batch_sampler=train_sampler,
         )
 
+        # [修复] 验证集也使用 edge 模式进行批处理
+        # 旧逻辑使用 mode="node"，导致节点数受控但边数完全不可控，
+        # 几乎 100% 的验证 batch 都因超出 edge_guard_limit 而被 preflight skip
         val_sampler = DynamicBatchSampler(
             cast(Any, val_set),
-            max_num=val_max_nodes,
-            mode="node",
+            max_num=val_edge_budget,
+            mode="edge",
             shuffle=False,
         )
         val_loader_local = DataLoader(
@@ -468,6 +481,41 @@ def train(
     total_oom_batches = 0
     consecutive_clean_epochs = 0  # 连续无 OOM 的 epoch 计数，用于回升决策
     consecutive_clean_val_epochs = 0
+    oom_blacklisted_pdb_ids: set[str] = set()
+    oom_counts_by_pdb: dict[str, int] = {}
+    OOM_BLACKLIST_THRESHOLD = 2
+
+    def _extract_batch_pdb_ids(batch_obj: Any) -> list[str]:
+        pdb_attr = getattr(batch_obj, "pdb_id", None)
+
+        if pdb_attr is None:
+            return []
+
+        if isinstance(pdb_attr, str):
+            return [pdb_attr]
+
+        if isinstance(pdb_attr, (list, tuple)):
+            return [str(pid) for pid in pdb_attr]
+
+        try:
+            return [str(pid) for pid in list(pdb_attr)]
+        except Exception:
+            return [str(pdb_attr)]
+
+    def _estimate_batch_total_edges(batch_obj: Any) -> int:
+        total_edges = 0
+
+        edge_types = getattr(batch_obj, "edge_types", None)
+        if not edge_types:
+            return 0
+
+        for edge_type in edge_types:
+            edge_store = batch_obj[edge_type]
+            edge_index = getattr(edge_store, "edge_index", None)
+            if edge_index is not None and edge_index.ndim == 2:
+                total_edges += int(edge_index.size(1))
+
+        return total_edges
 
     for epoch in range(epochs):
         gc.collect()
@@ -482,6 +530,7 @@ def train(
         
         actual_batches = 0
         epoch_oom_batches = 0
+        epoch_edge_guard_skips = 0
         accumulated_graphs = 0  # 当前累积周期内的总图数
         consecutive_oom = 0     # 连续 OOM 计数，用于级联熔断
         CIRCUIT_BREAKER_LIMIT = 10  # 连续 OOM 达到此值则熔断当前 epoch
@@ -491,6 +540,32 @@ def train(
         for batch_idx, batch in enumerate(train_loader):
             num_graphs = int(batch["ligand_atom"].batch.max().item()) + 1
             pbar.update(num_graphs)
+            batch_pdb_ids = _extract_batch_pdb_ids(batch)
+
+            if oom_blacklisted_pdb_ids and batch_pdb_ids:
+                if any(pid in oom_blacklisted_pdb_ids for pid in batch_pdb_ids):
+                    blacklisted_in_batch = [pid for pid in batch_pdb_ids if pid in oom_blacklisted_pdb_ids]
+                    logger.warning(
+                        f"Batch {batch_idx}: skipping batch containing OOM-blacklisted samples "
+                        f"({len(blacklisted_in_batch)}/{len(batch_pdb_ids)} in batch)."
+                    )
+                    consecutive_oom = 0
+                    continue
+
+            total_edges_cpu = _estimate_batch_total_edges(batch)
+            edge_guard_limit = max(1, int(current_train_max_nodes_per_batch * train_edge_budget_factor))
+            if total_edges_cpu > edge_guard_limit:
+                epoch_edge_guard_skips += 1
+                if batch_pdb_ids:
+                    for pid in batch_pdb_ids:
+                        oom_blacklisted_pdb_ids.add(pid)
+                        oom_counts_by_pdb[pid] = max(oom_counts_by_pdb.get(pid, 0), OOM_BLACKLIST_THRESHOLD)
+                logger.warning(
+                    f"Batch {batch_idx}: preflight skip due to edge-heavy batch "
+                    f"(total_edges={total_edges_cpu} > limit={edge_guard_limit})."
+                )
+                consecutive_oom = 0
+                continue
             
             # 【全覆盖 OOM 安全网】
             # 包裹 batch.to(device) → 采样 → 前向 → 损失 → 反向 的完整流程
@@ -566,13 +641,24 @@ def train(
                 if consecutive_oom == 5:
                     logger.warning(
                         f"Batch {batch_idx}: {consecutive_oom} consecutive OOMs, "
-                        f"performing model CPU roundtrip to defragment VRAM."
+                        f"skipping model CPU roundtrip to avoid secondary OOM during restore."
                     )
-                    model.cpu()
-                    optimizer.zero_grad(set_to_none=True)
-                    gc.collect()
-                    torch.cuda.empty_cache()
-                    model.to(device)
+
+                newly_blacklisted: list[str] = []
+                if batch_pdb_ids:
+                    for pid in batch_pdb_ids:
+                        count = oom_counts_by_pdb.get(pid, 0) + 1
+                        oom_counts_by_pdb[pid] = count
+                        if count >= OOM_BLACKLIST_THRESHOLD and pid not in oom_blacklisted_pdb_ids:
+                            oom_blacklisted_pdb_ids.add(pid)
+                            newly_blacklisted.append(pid)
+
+                if newly_blacklisted:
+                    consecutive_oom = 0
+                    logger.warning(
+                        f"Batch {batch_idx}: blacklisted {len(newly_blacklisted)} repeatedly OOM samples; "
+                        f"total blacklisted={len(oom_blacklisted_pdb_ids)}."
+                    )
 
                 # 【级联熔断器】连续 OOM 达到阈值，立即退出当前 epoch
                 if consecutive_oom >= CIRCUIT_BREAKER_LIMIT:
@@ -584,7 +670,10 @@ def train(
                     break
 
                 if consecutive_oom <= 2:
-                    logger.warning(f"Batch {batch_idx}: CUDA OOM, skipping and clearing cache.")
+                    logger.warning(
+                        f"Batch {batch_idx}: CUDA OOM, skipping and clearing cache "
+                        f"(batch_total_edges={total_edges_cpu}, edge_guard_limit={edge_guard_limit})."
+                    )
                 continue
 
             # OOM 恢复：成功处理一个 batch 后重置连续 OOM 计数
@@ -771,6 +860,12 @@ def train(
             max_rmsd_batches=rmsd_check_batches,
             dataset=dataset,
             warmup_epochs=warmup_epochs,
+            # [修复] edge_guard 应基于实际的 val_edge_budget 并预留动态边余量
+            # 旧算法用 val_max_nodes * 60 = 360K，但批内实际边数远超该值
+            # 现在改为 val_edge_budget * 1.5，为前向传播动态边预留 50% headroom
+            edge_guard_limit=max(1, int(
+                current_val_max_nodes_per_batch * train_edge_budget_factor * 1.5
+            )),
         )
         
         # [新增] 验证结束，下一轮开始前的清理
@@ -847,7 +942,9 @@ def train(
             f"Median: {val_metrics.get('median_rmsd_final', float('inf')):.4f} | "
             f"Centroid: {val_metrics.get('centroid_dist_mean', float('inf')):.4f} | "
             f"Pearson: {val_metrics.get('pearson_r', 0):.4f} | "
-            f"OOM batches: epoch={epoch_oom_batches}, total={total_oom_batches}"
+            f"OOM batches: epoch={epoch_oom_batches}, total={total_oom_batches} | "
+            f"Edge-guard skips: {epoch_edge_guard_skips} | "
+            f"OOM-blacklisted samples: {len(oom_blacklisted_pdb_ids)}"
         )
 
         # 准备保存数据
@@ -902,6 +999,7 @@ def train(
                 max_rmsd_batches=max(10_000_000, len(test_set)),
                 dataset=dataset,
                 warmup_epochs=warmup_epochs,
+                edge_guard_limit=max(1, int(configured_test_max_nodes_per_batch * train_edge_budget_factor)),
             )
             if isinstance(test_metrics_raw, dict):
                 test_metrics = dict(test_metrics_raw)
@@ -919,6 +1017,7 @@ def train(
                 num_pose_samples=max(test_pose_samples, max(test_topk_values)),
                 ode_steps=50,
                 warmup_epochs=warmup_epochs,
+                edge_guard_limit=max(1, int(configured_topn_max_nodes_per_batch * train_edge_budget_factor)),
             )
             test_metrics.update(topn_metrics)
 
@@ -945,6 +1044,7 @@ def compute_validation_loss(
     max_rmsd_batches: int = 10,
     dataset: PDBBindDataset | None = None,
     warmup_epochs: int = 20,
+    edge_guard_limit: int | None = None,
 ) -> dict | float:
     """
     验证函数：计算 Loss 并统计全量 RMSD 指标
@@ -959,6 +1059,7 @@ def compute_validation_loss(
     
     valid_batches = 0
     oom_batches = 0
+    edge_guard_skips = 0
     
     # 固定随机种子 (保持验证集生成的一致性)
     if epoch is not None:
@@ -973,6 +1074,25 @@ def compute_validation_loss(
     for i, batch in enumerate(loader):
         num_graphs = int(batch["ligand_atom"].batch.max().item()) + 1
         pbar.update(num_graphs)
+
+        if edge_guard_limit is not None:
+            total_edges_cpu = 0
+            edge_types = getattr(batch, "edge_types", None)
+            if edge_types:
+                for edge_type in edge_types:
+                    edge_store = batch[edge_type]
+                    edge_index = getattr(edge_store, "edge_index", None)
+                    if edge_index is not None and edge_index.ndim == 2:
+                        total_edges_cpu += int(edge_index.size(1))
+
+            if total_edges_cpu > edge_guard_limit:
+                edge_guard_skips += 1
+                logger.warning(
+                    f"Validation batch {i}: preflight skip due to edge-heavy batch "
+                    f"(total_edges={total_edges_cpu} > limit={edge_guard_limit})."
+                )
+                continue
+
         try:
             batch = batch.to(device)
             x_1 = batch["ligand_atom"].pos
@@ -1176,6 +1296,7 @@ def compute_validation_loss(
     metrics["centroid_dist_median"] = median_centroid
     metrics["oom_batches"] = float(oom_batches)
     metrics["valid_batches"] = float(valid_batches)
+    metrics["edge_guard_skips"] = float(edge_guard_skips)
 
     if valid_batches == 0:
         metrics["val_loss"] = float("nan")
@@ -1203,6 +1324,7 @@ def evaluate_topn_success(
     num_pose_samples: int = 10,
     ode_steps: int = 50,
     warmup_epochs: int = 20,
+    edge_guard_limit: int | None = None,
 ) -> dict[str, float]:
     """
     基于多候选 pose 生成 + 亲和力排序，统计 Top-N 对接成功率。
@@ -1232,9 +1354,28 @@ def evaluate_topn_success(
     success_counts_5a = {k: 0.0 for k in topk_unique}
     mean_best_rmsd = {k: [] for k in topk_unique}
     total_graphs = 0
+    edge_guard_skips = 0
 
     for batch_idx, batch in enumerate(loader):
         try:
+            if edge_guard_limit is not None:
+                total_edges_cpu = 0
+                edge_types = getattr(batch, "edge_types", None)
+                if edge_types:
+                    for edge_type in edge_types:
+                        edge_store = batch[edge_type]
+                        edge_index = getattr(edge_store, "edge_index", None)
+                        if edge_index is not None and edge_index.ndim == 2:
+                            total_edges_cpu += int(edge_index.size(1))
+
+                if total_edges_cpu > edge_guard_limit:
+                    edge_guard_skips += 1
+                    logger.warning(
+                        f"Top-N eval batch {batch_idx}: preflight skip due to edge-heavy batch "
+                        f"(total_edges={total_edges_cpu} > limit={edge_guard_limit})."
+                    )
+                    continue
+
             batch = batch.to(device)
             x_ref = batch["ligand_atom"].pos
             lig_batch = batch["ligand_atom"].batch
@@ -1314,6 +1455,7 @@ def evaluate_topn_success(
     metrics: dict[str, float] = {
         "topn_total_graphs": float(total_graphs),
         "topn_pose_samples": float(num_pose_samples),
+        "topn_edge_guard_skips": float(edge_guard_skips),
     }
 
     for k in topk_unique:

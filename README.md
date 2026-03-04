@@ -13,7 +13,7 @@
 
 - **SE(3) × T^m 流形建模**：统一学习刚体平移、旋转与扭转速度场。
 - **层次化异构图编码**：原子与残基双尺度交互，兼顾几何细节与全局语义。
-- **动态节点预算批采样**：基于 `max_nodes_per_batch` 控制显存上限，训练更稳定。
+- **动态边预算批采样**：基于 `max_nodes_per_batch × edge_budget_factor` 的边预算控制显存上限，训练与验证均使用 edge 模式。
 - **工程化训练策略**：Spatial Curriculum、EMA、梯度累积与裁剪协同提升收敛质量。
 - **OOM 级联熔断器**：连续 OOM 时分级恢复（基础清理→深度重置→CPU 往返），级联时自动熔断当前 epoch。
 
@@ -146,7 +146,7 @@ uv run python scripts/organize_data.py \
 
 ### 推荐配置（24GB 单卡）
 
-说明：当前版本采用 **节点预算模式**。`--max_nodes_per_batch` 是显存占用的主控参数，
+说明：当前版本采用 **边预算模式**（`DynamicBatchSampler mode="edge"`）。实际单批边数上限 = `max_nodes_per_batch × edge_budget_factor`（内部硬编码 factor=40），训练与验证均按边数控制批大小。
 `--accumulation_steps` 用于在不增加峰值显存的情况下提升等效 batch。
 训练入口已自动设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128`。
 
@@ -229,8 +229,8 @@ tail -f logs/nohup.log
 | `--save_dir` | str | `./checkpoints` | 检查点保存目录 |
 | `--device` | str | `cuda:0` | 训练设备（`cuda:0`、`cuda:1`、`cpu` 等） |
 | `--epochs` | int | 100 | 训练轮数 |
-| `--max_nodes_per_batch` | int | 20000 | 动态批采样的单批最大节点数。决定了显存占用的上限。 |
-| `--val_max_nodes_per_batch` | int | `None` | 验证集节点预算。默认使用 `min(train_budget, 6000)`。 |
+| `--max_nodes_per_batch` | int | 20000 | 边预算基数。实际单批边上限 = 该值 × `edge_budget_factor`（内部 40）。 |
+| `--val_max_nodes_per_batch` | int | `None` | 验证集边预算基数。默认使用 `min(train_budget, 6000)`。 |
 | `--test_max_nodes_per_batch` | int | `None` | 最终测试集节点预算。默认与验证预算一致。 |
 | `--topn_max_nodes_per_batch` | int | `None` | Top-N 评估节点预算。默认与测试预算一致。 |
 | `--accumulation_steps` | int | 8 | 梯度累积步数，等效扩大 batch size |
@@ -270,12 +270,12 @@ tail -f logs/nohup.log
 
 ### OOM 说明（实践建议）
 
-- `max_nodes_per_batch` 仅限制节点数，不直接限制边数；高密度样本仍可能触发显存尖峰。
-- 推荐分离预算：训练保持高预算（如 20000）追求吞吐；验证/测试/Top-N 使用更稳的独立预算（如 6000/5000/4000）。
+- 训练与验证均使用 **边预算模式**（`DynamicBatchSampler mode="edge"`），按边数而非节点数控制显存。
+- 编码器前向传播会通过 `radius()` 动态重建跨图边（对 Sampler 不可见），edge_guard 以 1.5× 预留余量。
+- 推荐分离预算：训练保持高预算基数（如 20000）追求吞吐；验证/测试/Top-N 使用更稳的独立预算（如 6000/5000/4000）。
 - **级联熔断器**：连续 10 次 OOM 自动中断当前 epoch，避免数千次无效重试。
-- **分级恢复**：首次 OOM 基础清理→ 连续 3次深度重置→ 连续 5次模型 CPU 往返去碎片。
+- **分级恢复**：首次 OOM 基础清理→ 连续 3 次深度重置→ 连续 5 次模型 CPU 往返去碎片。
 - **验证自适应降批**：验证 OOM 达阈值后自动降低验证预算，不影响训练预算。
-- 20000 节点预算在 24GB 卡上 99%+ 的 batch 可正常通过，仅极少数边密度异常的样本会 OOM。
 - 若显存紧张，优先降低 `--max_nodes_per_batch`，其次降低 `--num_gnn_blocks`。
 - 在共享 GPU 场景，其他进程会挤占显存，建议训练前确认空闲显存。
 

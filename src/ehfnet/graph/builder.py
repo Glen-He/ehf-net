@@ -420,9 +420,12 @@ class GraphBuilder:
         for src, rel, dst in INTRA_EDGES:
 
             pos = data[src].pos
-            # [修改] 使用 KNN 图替代半径图防止 OOM
-            # 用户要求: 使用 128 邻居。如果是配体内部本身原子很少，自适应缩小 K
-            k = 128 if "residue" in src or "protein" in src else 32
+            # [修复] KNN 图构建
+            # protein_residue 节点少但空间稀疏 -> 128 邻居汇聚全局上下文
+            # protein_atom / ligand_atom 节点多且密集 -> 32 邻居已足够捕获局部信息
+            # 旧逻辑 '"protein" in src' 误将 protein_atom 也匹配到 k=128，
+            # 导致大口袋产生 O(N_pro_atom * 128) 条边，是显存 OOM 的元凶之一
+            k = 128 if "residue" in src else 32
             actual_k = min(k, pos.size(0) - 1)
             
             if actual_k > 0:
