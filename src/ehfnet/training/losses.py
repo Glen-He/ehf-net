@@ -26,7 +26,7 @@ class FlowMatchingLoss(nn.Module):
         characteristic_scale: float = 5.0,
         weight_trans: float = 1.0,
         weight_rot: float = 1.0,
-        weight_torsion: float = 0.2,
+        weight_torsion: float = 0.5,
         weight_energy: float = 0.05,
         weight_clash: float = 0.001,  # 初始极小权重：clash_batch 量级 O(10²)，须防止压垮 SE(3) 损失
     ) -> None:
@@ -96,7 +96,14 @@ class FlowMatchingLoss(nn.Module):
         if pred_rot is None or gt_rot is None:
             raise ValueError("Missing rotation data in predictions or targets.")
 
-        loss_rot = F.huber_loss(pred_rot * self.L, gt_rot * self.L, delta=1.0)
+        # [修复] Huber delta 应与 L 缩放匹配
+        # 旧代码: delta=1.0 在 L=5.0 缩放空间下等效于 raw 旋转误差 0.2 rad (≈11.5°)
+        # 这意味着任何 > 11.5° 的旋转预测误差都进入线性区，梯度恒定不随误差减小而增大。
+        # 课程学习达到全范围 (±π) 后，几乎所有旋转误差都在线性区，
+        # 导致模型丧失对旋转精度的细粒度优化信号 → RMSD 在 ~5.5Å 停滞。
+        # 修复: delta=L 使二次→线性转折点对应 raw 误差 1.0 rad (≈57°)，
+        # < 57° 误差获得更强的二次梯度，推动进一步收敛。
+        loss_rot = F.huber_loss(pred_rot * self.L, gt_rot * self.L, delta=self.L)
         loss_dict["loss_rot"] = loss_rot.detach()
 
         # 3. 扭转损失（周期性余弦损失）

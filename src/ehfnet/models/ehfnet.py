@@ -95,27 +95,26 @@ class EHFNet(nn.Module):
             affinity_stats=normalization_stats.get("affinity") if normalization_stats else None,
         )
 
-        # 扭转角速度 readout [T, H*2] → [T]
+        # 扭转角速度 readout [T, H*2+4] → [T]
+        # 输入：键两端原子特征(H*2) + 几何特征(4: sin/cos当前二面角 + 键长 + 移动侧原子数)
+        # 增强几何感知，容量加深至 3 层
         self.torsion_head = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim // 2),
+            nn.Linear(hidden_dim * 2 + 4, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
 
-        # 体帧旋转方向 readout [B, H] → [B, 3]
+        # 体帧旋转速度 readout [B, H] → [B, 3]
+        # 直接输出轴角向量（方向 × 角速度），不做 direction/magnitude 分离
+        # 避免 softplus 在小角度时的梯度消失问题
         self.rot_body_head = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 3),
-        )
-
-        # 旋转幅度 readout [B, H] → [B, 1]
-        self.rot_scale_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 4, 1),
         )
 
         # 平移幅度 readout [B, H] → [B, 1]
@@ -194,9 +193,8 @@ class EHFNet(nn.Module):
         v_translation = (gate * v_com_raw + (1.0 - gate) * v_mlp_trans) * trans_scale   # [B, 3]
 
         # 旋转：体帧 MLP → 世界帧等变角速度
-        omega_dir  = F.normalize(self.rot_body_head(lig_mol_feat), dim=-1, eps=1e-8)    # [B, 3]
-        rot_scale  = F.softplus(self.rot_scale_head(lig_mol_feat))                      # [B, 1]
-        omega_body = omega_dir * rot_scale                                              # [B, 3]
+        # 直接输出轴角向量，无 softplus / normalize 约束
+        omega_body = self.rot_body_head(lig_mol_feat)                                   # [B, 3]
         v_rotation = (R_frame @ omega_body.unsqueeze(-1)).squeeze(-1)                   # [B, 3]
 
         # 3. 扭转角速度
@@ -210,7 +208,33 @@ class EHFNet(nn.Module):
         if torsion_indices.numel() > 0 and torsion_indices.size(0) > 0:
             a1_feat = lig_atom_feat[torsion_indices[:, 1]]              # [T, H]
             a2_feat = lig_atom_feat[torsion_indices[:, 2]]              # [T, H]
-            bond_feat = torch.cat([a1_feat, a2_feat], dim=-1)           # [T, 2H]
+
+            # 几何特征：当前二面角的 sin/cos + 键长 + 移动侧原子数
+            lig_pos = data["ligand_atom"].pos
+            idx0, idx1 = torsion_indices[:, 0], torsion_indices[:, 1]
+            idx2, idx3 = torsion_indices[:, 2], torsion_indices[:, 3]
+
+            # 二面角
+            b0 = -(lig_pos[idx1] - lig_pos[idx0])
+            b1_vec = F.normalize(lig_pos[idx2] - lig_pos[idx1], dim=-1, eps=1e-8)
+            b2 = lig_pos[idx3] - lig_pos[idx2]
+            v_perp = b0 - (b0 * b1_vec).sum(-1, keepdim=True) * b1_vec
+            w_perp = b2 - (b2 * b1_vec).sum(-1, keepdim=True) * b1_vec
+            cos_dih = (v_perp * w_perp).sum(-1)                        # [T]
+            sin_dih = (torch.cross(b1_vec, v_perp, dim=-1) * w_perp).sum(-1)  # [T]
+
+            # 键长（归一化到 ~1）
+            bond_len = torch.norm(lig_pos[idx2] - lig_pos[idx1], dim=-1) / 1.5  # [T]
+
+            # 移动侧原子数（归一化）
+            tor_mask = getattr(data, "torsion_moving_mask", None)
+            if tor_mask is not None and tor_mask.numel() > 0:
+                n_moving = tor_mask.float().sum(-1) / max(lig_pos.shape[0], 1)  # [T]
+            else:
+                n_moving = torch.zeros(torsion_indices.size(0), device=device, dtype=lig_mol_feat.dtype)
+
+            geo_feat = torch.stack([cos_dih, sin_dih, bond_len, n_moving], dim=-1)  # [T, 4]
+            bond_feat = torch.cat([a1_feat, a2_feat, geo_feat], dim=-1)   # [T, 2H+4]
             v_torsion = self.torsion_head(bond_feat).squeeze(-1)        # [T]
         else:
             v_torsion = torch.zeros(0, device=device, dtype=lig_mol_feat.dtype)

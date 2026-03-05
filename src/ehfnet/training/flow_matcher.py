@@ -32,7 +32,7 @@ class ConditionalFlowMatcher:
         spatial_sigma_min: float = 1.0,
         spatial_sigma_max: float = 6.0,
         warmup_epochs: int = 20,
-        fd_dt: float = 0.05,
+        fd_dt: float = 0.01,
         rotation_angle_min: float = 0.2,
         rotation_angle_max: float = math.pi,
         torsion_scale_min: float = 0.1,

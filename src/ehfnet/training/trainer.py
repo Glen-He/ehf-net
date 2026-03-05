@@ -291,14 +291,8 @@ def train(
         if topn_max_nodes_per_batch is not None
         else configured_test_max_nodes_per_batch
     )
-    # [修复] 降低边预算因子
-    # 旧值 60 + protein_atom k=128 bug 导致 batch 静态边已接近显存上限，
-    # 而编码器 forward 中还会通过 radius() 动态创建跨图边（对 Sampler 不可见），
-    # 使实际 GPU 边数远超预算 → OOM。
-    # 修复 k→32 后静态边/图大幅下降，Sampler 会装入更多图，
-    # 必须同步下调因子为动态边预留 ~40-50% 显存 headroom。
-    # 注意：batch 变小不影响精度——accumulation_steps=8 保证了有效梯度规模。
-    train_edge_budget_factor = 40
+    # 边预算因子：实际 batch 边上限 = max_nodes_per_batch × 此因子
+    train_edge_budget_factor = 60
 
     effective_min_train_nodes_per_batch = max(1, int(min_max_nodes_per_batch))
     effective_min_val_nodes_per_batch = max(
@@ -384,10 +378,15 @@ def train(
         return train_loader_local, val_loader_local
 
     def _build_eval_loader(subset: Any, max_nodes: int) -> DataLoader:
+        # [修复] 使用 edge 模式代替 node 模式
+        # 旧逻辑用 mode="node" 导致 batch 边数不可控，跟 test/topn 的 edge_guard_limit 冲突，
+        # 引起几乎 100% preflight skip。改为 edge 模式后边数已在 sampler 层控制，
+        # edge_guard 只作为动态边余量安全网。
+        eval_edge_budget = max(1, int(max_nodes * train_edge_budget_factor))
         eval_sampler = DynamicBatchSampler(
             cast(Any, subset),
-            max_num=max_nodes,
-            mode="node",
+            max_num=eval_edge_budget,
+            mode="edge",
             shuffle=False,
         )
         return DataLoader(
@@ -999,7 +998,9 @@ def train(
                 max_rmsd_batches=max(10_000_000, len(test_set)),
                 dataset=dataset,
                 warmup_epochs=warmup_epochs,
-                edge_guard_limit=max(1, int(configured_test_max_nodes_per_batch * train_edge_budget_factor)),
+                # [修复] edge_guard 放宽至 1.5× edge budget，与 val 保持一致
+                # 旧值 = nodes * factor 在 node 模式下导致几乎全部 skip
+                edge_guard_limit=max(1, int(configured_test_max_nodes_per_batch * train_edge_budget_factor * 1.5)),
             )
             if isinstance(test_metrics_raw, dict):
                 test_metrics = dict(test_metrics_raw)
@@ -1017,7 +1018,8 @@ def train(
                 num_pose_samples=max(test_pose_samples, max(test_topk_values)),
                 ode_steps=50,
                 warmup_epochs=warmup_epochs,
-                edge_guard_limit=max(1, int(configured_topn_max_nodes_per_batch * train_edge_budget_factor)),
+                # [修复] edge_guard 放宽至 1.5× edge budget
+                edge_guard_limit=max(1, int(configured_topn_max_nodes_per_batch * train_edge_budget_factor * 1.5)),
             )
             test_metrics.update(topn_metrics)
 
@@ -1174,13 +1176,13 @@ def compute_validation_loss(
                     # [修改] 强制转 CPU，切断 GPU 显存占用
                     all_rmsd_init.append(rmsd_init.detach().cpu())
 
-                    # 执行推演（Euler 50 步，用于训练期间的趋势监控）
+                    # 执行推演（RK4 50 步，用于训练期间的趋势监控）
                     infer_batch["ligand_atom"].pos = x_0_infer
                     final_pos, _ = matcher.ode_solve(
                         model=model,
                         data=infer_batch,
                         steps=50,
-                        method="euler"
+                        method="rk4"
                     )
                     
                     # 记录最终 RMSD
@@ -1405,7 +1407,7 @@ def evaluate_topn_success(
                     model=model,
                     data=infer_batch,
                     steps=ode_steps,
-                    method="euler",
+                    method="rk4",
                 )
 
                 sq_diff = ((final_pos - x_ref) ** 2).sum(dim=-1)
