@@ -146,7 +146,7 @@ uv run python scripts/organize_data.py \
 
 ### 推荐配置（24GB 单卡）
 
-说明：当前版本采用 **边预算模式**（`DynamicBatchSampler mode="edge"`）。实际单批边数上限 = `max_nodes_per_batch × edge_budget_factor`（内部硬编码 factor=40），训练与验证均按边数控制批大小。
+说明：当前版本采用 **边预算模式**（`DynamicBatchSampler mode="edge"`）。实际单批边数上限 = `max_nodes_per_batch × edge_budget_factor`（内部硬编码 factor=60），训练与验证均按边数控制批大小。
 `--accumulation_steps` 用于在不增加峰值显存的情况下提升等效 batch。
 训练入口已自动设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128`。
 
@@ -229,7 +229,7 @@ tail -f logs/nohup.log
 | `--save_dir` | str | `./checkpoints` | 检查点保存目录 |
 | `--device` | str | `cuda:0` | 训练设备（`cuda:0`、`cuda:1`、`cpu` 等） |
 | `--epochs` | int | 100 | 训练轮数 |
-| `--max_nodes_per_batch` | int | 20000 | 边预算基数。实际单批边上限 = 该值 × `edge_budget_factor`（内部 40）。 |
+| `--max_nodes_per_batch` | int | 20000 | 边预算基数。实际单批边上限 = 该值 × `edge_budget_factor`（内部 60）。 |
 | `--val_max_nodes_per_batch` | int | `None` | 验证集边预算基数。默认使用 `min(train_budget, 6000)`。 |
 | `--test_max_nodes_per_batch` | int | `None` | 最终测试集节点预算。默认与验证预算一致。 |
 | `--topn_max_nodes_per_batch` | int | `None` | Top-N 评估节点预算。默认与测试预算一致。 |

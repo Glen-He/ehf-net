@@ -1176,13 +1176,13 @@ def compute_validation_loss(
                     # [修改] 强制转 CPU，切断 GPU 显存占用
                     all_rmsd_init.append(rmsd_init.detach().cpu())
 
-                    # 执行推演（RK4 50 步，用于训练期间的趋势监控）
+                    # 执行推演（Euler 50 步，用于训练期间的趋势监控）
                     infer_batch["ligand_atom"].pos = x_0_infer
                     final_pos, _ = matcher.ode_solve(
                         model=model,
                         data=infer_batch,
                         steps=50,
-                        method="rk4"
+                        method="euler"
                     )
                     
                     # 记录最终 RMSD
@@ -1407,7 +1407,7 @@ def evaluate_topn_success(
                     model=model,
                     data=infer_batch,
                     steps=ode_steps,
-                    method="rk4",
+                    method="euler",
                 )
 
                 sq_diff = ((final_pos - x_ref) ** 2).sum(dim=-1)
