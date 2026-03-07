@@ -36,6 +36,21 @@ from ehfnet.training.flow_matcher import ConditionalFlowMatcher
 logger = logging.getLogger(__name__)
 
 
+def apply_loss_context(
+    batch_obj: Any,
+    *,
+    current_epoch: int,
+    total_epochs_count: int,
+    warmup_epochs_count: int,
+    training: bool,
+) -> None:
+    progress = 1.0 if total_epochs_count <= 1 else current_epoch / max(1, total_epochs_count - 1)
+    warmup_end = min(1.0, warmup_epochs_count / max(1, total_epochs_count))
+    batch_obj.loss_progress = float(max(0.0, min(1.0, progress)))
+    batch_obj.loss_warmup_end = float(max(0.0, min(1.0, warmup_end)))
+    batch_obj.loss_is_training = bool(training)
+
+
 def train(
     *,
     data_root: str,
@@ -88,6 +103,8 @@ def train(
     min_val_max_nodes_per_batch: int | None = None,
     oom_recover_epochs: int = 3,
     oom_recover_factor: float = 1.1,
+    run_name: str | None = None,
+    run_log_file: str | None = None,
 ):
     """
     训练 EHFNet 模型
@@ -155,6 +172,10 @@ def train(
         
     os.makedirs(save_dir, exist_ok=True)
     logger.info(f"Using device: {device}")
+    if run_name is not None:
+        logger.info(f"Run name: {run_name}")
+    if run_log_file is not None:
+        logger.info(f"Run log file: {run_log_file}")
 
     torch.set_num_threads(1)
 
@@ -213,9 +234,27 @@ def train(
             + split_indices.get("val", [0])
             + split_indices.get("test", [0])
         )
-        if max_idx >= len(dataset):
+        cached_dataset_size = split_metadata.get("dataset_size")
+        cached_index_file = split_metadata.get("index_file")
+        cached_fractions = split_metadata.get("fractions", {})
+        current_index_file = os.path.abspath(index_file)
+        cached_index_file_abs = os.path.abspath(str(cached_index_file)) if cached_index_file is not None else None
+
+        split_cache_mismatch = any([
+            max_idx >= len(dataset),
+            cached_dataset_size != len(dataset),
+            cached_index_file_abs != current_index_file,
+            split_metadata.get("seed") != split_seed,
+            bool(split_metadata) and cached_fractions.get("train") != split_train_frac,
+            bool(split_metadata) and cached_fractions.get("val") != split_val_frac,
+            bool(split_metadata) and cached_fractions.get("test") != split_test_frac,
+        ])
+
+        if split_cache_mismatch:
             logger.warning(
-                f"Cached split file {split_cache_file} is incompatible with current dataset size={len(dataset)}; regenerating."
+                f"Cached split file {split_cache_file} is incompatible with current dataset configuration; regenerating. "
+                f"(cached_dataset_size={cached_dataset_size}, current_dataset_size={len(dataset)}, "
+                f"cached_index_file={cached_index_file}, current_index_file={current_index_file})"
             )
             split_indices = splitter.split_indices(
                 dataset,
@@ -232,7 +271,7 @@ def train(
                     "test": split_test_frac,
                 },
                 "dataset_size": len(dataset),
-                "index_file": index_file,
+                "index_file": current_index_file,
             }
             ScaffoldSplitter.save_split(split_cache_file, split_indices, metadata=split_metadata)
         else:
@@ -254,7 +293,7 @@ def train(
                 "test": split_test_frac,
             },
             "dataset_size": len(dataset),
-            "index_file": index_file,
+            "index_file": os.path.abspath(index_file),
         }
         ScaffoldSplitter.save_split(split_cache_file, split_indices, metadata=split_metadata)
         logger.info(f"Saved split indices to {split_cache_file}")
@@ -299,6 +338,112 @@ def train(
     # 必须同步下调因子为动态边预留 ~40-50% 显存 headroom。
     # 注意：batch 变小不影响精度——accumulation_steps=8 保证了有效梯度规模。
     train_edge_budget_factor = 40
+    eval_edge_guard_headroom = 1.5
+
+    def _safe_metric(value: Any, default: float, *, higher_is_better: bool = True) -> float:
+        try:
+            metric = float(value)
+        except Exception:
+            return default
+
+        if math.isnan(metric) or math.isinf(metric):
+            return default
+
+        return metric
+
+    def _build_selection_metrics(metrics: dict[str, Any]) -> dict[str, float]:
+        success_2a = _safe_metric(metrics.get("success_2a"), 0.0)
+        success_5a = _safe_metric(metrics.get("success_5a"), 0.0)
+        mean_rmsd = _safe_metric(metrics.get("mean_rmsd_final"), 1e9, higher_is_better=False)
+        val_loss = _safe_metric(metrics.get("val_loss"), 1e9, higher_is_better=False)
+        composite_score = 1.5 * success_2a + 0.15 * success_5a - 0.8 * mean_rmsd
+
+        return {
+            "composite_score": composite_score,
+            "success_2a": success_2a,
+            "success_5a": success_5a,
+            "mean_rmsd": mean_rmsd,
+            "val_loss": val_loss,
+        }
+
+    def _is_better_checkpoint(
+        candidate: dict[str, float],
+        incumbent: dict[str, float] | None,
+        *,
+        primary_key: str,
+        primary_higher_is_better: bool,
+        tol: float = 1e-6,
+    ) -> bool:
+        if incumbent is None:
+            return True
+
+        candidate_primary = candidate[primary_key]
+        incumbent_primary = incumbent[primary_key]
+
+        if primary_higher_is_better:
+            if candidate_primary > incumbent_primary + tol:
+                return True
+            if candidate_primary < incumbent_primary - tol:
+                return False
+        else:
+            if candidate_primary < incumbent_primary - tol:
+                return True
+            if candidate_primary > incumbent_primary + tol:
+                return False
+
+        if candidate["success_2a"] > incumbent["success_2a"] + tol:
+            return True
+        if candidate["success_2a"] < incumbent["success_2a"] - tol:
+            return False
+
+        if candidate["success_5a"] > incumbent["success_5a"] + tol:
+            return True
+        if candidate["success_5a"] < incumbent["success_5a"] - tol:
+            return False
+
+        if candidate["mean_rmsd"] < incumbent["mean_rmsd"] - tol:
+            return True
+        if candidate["mean_rmsd"] > incumbent["mean_rmsd"] + tol:
+            return False
+
+        if candidate["val_loss"] < incumbent["val_loss"] - tol:
+            return True
+        if candidate["val_loss"] > incumbent["val_loss"] + tol:
+            return False
+
+        return False
+
+    def _annotate_loss_context(batch_obj: Any, *, current_epoch: int, total_epochs_count: int, warmup_epochs_count: int, training: bool) -> None:
+        apply_loss_context(
+            batch_obj,
+            current_epoch=current_epoch,
+            total_epochs_count=total_epochs_count,
+            warmup_epochs_count=warmup_epochs_count,
+            training=training,
+        )
+
+    def _compose_checkpoint(
+        *,
+        epoch_idx: int,
+        avg_train_loss_value: float,
+        val_metrics_obj: dict[str, Any],
+        selection_metrics: dict[str, float],
+    ) -> dict[str, Any]:
+        return {
+            "epoch": epoch_idx,
+            "run_name": run_name,
+            "run_log_file": run_log_file,
+            "model_state_dict": model.state_dict(),
+            "ema_model_state_dict": ema_model.module.state_dict() if ema_model is not None else model.state_dict(),
+            "loss_state_dict": criterion.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "best_val_loss": best_val_loss,
+            "best_rmsd": best_rmsd,
+            "avg_train_loss": avg_train_loss_value,
+            "val_metrics": dict(val_metrics_obj),
+            "selection_metrics": dict(selection_metrics),
+        }
 
     effective_min_train_nodes_per_batch = max(1, int(min_max_nodes_per_batch))
     effective_min_val_nodes_per_batch = max(
@@ -384,10 +529,11 @@ def train(
         return train_loader_local, val_loader_local
 
     def _build_eval_loader(subset: Any, max_nodes: int) -> DataLoader:
+        eval_edge_budget = max(1, int(max_nodes * train_edge_budget_factor))
         eval_sampler = DynamicBatchSampler(
             cast(Any, subset),
-            max_num=max_nodes,
-            mode="node",
+            max_num=eval_edge_budget,
+            mode="edge",
             shuffle=False,
         )
         return DataLoader(
@@ -420,8 +566,10 @@ def train(
     logger.info(f"Validation Sampling: Check RMSD for {rmsd_check_batches}/{total_val_batches} batches ({rmsd_check_ratio*100:.1f}%)")
     logger.info(
         "Evaluation budgets: "
-        f"test_max_num={configured_test_max_nodes_per_batch}, "
-        f"topn_max_num={configured_topn_max_nodes_per_batch}."
+        f"test_nodes={configured_test_max_nodes_per_batch}, "
+        f"test_edges={max(1, int(configured_test_max_nodes_per_batch * train_edge_budget_factor))}, "
+        f"topn_nodes={configured_topn_max_nodes_per_batch}, "
+        f"topn_edges={max(1, int(configured_topn_max_nodes_per_batch * train_edge_budget_factor))}."
     )
 
     # 3. 准备模型组件
@@ -478,6 +626,9 @@ def train(
     # 5. 训练循环
     best_val_loss = float("inf")
     best_rmsd = float("inf")
+    best_composite_metrics: dict[str, float] | None = None
+    best_success2a_metrics: dict[str, float] | None = None
+    best_rmsd_metrics: dict[str, float] | None = None
     total_oom_batches = 0
     consecutive_clean_epochs = 0  # 连续无 OOM 的 epoch 计数，用于回升决策
     consecutive_clean_val_epochs = 0
@@ -556,10 +707,6 @@ def train(
             edge_guard_limit = max(1, int(current_train_max_nodes_per_batch * train_edge_budget_factor))
             if total_edges_cpu > edge_guard_limit:
                 epoch_edge_guard_skips += 1
-                if batch_pdb_ids:
-                    for pid in batch_pdb_ids:
-                        oom_blacklisted_pdb_ids.add(pid)
-                        oom_counts_by_pdb[pid] = max(oom_counts_by_pdb.get(pid, 0), OOM_BLACKLIST_THRESHOLD)
                 logger.warning(
                     f"Batch {batch_idx}: preflight skip due to edge-heavy batch "
                     f"(total_edges={total_edges_cpu} > limit={edge_guard_limit})."
@@ -572,6 +719,13 @@ def train(
             # OOM 可能发生在任何 GPU 操作点：数据迁移、EGNN 消息传递、梯度计算
             try:
                 batch = batch.to(device)
+                _annotate_loss_context(
+                    batch,
+                    current_epoch=epoch,
+                    total_epochs_count=epochs,
+                    warmup_epochs_count=warmup_epochs,
+                    training=True,
+                )
 
                 # 流匹配训练步骤
                 # 生成训练目标不需要梯度
@@ -727,6 +881,8 @@ def train(
                 }
             )
 
+            del predictions, loss_dict, loss, loss_sum, targets, x_1, x_t, t, batch
+
         # 循环结束，如果有剩余积累的梯度，进行最后一次 step
         if accumulated_graphs > 0:
             for param in model.parameters():
@@ -749,6 +905,9 @@ def train(
             optimizer.zero_grad()
 
         pbar.close()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         avg_train_loss = train_loss_meter / max(1, actual_batches)
 
         if epoch_oom_batches > 0:
@@ -947,28 +1106,72 @@ def train(
             f"OOM-blacklisted samples: {len(oom_blacklisted_pdb_ids)}"
         )
 
-        # 准备保存数据
-        checkpoint = {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "ema_model_state_dict": ema_model.module.state_dict() if ema_model is not None else model.state_dict(),
-            "loss_state_dict": criterion.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "best_val_loss": best_val_loss,
-            "best_rmsd": best_rmsd,
-        }
+        selection_metrics = _build_selection_metrics(val_metrics)
+        logger.info(
+            "Checkpoint selection metrics | "
+            f"Composite: {selection_metrics['composite_score']:.4f} | "
+            f"Success@2A: {selection_metrics['success_2a']:.2f} | "
+            f"Success@5A: {selection_metrics['success_5a']:.2f} | "
+            f"Mean RMSD: {selection_metrics['mean_rmsd']:.4f} | "
+            f"Val Loss: {selection_metrics['val_loss']:.4f}"
+        )
+
+        checkpoint = _compose_checkpoint(
+            epoch_idx=epoch,
+            avg_train_loss_value=avg_train_loss,
+            val_metrics_obj=val_metrics,
+            selection_metrics=selection_metrics,
+        )
 
         # 1. 始终保存最新模型（作为保底）
         torch.save(checkpoint, os.path.join(save_dir, "latest_model.pt"))
 
-        # 2. Best model：Curriculum 结束后 + RMSD 创新低时保存
+        # 2. Best model：Curriculum 结束后按多指标分别保存
         is_warmup = epoch < warmup_epochs
-        if not is_warmup and mean_rmsd < best_rmsd:
-            best_rmsd = mean_rmsd
-            checkpoint["best_rmsd"] = best_rmsd
-            torch.save(checkpoint, os.path.join(save_dir, "best_model.pt"))
-            logger.info(f"Saved best model with Mean Final RMSD: {best_rmsd:.4f}")
+        if not is_warmup:
+            if _is_better_checkpoint(
+                selection_metrics,
+                best_composite_metrics,
+                primary_key="composite_score",
+                primary_higher_is_better=True,
+            ):
+                best_composite_metrics = dict(selection_metrics)
+                torch.save(checkpoint, os.path.join(save_dir, "best_composite_model.pt"))
+                torch.save(checkpoint, os.path.join(save_dir, "best_model.pt"))
+                logger.info(
+                    "Saved best composite model | "
+                    f"Composite={selection_metrics['composite_score']:.4f}, "
+                    f"Success@2A={selection_metrics['success_2a']:.2f}, "
+                    f"Success@5A={selection_metrics['success_5a']:.2f}, "
+                    f"Mean RMSD={selection_metrics['mean_rmsd']:.4f}."
+                )
+
+            if _is_better_checkpoint(
+                selection_metrics,
+                best_success2a_metrics,
+                primary_key="success_2a",
+                primary_higher_is_better=True,
+            ):
+                best_success2a_metrics = dict(selection_metrics)
+                torch.save(checkpoint, os.path.join(save_dir, "best_success2a_model.pt"))
+                logger.info(
+                    "Saved best Success@2A model | "
+                    f"Success@2A={selection_metrics['success_2a']:.2f}, "
+                    f"Success@5A={selection_metrics['success_5a']:.2f}, "
+                    f"Mean RMSD={selection_metrics['mean_rmsd']:.4f}."
+                )
+
+            if _is_better_checkpoint(
+                selection_metrics,
+                best_rmsd_metrics,
+                primary_key="mean_rmsd",
+                primary_higher_is_better=False,
+            ):
+                best_rmsd_metrics = dict(selection_metrics)
+                best_rmsd = selection_metrics["mean_rmsd"]
+                checkpoint["best_rmsd"] = best_rmsd
+                torch.save(checkpoint, os.path.join(save_dir, "best_rmsd_model.pt"))
+                logger.info(f"Saved best Mean RMSD model: {best_rmsd:.4f}")
 
         # 3. 每 10 轮保存一个永久备份
         if (epoch + 1) % 10 == 0:
@@ -979,13 +1182,19 @@ def train(
         if len(test_set) == 0:
             logger.warning("Test set is empty; skipping final test evaluation.")
         else:
-            best_ckpt_path = os.path.join(save_dir, "best_model.pt")
-            if os.path.exists(best_ckpt_path):
-                ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=False)
-                best_state = ckpt.get("ema_model_state_dict", ckpt.get("model_state_dict"))
-                if best_state is not None:
-                    model.load_state_dict(best_state)
-                    logger.info(f"Loaded best checkpoint for final test evaluation: {best_ckpt_path}")
+            preferred_ckpt_paths = [
+                os.path.join(save_dir, "best_composite_model.pt"),
+                os.path.join(save_dir, "best_model.pt"),
+                os.path.join(save_dir, "best_rmsd_model.pt"),
+            ]
+            for best_ckpt_path in preferred_ckpt_paths:
+                if os.path.exists(best_ckpt_path):
+                    ckpt = torch.load(best_ckpt_path, map_location=device, weights_only=False)
+                    best_state = ckpt.get("ema_model_state_dict", ckpt.get("model_state_dict"))
+                    if best_state is not None:
+                        model.load_state_dict(best_state)
+                        logger.info(f"Loaded best checkpoint for final test evaluation: {best_ckpt_path}")
+                        break
 
             test_loader = _build_eval_loader(test_set, configured_test_max_nodes_per_batch)
             test_metrics_raw = compute_validation_loss(
@@ -999,7 +1208,9 @@ def train(
                 max_rmsd_batches=max(10_000_000, len(test_set)),
                 dataset=dataset,
                 warmup_epochs=warmup_epochs,
-                edge_guard_limit=max(1, int(configured_test_max_nodes_per_batch * train_edge_budget_factor)),
+                edge_guard_limit=max(1, int(
+                    configured_test_max_nodes_per_batch * train_edge_budget_factor * eval_edge_guard_headroom
+                )),
             )
             if isinstance(test_metrics_raw, dict):
                 test_metrics = dict(test_metrics_raw)
@@ -1017,7 +1228,9 @@ def train(
                 num_pose_samples=max(test_pose_samples, max(test_topk_values)),
                 ode_steps=50,
                 warmup_epochs=warmup_epochs,
-                edge_guard_limit=max(1, int(configured_topn_max_nodes_per_batch * train_edge_budget_factor)),
+                edge_guard_limit=max(1, int(
+                    configured_topn_max_nodes_per_batch * train_edge_budget_factor * eval_edge_guard_headroom
+                )),
             )
             test_metrics.update(topn_metrics)
 
@@ -1095,6 +1308,13 @@ def compute_validation_loss(
 
         try:
             batch = batch.to(device)
+            apply_loss_context(
+                batch,
+                current_epoch=epoch if epoch is not None else total_epochs - 1,
+                total_epochs_count=total_epochs,
+                warmup_epochs_count=warmup_epochs,
+                training=False,
+            )
             x_1 = batch["ligand_atom"].pos
 
             # 1. 计算 Loss (用于早停和模型选择)
@@ -1180,7 +1400,8 @@ def compute_validation_loss(
                         model=model,
                         data=infer_batch,
                         steps=50,
-                        method="euler"
+                        method="euler",
+                        store_trajectory=False,
                     )
                     
                     # 记录最终 RMSD
@@ -1195,6 +1416,9 @@ def compute_validation_loss(
                     true_centroid = scatter_mean(x_1, infer_batch["ligand_atom"].batch, dim=0, dim_size=B_infer)
                     centroid_dist = torch.norm(pred_centroid - true_centroid, dim=-1)  # [B_infer]
                     all_centroid_dist.append(centroid_dist.detach().cpu())
+
+                    del infer_batch, x_0_infer, final_pos, sq_diff_init, msd_init, rmsd_init
+                    del sq_diff_final, msd_final, rmsd_final, pred_centroid, true_centroid, centroid_dist
                     
                 except Exception as e:
                     logger.warning(f"RMSD inference failed for batch {i}: {e}")
@@ -1216,6 +1440,8 @@ def compute_validation_loss(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             continue
+
+        del predictions, targets, loss_dict, loss, x_1, x_t, t, batch
 
     # ========== 综合评估指标计算 ==========
     metrics: dict[str, float] = {}
@@ -1406,6 +1632,7 @@ def evaluate_topn_success(
                     data=infer_batch,
                     steps=ode_steps,
                     method="euler",
+                    store_trajectory=False,
                 )
 
                 sq_diff = ((final_pos - x_ref) ** 2).sum(dim=-1)
@@ -1418,6 +1645,8 @@ def evaluate_topn_success(
                 score_out = model(score_batch, score_t)
                 score = score_out["binding_affinity"].view(-1)
                 candidate_scores.append(score.detach().cpu())
+
+                del infer_batch, score_batch, x0, final_pos, sq_diff, rmsd_per_graph, score_t, score_out, score
 
             rmsd_mat = torch.stack(candidate_rmsd, dim=1)    # [B, P]
             score_mat = torch.stack(candidate_scores, dim=1) # [B, P]
@@ -1433,6 +1662,8 @@ def evaluate_topn_success(
                 mean_best_rmsd[k].append(best_rmsd_k)
 
             total_graphs += B
+
+            del batch, x_ref, lig_batch, masses, candidate_rmsd, candidate_scores, rmsd_mat, score_mat, rank_idx
 
         except torch.cuda.OutOfMemoryError:
             logger.warning(f"Top-N eval batch {batch_idx}: CUDA OOM, skipping.")

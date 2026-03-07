@@ -12,7 +12,6 @@ from ehfnet.geometry.static import (
 )
 from ehfnet.geometry.dynamics import (
     PhysicsConstants,
-    VelocityDecomposer,
     PoseUpdater,
     PathInterpolator,
 )
@@ -26,7 +25,6 @@ __all__ = [
     # 物理常量
     "PhysicsConstants",
     # 动态几何计算（训练/推理）
-    "VelocityDecomposer",
     "PoseUpdater",
     "PathInterpolator",
 ]

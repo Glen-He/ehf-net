@@ -123,7 +123,8 @@ def main():
     os.makedirs(log_dir, exist_ok=True)
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = os.path.join(log_dir, f"train_{timestamp}.log")
+    run_name = f"train_{timestamp}"
+    log_file = os.path.join(log_dir, f"{run_name}.log")
 
     logging.basicConfig(
         level=logging.INFO,
@@ -135,11 +136,14 @@ def main():
     )
     
     logging.info(f"Logging to {log_file}")
-    
-    # 创建保存目录
+
+    # 为当前运行创建独立输出目录，避免覆盖历史 checkpoint/report
+    base_save_dir = args.save_dir
+    args.save_dir = os.path.join(base_save_dir, run_name)
     os.makedirs(args.save_dir, exist_ok=True)
 
     logger = logging.getLogger(__name__)
+    logger.info(f"Run artifacts will be saved to {args.save_dir}")
     logger.info(f"Starting training with arguments: {args}")
 
     # 加载归一化统计数据
@@ -220,6 +224,8 @@ def main():
             min_val_max_nodes_per_batch=args.min_val_max_nodes_per_batch,
             oom_recover_epochs=args.oom_recover_epochs,
             oom_recover_factor=args.oom_recover_factor,
+            run_name=run_name,
+            run_log_file=log_file,
         )
     except Exception as e:
         logger.error(f"Training failed: {e}", exc_info=True)

@@ -12,7 +12,7 @@ import logging
 from torch import Tensor
 from torch_geometric.data import HeteroData
 import torch.nn.functional as F
-from ehfnet.geometry.dynamics import PathInterpolator, PoseUpdater, PhysicsConstants, compute_center_of_mass, VelocityDecomposer
+from ehfnet.geometry.dynamics import PathInterpolator, PoseUpdater, PhysicsConstants, compute_center_of_mass, TangentTargetProjector
 
 
 logger = logging.getLogger(__name__)
@@ -44,7 +44,7 @@ class ConditionalFlowMatcher:
             spatial_sigma_min: 空间课程学习起始平移尺度 (Å)
             spatial_sigma_max: 空间课程学习结束平移尺度 (Å)
             warmup_epochs: 课程学习预热轮数
-            fd_dt: 速度有限差分步长，透传至 PathInterpolator（v = Δpos / fd_dt）
+            fd_dt: 有限差分步长，透传至 PathInterpolator（路径导数 = Δpos / fd_dt）
             rotation_angle_min: 初始最大旋转角（弧度）
             rotation_angle_max: 最终最大旋转角（弧度）
             torsion_scale_min: 初始扭转角缩放系数
@@ -65,7 +65,7 @@ class ConditionalFlowMatcher:
 
         self.interpolator = PathInterpolator(eps=PhysicsConstants.EPSILON, fd_dt=fd_dt)
         self.updater = PoseUpdater(eps=PhysicsConstants.EPSILON)
-        self.decomposer = VelocityDecomposer(eps=PhysicsConstants.EPSILON)
+        self.target_projector = TangentTargetProjector(eps=PhysicsConstants.EPSILON)
 
 
     def get_curriculum_ratio(self, epoch: int) -> float:
@@ -163,19 +163,19 @@ class ConditionalFlowMatcher:
             torsion_moving_mask=torsion_moving_mask,
         )
 
-        # 4. 插值得到 x_t 和瞬时笛卡尔速度 v_t
+        # 4. 插值得到 x_t 和瞬时笛卡尔路径导数
         try:
-            x_t, v_t = self.interpolator.interpolate(path_params, t)
-            # [移除] 不再对笛卡尔速度做硬截断，decomposer 内部已处理饱和
+            x_t, cartesian_velocity = self.interpolator.interpolate(path_params, t)
+            # [移除] 不再对笛卡尔路径导数做硬截断，投影器内部已处理饱和
         except Exception as e:
             logger.error(f"Error during interpolation: {e}")
             x_t = x_0
-            v_t = torch.zeros_like(x_0)
+            cartesian_velocity = torch.zeros_like(x_0)
 
-        # 5. [核心] 将笛卡尔速度分解为 SE(3) x T^m 切向量，彻底消灭极端速度问题
-        v_trans, v_rot, v_torsion = self.decomposer.decompose(
+        # 5. [核心] 将笛卡尔路径导数投影为 SE(3) x T^m 监督目标
+        v_trans, v_rot, v_torsion = self.target_projector.decompose(
             pos=x_t,
-            vel=v_t,
+            vel=cartesian_velocity,
             masses=masses,
             batch=batch,
             torsion_indices=torsion_indices,
@@ -200,7 +200,8 @@ class ConditionalFlowMatcher:
         steps: int = 20,
         inference_t_start: float = 0.0,
         method: str = "rk4",
-    ) -> tuple[Tensor, list[Tensor]]:
+        store_trajectory: bool = False,
+    ) -> tuple[Tensor, list[Tensor] | None]:
         """
         [推理接口] 生成轨迹
 
@@ -210,6 +211,8 @@ class ConditionalFlowMatcher:
             steps: 积分步数
             inference_t_start: 起始时间（通常为 0.0）
             method: 积分方法（"euler" 或 "rk4"）
+            store_trajectory: 是否保留整条轨迹；验证/Top-N 评估通常只需最终坐标，
+                              关闭可显著降低显存峰值
 
         Returns:
             final_pos: 最终生成的坐标 [N, 3]
@@ -233,7 +236,7 @@ class ConditionalFlowMatcher:
             torsion_indices = None
             torsion_moving_mask = None
 
-        trajectory = [current_pos.clone()]
+        trajectory = [current_pos.clone()] if store_trajectory else None
         dt = (1.0 - inference_t_start) / steps
         B = int(batch.max().item()) + 1
 
@@ -359,7 +362,8 @@ class ConditionalFlowMatcher:
                         dt=dt,
                     )
 
-                trajectory.append(current_pos.clone())
+                if trajectory is not None:
+                    trajectory.append(current_pos.clone())
 
         return current_pos, trajectory
 

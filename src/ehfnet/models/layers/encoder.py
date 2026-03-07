@@ -245,7 +245,7 @@ class EHFEncoder(nn.Module):
             aggr="mean",
             update_coors=True,    # 全部 block 启用坐标更新：每层 EGNN 输出的坐标增量
                                   # 通过多步迭代积累等变位移信号；
-                                  # encoder 通过 vel_dict = pos_final - pos_init 返回给 EHFNet。
+                                  # encoder 通过 displacement_dict = pos_final - pos_init 返回给 EHFNet。
             update_feats=True,
             dropout=dropout_rate,
             norm_feats=True,
@@ -835,25 +835,25 @@ class EHFEncoder(nn.Module):
                 cast(nn.ModuleDict, block), x_dict, pos_dict, edge_dict, full_pos_dict
             )
 
-        # 计算速度：v = pos_out - pos_in
-        vel_dict: dict[str, Tensor] = {}
+        # 计算累计位移：delta_pos = pos_out - pos_in
+        displacement_dict: dict[str, Tensor] = {}
 
         for nt in pos_dict:
 
             if nt in pos_input:
-                vel_dict[nt] = pos_dict[nt] - pos_input[nt]
+                displacement_dict[nt] = pos_dict[nt] - pos_input[nt]
 
             else:
-                vel_dict[nt] = torch.zeros_like(pos_dict[nt])
+                displacement_dict[nt] = torch.zeros_like(pos_dict[nt])
 
-        # 如果冻结蛋白，将蛋白速度设为零，坐标恢复为初始值
-        if self.fix_protein and "protein_atom" in vel_dict:
-            vel_dict["protein_atom"] = torch.zeros_like(vel_dict["protein_atom"])
+        # 如果冻结蛋白，将蛋白位移设为零，坐标恢复为初始值
+        if self.fix_protein and "protein_atom" in displacement_dict:
+            displacement_dict["protein_atom"] = torch.zeros_like(displacement_dict["protein_atom"])
             pos_dict["protein_atom"] = pos_input["protein_atom"]
 
         return {
             "x_dict": x_dict,
             "pos_dict": pos_dict,
-            "vel_dict": vel_dict,
+            "displacement_dict": displacement_dict,
             "initial_ligand_pos": initial_lig_pos,
         }

@@ -226,7 +226,7 @@ tail -f logs/nohup.log
 |------|------|--------|------|
 | `--data_root` | str | — | 数据根目录路径 |
 | `--index_file` | str | — | 索引 CSV 文件路径 |
-| `--save_dir` | str | `./checkpoints` | 检查点保存目录 |
+| `--save_dir` | str | `./checkpoints` | 运行产物根目录。每次训练会自动创建与日志同名的子目录，如 `checkpoints/train_20260307_153000/`。 |
 | `--device` | str | `cuda:0` | 训练设备（`cuda:0`、`cuda:1`、`cpu` 等） |
 | `--epochs` | int | 100 | 训练轮数 |
 | `--max_nodes_per_batch` | int | 20000 | 边预算基数。实际单批边上限 = 该值 × `edge_budget_factor`（内部 40）。 |
@@ -286,10 +286,16 @@ tail -f logs/nohup.log
 - **分项损失**：`loss_trans` / `loss_rot` / `loss_torsion` / `loss_energy` / `loss_clash`
 - **验证 RMSD**：Init RMSD → Final RMSD，以及 <2Å 和 <5Å 成功率
 - **日志文件**：`logs/train/train_{timestamp}.log`
+- **运行目录**：`checkpoints/train_{timestamp}/`
+- **最新模型**：`checkpoints/train_{timestamp}/latest_model.pt`
+- **组合最优模型**：`checkpoints/train_{timestamp}/best_composite_model.pt`
+- **2Å 成功率最优模型**：`checkpoints/train_{timestamp}/best_success2a_model.pt`
+- **Mean RMSD 最优模型**：`checkpoints/train_{timestamp}/best_rmsd_model.pt`
+- **兼容别名**：`checkpoints/train_{timestamp}/best_model.pt`（指向组合最优语义）
 
 训练结束后（若启用 `--run_test_after_training`）额外输出：
 
-- **独立测试集报告**：`checkpoints/reports/test_metrics.json`
+- **独立测试集报告**：`checkpoints/train_{timestamp}/reports/test_metrics.json`
 - **Top-N 指标**：`top1/top5/top10` 在 `<2Å` 和 `<5Å` 下的成功率，以及 Top-N 最优 RMSD 的均值/中位数
 
 ## Ablation Protocol (2-run)

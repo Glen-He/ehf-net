@@ -53,6 +53,84 @@ class FlowMatchingLoss(nn.Module):
             "clash": weight_clash,
         }
 
+        self.curriculum_weights = {
+            "coarse": {
+                "trans": 1.2,
+                "rot": 0.8,
+                "torsion": 0.05,
+                "energy": 0.0,
+                "clash": 0.0,
+            },
+            "transition": {
+                "trans": 1.0,
+                "rot": 1.0,
+                "torsion": 0.25,
+                "energy": 0.08,
+                "clash": 0.01,
+            },
+            "refine": {
+                "trans": 0.8,
+                "rot": 1.2,
+                "torsion": 0.6,
+                "energy": 0.20,
+                "clash": 0.03,
+            },
+        }
+
+    @staticmethod
+    def _clamp_progress(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    @staticmethod
+    def _lerp_dict(start: dict[str, float], end: dict[str, float], alpha: float) -> dict[str, float]:
+        alpha = max(0.0, min(1.0, float(alpha)))
+        return {
+            key: float(start[key] + (end[key] - start[key]) * alpha)
+            for key in start
+        }
+
+    @staticmethod
+    def _smoothstep(edge0: float, edge1: float, value: float) -> float:
+        if edge1 <= edge0:
+            return 1.0 if value >= edge1 else 0.0
+        t = (value - edge0) / (edge1 - edge0)
+        t = max(0.0, min(1.0, t))
+        return t * t * (3.0 - 2.0 * t)
+
+    def _get_loss_schedule(self, data: Any) -> dict[str, float]:
+        progress = self._clamp_progress(getattr(data, "loss_progress", 0.0))
+        warmup_end = self._clamp_progress(getattr(data, "loss_warmup_end", 0.2))
+        refine_start = 0.70
+
+        if progress <= warmup_end:
+            alpha = 1.0 if warmup_end <= 1e-8 else progress / max(warmup_end, 1e-8)
+            return self._lerp_dict(
+                self.curriculum_weights["coarse"],
+                self.curriculum_weights["transition"],
+                alpha,
+            )
+
+        if progress <= refine_start:
+            return dict(self.curriculum_weights["transition"])
+
+        alpha = (progress - refine_start) / max(1.0 - refine_start, 1e-8)
+        return self._lerp_dict(
+            self.curriculum_weights["transition"],
+            self.curriculum_weights["refine"],
+            alpha,
+        )
+
+    def _get_pose_focus_gate(self, data: Any, t_val: Tensor | None, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+        progress = self._clamp_progress(getattr(data, "loss_progress", 0.0))
+        epoch_gate = self._smoothstep(0.15, 0.85, progress)
+
+        if t_val is None:
+            return torch.tensor(epoch_gate, device=device, dtype=dtype)
+
+        tau = 0.90 - 0.25 * progress
+        pose_gate = torch.sigmoid((t_val.to(dtype=dtype) - tau) / 0.07)
+        return pose_gate * epoch_gate
+
     def forward(
         self,
         predictions: dict[str, Tensor | None],
@@ -79,6 +157,7 @@ class FlowMatchingLoss(nn.Module):
             raise ValueError("Key 'v_translation' is missing in predictions.")
 
         device = pred_trans.device
+        schedule = self._get_loss_schedule(data)
 
         # 1. 平移损失
         gt_trans = targets.get("v_trans_target")
@@ -136,18 +215,23 @@ class FlowMatchingLoss(nn.Module):
 
             else:
                 t_val = getattr(data, "t", None)
+                pose_focus_gate = self._get_pose_focus_gate(
+                    data,
+                    t_val,
+                    device=device,
+                    dtype=pred_affinity.dtype,
+                )
 
                 if t_val is not None:
-                    # 仅在 t > 0.8 时（配体已较为靠近真实结合态）计算亲和力损失
-                    # 过早计算会用不靠谱的中间状态的能量信号挤压 SE(3) 梯度容量
-                    valid_mask = t_val > 0.8
-
-                    if valid_mask.any():
-                        loss_energy = F.huber_loss(
-                            pred_affinity[valid_mask].view(-1),
-                            gt_affinity[valid_mask].view(-1),
-                            delta=2.0,
-                        )
+                    per_sample_energy = F.huber_loss(
+                        pred_affinity.view(-1),
+                        gt_affinity.view(-1),
+                        delta=2.0,
+                        reduction="none",
+                    )
+                    gate_sum = pose_focus_gate.sum()
+                    if gate_sum > 1e-8:
+                        loss_energy = (per_sample_energy * pose_focus_gate).sum() / gate_sum
                 else:
                     # 兼容性回退：无时间步信息时直接计算
                     loss_energy = F.huber_loss(
@@ -159,30 +243,38 @@ class FlowMatchingLoss(nn.Module):
         # 5. 位阻惩罚损失（时间感知动态惩罚 Time-Aware Dynamic Penalty）
         # 使用 t⁴ 平滑曲线取代硬阈值 t>0.8，让惩罚在后期（配体已进入口袋）时急剧上升，
         # 同时避免阈值跳变导致的梯度不连续震荡
-        max_clash_weight = 0.01  # t=1 时的最大有效权重
         loss_clash = torch.tensor(0.0, device=device)
         clash_batch = predictions.get("steric_clash_batch")
 
         if clash_batch is not None and not torch.isnan(clash_batch).any():
             t_val = getattr(data, "t", None)
-
-            if t_val is not None and t_val.numel() > 0:
-                # t⁴ 动态权重：t=0.5→0.004, t=0.7→0.015, t=0.8→0.026, t=0.9→0.043, t=1.0→0.065
-                # 在 t<0.5 时几乎为零，t>0.8 时快速增长
-                dynamic_weight = max_clash_weight * (t_val ** 4)         # [B]
-                # clash_batch [B] × dynamic_weight [B] → 加权后取平均
-                loss_clash = (clash_batch * dynamic_weight).mean()
+            pose_focus_gate = self._get_pose_focus_gate(
+                data,
+                t_val,
+                device=device,
+                dtype=clash_batch.dtype,
+            )
+            gate_sum = pose_focus_gate.sum() if pose_focus_gate.ndim > 0 else pose_focus_gate
+            if torch.is_tensor(gate_sum):
+                if gate_sum > 1e-8:
+                    loss_clash = (clash_batch.view(-1) * pose_focus_gate.view(-1)).sum() / gate_sum
+            elif gate_sum > 1e-8:
+                loss_clash = clash_batch.mean() * float(gate_sum)
 
         loss_dict["loss_clash"] = loss_clash.detach()
+        loss_dict["weight_trans"] = torch.tensor(schedule["trans"], device=device)
+        loss_dict["weight_rot"] = torch.tensor(schedule["rot"], device=device)
+        loss_dict["weight_torsion"] = torch.tensor(schedule["torsion"], device=device)
+        loss_dict["weight_energy"] = torch.tensor(schedule["energy"], device=device)
+        loss_dict["weight_clash"] = torch.tensor(schedule["clash"], device=device)
 
         # 6. 总损失
-        # 注意：loss_clash 已内含动态权重，不再乘以 self.weights["clash"]
         total_loss = (
-            self.weights["trans"] * loss_trans
-            + self.weights["rot"] * loss_rot
-            + self.weights["torsion"] * loss_torsion
-            + self.weights["energy"] * loss_energy
-            + loss_clash  # 动态权重已内置
+            schedule["trans"] * loss_trans
+            + schedule["rot"] * loss_rot
+            + schedule["torsion"] * loss_torsion
+            + schedule["energy"] * loss_energy
+            + schedule["clash"] * loss_clash
         )
 
         loss_dict["total"] = total_loss

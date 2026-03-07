@@ -244,6 +244,15 @@ class PredictionHead(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
         )
 
+        self.force_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
         self.global_correction_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.SiLU(),
@@ -279,7 +288,7 @@ class PredictionHead(nn.Module):
             lig_mol_feat: 配体分子特征 [B, H]
 
         Returns:
-            binding_affinity 和 steric_clash_batch 的字典
+            binding_affinity、steric_clash_batch、局部相互作用上下文与 force-like 信号的字典
         """
 
         device = lig_atom_feat.device
@@ -292,6 +301,8 @@ class PredictionHead(nn.Module):
 
             return {
                 "binding_affinity": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
+                "ligand_interaction_context": torch.zeros_like(lig_atom_feat),
+                "ligand_force": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
             }
 
         # 1. 邻居搜索
@@ -351,6 +362,8 @@ class PredictionHead(nn.Module):
             return {
                 "binding_affinity": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
                 "steric_clash_batch": torch.zeros(B, device=device, dtype=torch.float32),
+                "ligand_interaction_context": torch.zeros_like(lig_atom_feat),
+                "ligand_force": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
             }
 
         i_idx = edge_index[0]
@@ -385,10 +398,16 @@ class PredictionHead(nn.Module):
         lig_feat_sel = lig_atom_feat[i_idx]
         pro_feat_sel = pro_atom_feat[j_idx]
         pair_input = torch.cat([lig_feat_sel, pro_feat_sel, edge_feat], dim=-1)
+        rel_vec = pro_pos_sel - lig_pos_sel
+        rel_dir = rel_vec / dist.unsqueeze(-1).clamp(min=PredictionConstants.MIN_DISTANCE)
 
         # 3. 能量预测
         E_ij_raw = self.pairwise_energy_mlp(pair_input).squeeze(-1)
         E_ij = E_ij_raw * cutoff_weights
+
+        learned_force_mag = torch.tanh(self.force_mlp(pair_input).squeeze(-1)) * self.force_limit
+        clash_push = torch.nn.functional.relu(2.2 - dist) * 6.0
+        force_edge = (learned_force_mag.unsqueeze(-1) * rel_dir) - (clash_push.unsqueeze(-1) * rel_dir)
 
         # 先在配体原子维度按有效边权做归一化，再在样本维度做均值归一化
         edge_mass_per_atom = scatter_add(cutoff_weights, i_idx, dim=0, dim_size=N_lig)
@@ -438,6 +457,8 @@ class PredictionHead(nn.Module):
         weighted_V = V_sel * gate.unsqueeze(-1) * attn_weights.unsqueeze(-1)
         context_atom = scatter_add(weighted_V, i_idx, dim=0, dim_size=N_lig)
         context_atom = self.norm(context_atom + lig_atom_feat)
+        force_atom = scatter_add(force_edge, i_idx, dim=0, dim_size=N_lig)
+        force_atom = force_atom / edge_mass_per_atom.unsqueeze(-1).clamp(min=PredictionConstants.EPSILON)
 
         # 归一化聚合
         context_sum = scatter_add(context_atom, lig_batch, dim=0, dim_size=B)
@@ -461,6 +482,8 @@ class PredictionHead(nn.Module):
         return {
             "binding_affinity": binding_affinity,
             "steric_clash_batch": steric_clash_batch,
+            "ligand_interaction_context": context_atom,
+            "ligand_force": force_atom,
         }
 
 

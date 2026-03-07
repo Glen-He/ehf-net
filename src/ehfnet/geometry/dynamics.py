@@ -163,11 +163,12 @@ class PhysicsConstants:
     MIN_ROTATION_ANGLE = 1e-6   # 最小旋转角度（弧度）
 
 
-class VelocityDecomposer:
+class TangentTargetProjector:
     """
-    速度场分解器
+    切空间目标投影器
 
-    将原子速度场分解为物理约束的分量：
+    将环境空间中的原子级笛卡尔导数投影到模型使用的
+    SE(3) x T^m 切空间目标：
     - 刚体平移速度
     - 刚体旋转速度
     - 扭转角速度
@@ -193,11 +194,11 @@ class VelocityDecomposer:
         torsion_moving_mask: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """
-        联合最小二乘法分解速度场。
+        联合最小二乘法将笛卡尔导数投影为切空间目标。
 
         Args:
             pos: 原子坐标 [N, 3]
-            vel: 原子速度 [N, 3]
+            vel: 原子级笛卡尔导数 [N, 3]
             masses: 原子质量 [N] 或 [N, 1]
             batch: 批次索引 [N]
             torsion_indices: 扭转角定义 [T, 4]
@@ -225,7 +226,7 @@ class VelocityDecomposer:
         total_dofs = 6 * B + T
 
         # 1. 预计算质心（质量加权）
-        # 注意：在分解速度时，我们将坐标视为常数，只对速度求导
+        # 注意：在投影切空间目标时，我们将坐标视为常数，只对笛卡尔导数做线性投影
         # 这可以极大地提高数值稳定性，避免 SVD/Solve 在反向传播时的梯度爆炸
         pos_const = pos.detach()
         if masses.dim() == 1:
@@ -234,7 +235,7 @@ class VelocityDecomposer:
         com = compute_center_of_mass(pos_const, batch, masses, dim_size=B)
         r_rel = pos_const - com[batch]
 
-        # 2. 构建线性方程组 Ax = v
+        # 2. 构建线性方程组 Ax = v_cartesian
         A = torch.zeros((N * 3, total_dofs), device=device, dtype=dtype)
 
         # 2.1 填充刚体基（平移+旋转）
