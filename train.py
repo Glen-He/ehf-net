@@ -61,6 +61,28 @@ def main():
     parser.add_argument("--esm_dim", type=int, default=960, help="ESM embedding dimension (default: 960 for ESMC-300M)")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use for training (e.g., 'cuda:0', 'cuda:1', 'cpu')")
     parser.add_argument("--pocket_radius", type=float, default=12.0, help="Radius (A) for protein pocket extraction (default: 12.0)")
+    parser.add_argument("--candidate_root", type=str, default=None, help="Root directory of cached docking candidates")
+    parser.add_argument("--candidate_source", type=str, default="vina", help="Candidate source name under candidate_root")
+    parser.add_argument(
+        "--train_mode",
+        type=str,
+        default="random",
+        choices=["random", "candidate", "mixed"],
+        help="Initial pose mode for refinement training",
+    )
+    parser.add_argument(
+        "--candidate_sampling_strategy",
+        type=str,
+        default="uniform",
+        choices=["uniform", "near_native", "medium", "hard", "mixed"],
+        help="How to sample one candidate per complex from CandidateStore",
+    )
+    parser.add_argument(
+        "--candidate_init_ratio",
+        type=float,
+        default=0.7,
+        help="For mixed mode, probability of using candidate init instead of random init",
+    )
     parser.add_argument("--warmup_epochs", type=int, default=20, help="Number of warmup epochs for spatial curriculum learning (default: 20)")
     parser.add_argument("--rmsd_ratio", type=float, default=0.2, help="Ratio of validation set to compute RMSD (0.0-1.0)")
     parser.add_argument("--accumulation_steps", type=int, default=8, help="Gradient accumulation steps")
@@ -192,6 +214,11 @@ def main():
             esm_dim=args.esm_dim,
             device=args.device,
             pocket_radius=args.pocket_radius,
+            candidate_root=args.candidate_root,
+            candidate_source=args.candidate_source,
+            train_mode=args.train_mode,
+            candidate_sampling_strategy=args.candidate_sampling_strategy,
+            candidate_init_ratio=args.candidate_init_ratio,
             normalization_stats=normalization_stats,
             warmup_epochs=args.warmup_epochs,
             rmsd_check_ratio=args.rmsd_ratio,

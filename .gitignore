@@ -17,6 +17,7 @@ logs/
 outputs/
 nohup.out
 checkpoints/
+docs/
 
 # IDE files
 .idea/

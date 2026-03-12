@@ -8,6 +8,7 @@
 import numpy as np
 
 from typing import Any, cast
+from pathlib import Path
 
 import torch
 from rdkit import Chem
@@ -32,21 +33,40 @@ def load_ligand(ligand_path: str) -> Chem.Mol:
         RDKit Mol 对象（去氢后）
     """
 
-    if ligand_path.endswith(".mol2"):
-        mol = Chem.MolFromMol2File(ligand_path, sanitize=False)
+    fallback_paths: list[str] = []
+    if ligand_path.endswith(".sdf"):
+        fallback_paths.append(ligand_path[:-4] + ".mol2")
 
-    else:
-        suppl = Chem.SDMolSupplier(ligand_path, sanitize=False)
-        mol = suppl[0] if len(suppl) > 0 else None
+    candidate_paths = [ligand_path] + [path for path in fallback_paths if Path(path).exists()]
+    last_error: Exception | None = None
+    mol = None
+
+    for candidate_path in candidate_paths:
+        try:
+            if candidate_path.endswith(".mol2"):
+                mol = Chem.MolFromMol2File(candidate_path, sanitize=False)
+            else:
+                suppl = Chem.SDMolSupplier(candidate_path, sanitize=False)
+                mol = suppl[0] if len(suppl) > 0 else None
+
+            if mol is None:
+                continue
+
+            try:
+                Chem.SanitizeMol(mol)
+            except Exception:
+                mol.UpdatePropertyCache(strict=False)
+
+            ligand_path = candidate_path
+            break
+        except Exception as exc:
+            last_error = exc
+            mol = None
 
     if mol is None:
+        if last_error is not None:
+            raise ValueError(f"Failed to load ligand: {ligand_path} ({last_error})") from last_error
         raise ValueError(f"Failed to load ligand: {ligand_path}")
-
-    try:
-        Chem.SanitizeMol(mol)
-
-    except Exception:
-        mol.UpdatePropertyCache(strict=False)
 
     mol = Chem.RemoveHs(mol)
 

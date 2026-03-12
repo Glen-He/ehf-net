@@ -71,6 +71,11 @@ def train(
     esm_dim: int = 960,
     device: str | torch.device = "auto",
     pocket_radius: float | None = 20.0,
+    candidate_root: str | None = None,
+    candidate_source: str = "vina",
+    train_mode: str = "random",
+    candidate_sampling_strategy: str = "uniform",
+    candidate_init_ratio: float = 0.7,
     normalization_stats: dict | None = None,
     warmup_epochs: int = 20,
     rmsd_check_ratio: float = 0.2,
@@ -128,6 +133,11 @@ def train(
         esm_dim: ESM embedding 维度
         device: 训练设备 ("cpu", "cuda", "cuda:0", "cuda:1" 等)，默认为 "auto" (自动检测)
         pocket_radius: 口袋提取半径 (Å)
+        candidate_root: 候选构象缓存根目录（可选）
+        candidate_source: 候选来源名称
+        train_mode: 初始构象模式（random/candidate/mixed）
+        candidate_sampling_strategy: 数据集侧单样本候选采样策略
+        candidate_init_ratio: mixed 模式下使用 candidate-init 的概率
         normalization_stats: 归一化统计数据
         warmup_epochs: 空间课程学习预热轮数
         rmsd_check_ratio: 验证集中计算 RMSD 的样本比例 (0.0 ~ 1.0)
@@ -196,6 +206,9 @@ def train(
         esm="auto",
         esm_dim=esm_dim,
         pocket_radius=pocket_radius,
+        candidate_root=candidate_root,
+        candidate_source=candidate_source,
+        candidate_sampling_strategy=candidate_sampling_strategy,
         interaction_profile="atom_only" if ablation_mode == "inter_multiscale_off" else "full",
     )
 
@@ -636,6 +649,14 @@ def train(
     oom_counts_by_pdb: dict[str, int] = {}
     OOM_BLACKLIST_THRESHOLD = 2
 
+    if train_mode not in {"random", "candidate", "mixed"}:
+        raise ValueError(f"Unsupported train_mode: {train_mode}")
+
+    logger.info(
+        f"Refinement training mode: train_mode={train_mode}, candidate_source={candidate_source}, "
+        f"candidate_sampling_strategy={candidate_sampling_strategy}, candidate_init_ratio={candidate_init_ratio:.2f}"
+    )
+
     def _extract_batch_pdb_ids(batch_obj: Any) -> list[str]:
         pdb_attr = getattr(batch_obj, "pdb_id", None)
 
@@ -668,6 +689,61 @@ def train(
 
         return total_edges
 
+    def _build_training_x0(batch_obj: Any, current_epoch: int) -> tuple[torch.Tensor | None, str]:
+        if train_mode == "random":
+            return None, "random"
+
+        candidate_pos = getattr(batch_obj, "candidate_init_pos", None)
+        candidate_available = getattr(batch_obj, "candidate_init_available", None)
+
+        if candidate_pos is None or candidate_available is None:
+            return None, "random"
+
+        try:
+            available_mask = candidate_available.to(
+                device=batch_obj["ligand_atom"].pos.device,
+                dtype=torch.bool,
+            ).view(-1)
+        except Exception:
+            return None, "random"
+
+        if available_mask.numel() == 0 or not bool(available_mask.any().item()):
+            return None, "random"
+
+        if train_mode == "mixed":
+            ratio = max(0.0, min(1.0, float(candidate_init_ratio)))
+            if bool(torch.rand(1).item() >= ratio):
+                return None, "random"
+
+        lig_pos = batch_obj["ligand_atom"].pos
+        lig_batch = batch_obj["ligand_atom"].batch
+        masses = batch_obj["ligand_atom"].masses
+        torsion_indices = getattr(batch_obj, "torsion_indices", None)
+        torsion_moving_mask = getattr(batch_obj, "torsion_moving_mask", None)
+        B = int(lig_batch.max().item()) + 1 if lig_batch is not None else 1
+
+        candidate_pos = candidate_pos.to(device=lig_pos.device, dtype=lig_pos.dtype)
+
+        if bool(available_mask.all().item()):
+            return candidate_pos, "candidate"
+
+        random_x0 = matcher._generate_random_pose(
+            x_ref=lig_pos,
+            batch=lig_batch,
+            B=B,
+            masses=masses,
+            torsion_indices=torsion_indices,
+            torsion_moving_mask=torsion_moving_mask,
+            epoch=current_epoch,
+        )
+        mixed_x0 = random_x0.clone()
+
+        for graph_id in torch.where(available_mask)[0].tolist():
+            node_mask = lig_batch == int(graph_id)
+            mixed_x0[node_mask] = candidate_pos[node_mask]
+
+        return mixed_x0, "mixed-candidate"
+
     for epoch in range(epochs):
         gc.collect()
         if torch.cuda.is_available():
@@ -686,6 +762,9 @@ def train(
         consecutive_oom = 0     # 连续 OOM 计数，用于级联熔断
         CIRCUIT_BREAKER_LIMIT = 10  # 连续 OOM 达到此值则熔断当前 epoch
         epoch_fused = False     # 本 epoch 是否被熔断
+        epoch_candidate_batches = 0
+        epoch_random_batches = 0
+        epoch_candidate_rmsd: list[float] = []
         optimizer.zero_grad()   # 在循环外初始化梯度清零
 
         for batch_idx, batch in enumerate(train_loader):
@@ -731,9 +810,27 @@ def train(
                 # 生成训练目标不需要梯度
                 with torch.no_grad():
                     x_1 = batch["ligand_atom"].pos
+                    x_0_train, init_mode = _build_training_x0(batch, epoch)
+                    if init_mode == "random":
+                        epoch_random_batches += 1
+                    else:
+                        epoch_candidate_batches += 1
+                        candidate_rmsd_attr = getattr(batch, "candidate_init_rmsd", None)
+                        candidate_available_attr = getattr(batch, "candidate_init_available", None)
+                        if candidate_rmsd_attr is not None and candidate_available_attr is not None:
+                            valid_candidate_mask = candidate_available_attr.to(
+                                device=candidate_rmsd_attr.device,
+                                dtype=torch.bool,
+                            ).view(-1)
+                            if valid_candidate_mask.any():
+                                valid_rmsd = candidate_rmsd_attr[valid_candidate_mask]
+                                valid_rmsd = valid_rmsd[torch.isfinite(valid_rmsd)]
+                                if valid_rmsd.numel() > 0:
+                                    epoch_candidate_rmsd.extend(valid_rmsd.detach().cpu().tolist())
                     t, x_t, targets = matcher.sample_location_and_target(
                         x_1=x_1,
                         data=batch,
+                        x_0=x_0_train,
                         current_epoch=epoch,
                         total_epochs=epochs,
                     )
@@ -916,6 +1013,17 @@ def train(
                 f"(total OOM batches={total_oom_batches})"
                 + (" [circuit breaker triggered]" if epoch_fused else "")
                 + "."
+            )
+
+        if epoch_candidate_batches > 0:
+            candidate_rmsd_mean = float(np.mean(epoch_candidate_rmsd)) if epoch_candidate_rmsd else float("nan")
+            logger.info(
+                f"Epoch {epoch+1}: init distribution random_batches={epoch_random_batches}, "
+                f"candidate_batches={epoch_candidate_batches}, sampled_candidate_rmsd_mean={candidate_rmsd_mean:.3f}"
+            )
+        else:
+            logger.info(
+                f"Epoch {epoch+1}: init distribution random_batches={epoch_random_batches}, candidate_batches=0"
             )
 
         # 【自适应降批】熔断 epoch 或 OOM 超阈值时降低节点预算

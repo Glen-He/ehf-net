@@ -21,6 +21,7 @@ from torch_geometric.data import Dataset, HeteroData
 
 from ehfnet.graph import GraphBuilder, ESMEmbeddingFiller
 from ehfnet.datasets.prepare import prepare_graph, get_esm_model
+from ehfnet.datasets.candidate_store import CandidateStore
 
 
 logger = logging.getLogger(__name__)
@@ -163,6 +164,9 @@ class PDBBindDataset(Dataset):
         force_reprocess: bool = False,
         esm_dim: int = 960,
         pocket_radius: float | None = 20.0,
+        candidate_root: str | None = None,
+        candidate_source: str = "vina",
+        candidate_sampling_strategy: str = "uniform",
     ) -> None:
         """
         Args:
@@ -182,6 +186,9 @@ class PDBBindDataset(Dataset):
             force_reprocess: 是否强制重建缓存
             esm_dim: ESM embedding 维度
             pocket_radius: 口袋提取半径 (Å)。设为 None 则不进行裁剪。
+            candidate_root: 候选构象缓存根目录（可选）
+            candidate_source: 候选来源名称（vina/smina/gnina/...）
+            candidate_sampling_strategy: 单样本候选采样策略
         """
         self.index_file = index_file
         self.esm_root = esm_root
@@ -190,6 +197,9 @@ class PDBBindDataset(Dataset):
         self.force_reprocess = force_reprocess
         self.esm_dim = esm_dim
         self.pocket_radius = pocket_radius
+        self.candidate_root = candidate_root
+        self.candidate_source = candidate_source
+        self.candidate_sampling_strategy = candidate_sampling_strategy
 
         self.index_df = load_index(index_file)
 
@@ -221,6 +231,7 @@ class PDBBindDataset(Dataset):
         )
 
         self._esm_model = None
+        self.candidate_store = CandidateStore(candidate_root, candidate_source) if candidate_root else None
         
         # [新增] 计算亲和力统计数据用于归一化
         self.affinity_stats = self._compute_affinity_stats()
@@ -427,6 +438,7 @@ class PDBBindDataset(Dataset):
         file_path = osp.join(self.processed_dir, f"data_{pdb_id}.pt")
 
         data = cast(HeteroData, torch.load(file_path, weights_only=False))
+        self._attach_training_candidate(data, pdb_id)
         
         # [新增] 几何合理性检查：检测原子间最小距离，防止奇异解
         if "ligand_atom" in data and hasattr(data["ligand_atom"], "pos"):
@@ -463,3 +475,52 @@ class PDBBindDataset(Dataset):
             data.y_energy = (raw_val - mean) / std
             
         return data
+
+    def _attach_training_candidate(self, data: HeteroData, pdb_id: str) -> None:
+        """
+        按需为单个样本附加一个 sampled candidate。
+
+        注意：这里故意只挂一个 candidate，而不是整池候选，避免 DataLoader / GPU 显存被放大。
+        """
+
+        gt_pos = data["ligand_atom"].pos
+        candidate_pos = gt_pos.clone()
+        candidate_available = torch.tensor(False, dtype=torch.bool)
+        candidate_score = torch.tensor(float("nan"), dtype=torch.float32)
+        candidate_rmsd = torch.tensor(float("nan"), dtype=torch.float32)
+        candidate_source_id = torch.tensor(0, dtype=torch.long)
+        candidate_index = torch.tensor(-1, dtype=torch.long)
+
+        if self.candidate_store is not None:
+            try:
+                record = self.candidate_store.sample_candidate(
+                    pdb_id,
+                    strategy=self.candidate_sampling_strategy,
+                )
+                if record is not None:
+                    if record.pos.shape != gt_pos.shape:
+                        logger.warning(
+                            f"Candidate atom shape mismatch for {pdb_id}: candidate={tuple(record.pos.shape)} gt={tuple(gt_pos.shape)}"
+                        )
+                    else:
+                        candidate_pos = record.pos.to(dtype=gt_pos.dtype)
+                        candidate_available = torch.tensor(True, dtype=torch.bool)
+                        candidate_score = torch.tensor(
+                            float(record.score) if record.score is not None else float("nan"),
+                            dtype=torch.float32,
+                        )
+                        candidate_rmsd = torch.tensor(
+                            float(record.rmsd) if record.rmsd is not None else float("nan"),
+                            dtype=torch.float32,
+                        )
+                        candidate_source_id = torch.tensor(int(record.source_id), dtype=torch.long)
+                        candidate_index = torch.tensor(int(record.candidate_index), dtype=torch.long)
+            except Exception as exc:
+                logger.warning(f"Failed to attach candidate for {pdb_id}: {exc}")
+
+        data.candidate_init_pos = candidate_pos
+        data.candidate_init_available = candidate_available
+        data.candidate_init_score = candidate_score
+        data.candidate_init_rmsd = candidate_rmsd
+        data.candidate_init_source_id = candidate_source_id
+        data.candidate_init_index = candidate_index
