@@ -1,0 +1,90 @@
+# EHFNet default training config
+# Code keeps built-in defaults; this file overrides the high-frequency knobs.
+
+[data]
+data_root = "data/processed/pdbbind"
+index_file = "data/processed/pdbbind/index.csv"
+save_dir = "./checkpoints"
+device = "cuda:0"
+protein_context_mode = "full"
+
+[model]
+hidden_dim = 128
+num_gnn_blocks = 4
+esm_dim = 960
+pocket_radius = 10.0
+
+[training]
+epochs = 100
+lr = 1e-4
+weight_decay = 1e-6
+clip_grad = 1.0
+warmup_epochs = 20
+accumulation_steps = 8
+ema_decay = 0.999
+
+[split]
+split_train_frac = 0.7
+split_val_frac = 0.1
+split_test_frac = 0.2
+split_seed = 42
+
+[batching]
+max_nodes_per_batch = 20000
+val_max_nodes_per_batch = 6000
+test_max_nodes_per_batch = 5000
+topn_max_nodes_per_batch = 4000
+dataloader_num_workers = 4
+dataloader_pin_memory = true
+dataloader_persistent_workers = true
+enable_oom_adaptive_batch = true
+enable_val_oom_adaptive_batch = true
+
+[blind_inference]
+test_topk = "1,5,10"
+test_pose_samples = 10
+val_ode_steps = 50
+center_proposal_topk = 8
+center_refine_topk = 3
+center_nms_radius = 6.0
+stage1_pose_samples = 2
+stage2_pose_samples = 4
+
+[proposal]
+center_proposal_weight = 0.15
+center_positive_radius = 4.0
+crop_candidate_topk = 8
+disable_jitter_crop = false
+disable_hard_negative_crop = false
+
+[ranking]
+pose_ranking_pair_weight = 0.2
+pose_ranking_margin = 0.5
+
+[bootstrap]
+pose_bootstrap_weight = 0.05
+pose_bootstrap_frequency = 25
+pose_bootstrap_ode_steps = 10
+
+[blind_pool]
+# Replay-based reranker training from blind candidate pool.
+# Pool is refreshed periodically; current model re-scores cached poses.
+blind_pool_refresh_every = 5
+blind_pool_start_epoch = 10
+blind_pool_max_complexes = 500
+blind_pool_cache_bce_weight = 1.0
+blind_pool_cache_rank_weight = 1.0
+blind_pool_pairs_per_complex = 4
+
+[checkpoint]
+checkpoint_selection_mode = "composite"
+
+[fusion]
+enable_fusion_calibration = true
+fusion_search_center_weights = "0,0.15,0.25,0.35,0.5,0.65"
+fusion_search_aff_weights = "0"
+fusion_search_clash_weights = "0"
+
+[ablation]
+ablation_mode = "none"
+run_test_after_training = true

@@ -26,14 +26,42 @@ from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
 from torch_scatter import scatter_mean
 
 from ehfnet.models import EHFNet
-from ehfnet.graph import GraphCollator
+from ehfnet.graph import GraphCollator, crop_graph_to_center
 from ehfnet.datasets.pdbbind import PDBBindDataset
 from ehfnet.datasets.splitter import ScaffoldSplitter
 from ehfnet.training.losses import FlowMatchingLoss
 from ehfnet.training.flow_matcher import ConditionalFlowMatcher
+from ehfnet.training.blind_pool import (
+    refresh_blind_candidate_pool,
+    save_blind_pool,
+    load_blind_pool,
+    BlindCandidateReplayDataset,
+    replay_and_compute_losses,
+    should_refresh_pool,
+    get_pool_stats,
+)
+from ehfnet.training.candidate_generation import (
+    generate_blind_candidates,
+    generate_candidates_from_loader,
+)
 
 
 logger = logging.getLogger(__name__)
+
+
+DEFAULT_FUSION_WEIGHTS: dict[str, float] = {
+    "pose_weight": 1.0,
+    "center_weight": 0.35,
+    "aff_weight": 0.0,
+    "clash_weight": 0.0,
+    "bias": 0.0,
+}
+
+
+def compute_pose_quality_target(current_pos: torch.Tensor, target_pos: torch.Tensor, batch_idx: torch.Tensor) -> torch.Tensor:
+    sq_diff = ((current_pos - target_pos) ** 2).sum(dim=-1)
+    rmsd = torch.sqrt(scatter_mean(sq_diff, batch_idx, dim=0) + 1e-8)
+    return torch.sigmoid((4.0 - rmsd) / 0.75).unsqueeze(-1)
 
 
 def apply_loss_context(
@@ -49,6 +77,714 @@ def apply_loss_context(
     batch_obj.loss_progress = float(max(0.0, min(1.0, progress)))
     batch_obj.loss_warmup_end = float(max(0.0, min(1.0, warmup_end)))
     batch_obj.loss_is_training = bool(training)
+
+
+def build_local_batch_from_centers(
+    batch_obj: Any,
+    *,
+    centers: torch.Tensor,
+    crop_radius: float,
+    graph_builder: Any,
+    collator: GraphCollator,
+) -> Any:
+    if centers.ndim != 2 or centers.size(1) != 3:
+        raise ValueError("centers must have shape [B, 3].")
+
+    samples = batch_obj.to_data_list() if hasattr(batch_obj, "to_data_list") else [batch_obj]
+    if len(samples) != int(centers.size(0)):
+        raise ValueError(
+            f"Mismatch between samples ({len(samples)}) and centers ({int(centers.size(0))})."
+        )
+
+    cropped_samples = [
+        crop_graph_to_center(
+            sample,
+            center=centers[i].detach().cpu(),
+            radius=crop_radius,
+            graph_builder=graph_builder,
+        )
+        for i, sample in enumerate(samples)
+    ]
+    return collator.collate(cropped_samples)
+
+
+def compute_center_proposal_target(
+    residue_pos: torch.Tensor,
+    residue_batch: torch.Tensor,
+    ligand_centers: torch.Tensor,
+    *,
+    positive_radius: float = 4.0,
+    soft_sigma: float = 3.0,
+) -> torch.Tensor:
+    center_ref = ligand_centers[residue_batch]
+    dist = torch.norm(residue_pos - center_ref, dim=-1)
+    soft_target = torch.exp(-0.5 * (dist / soft_sigma) ** 2)
+    soft_target = torch.where(dist <= positive_radius, torch.ones_like(soft_target), soft_target)
+    return soft_target.unsqueeze(-1)
+
+
+def compute_residue_proposal_priors(
+    residue_pos: torch.Tensor,
+    residue_batch: torch.Tensor,
+    *,
+    knn: int = 16,
+) -> torch.Tensor:
+    priors = residue_pos.new_zeros((residue_pos.size(0), 4))
+    if residue_pos.numel() == 0:
+        return priors
+
+    num_graphs = int(residue_batch.max().item()) + 1 if residue_batch.numel() > 0 else 0
+    for graph_idx in range(num_graphs):
+        mask = residue_batch == graph_idx
+        pos = residue_pos[mask]
+        if pos.size(0) == 0:
+            continue
+        if pos.size(0) == 1:
+            priors[mask] = torch.tensor([0.0, 1.0, 0.0, 0.0], device=residue_pos.device, dtype=residue_pos.dtype)
+            continue
+
+        dist = torch.cdist(pos, pos)
+        dist.fill_diagonal_(float("inf"))
+        k = min(knn, max(1, pos.size(0) - 1))
+        knn_dist = torch.topk(dist, k=k, largest=False, dim=-1).values
+        mean_knn = knn_dist.mean(dim=-1)
+
+        protein_center = pos.mean(dim=0, keepdim=True)
+        radial = torch.norm(pos - protein_center, dim=-1)
+        radial_norm = radial / radial.max().clamp_min(1e-6)
+        depth = 1.0 - radial_norm
+
+        density = torch.exp(-mean_knn / 4.0)
+        exposure = torch.sigmoid((mean_knn - mean_knn.mean()) / mean_knn.std(unbiased=False).clamp_min(1e-6))
+        cavity = density * depth * (1.0 - exposure)
+
+        priors[mask] = torch.stack([density, exposure, depth, cavity], dim=-1)
+
+    return priors.clamp(0.0, 1.0)
+
+
+def predict_center_proposal_logits(
+    model: torch.nn.Module,
+    batch_obj: Any,
+    *,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    base_model = resolve_ehfnet_model(model)
+    residue_store = batch_obj["protein_residue"]
+    lig_store = batch_obj["ligand_molecule"]
+    residue_batch = getattr(
+        residue_store,
+        "batch",
+        torch.zeros(residue_store.pos.size(0), dtype=torch.long),
+    )
+    esm_missing_mask = getattr(residue_store, "esm_missing_mask", None)
+    residue_prior_feat = compute_residue_proposal_priors(
+        residue_store.pos.to(device),
+        residue_batch.to(device),
+    )
+    logits = base_model.predict_center_logits(
+        residue_x_cat=residue_store.x_cat.to(device),
+        residue_x_cont=residue_store.x_cont.to(device),
+        residue_pos=residue_store.pos.to(device),
+        residue_batch=residue_batch.to(device),
+        lig_mol_x_cont=lig_store.x_cont.to(device),
+        residue_esm_missing_mask=esm_missing_mask.to(device) if esm_missing_mask is not None else None,
+        residue_prior_feat=residue_prior_feat,
+    )
+    return logits, residue_store.pos.to(device), residue_batch.to(device), residue_prior_feat
+
+
+def resolve_ehfnet_model(model: torch.nn.Module) -> EHFNet:
+    base_model = getattr(model, "module", model)
+    if not isinstance(base_model, EHFNet):
+        raise TypeError(f"Expected EHFNet-compatible model, got {type(base_model)!r}")
+    return base_model
+
+
+def compute_proposal_loss(
+    model: torch.nn.Module,
+    batch_obj: Any,
+    *,
+    device: torch.device,
+    positive_radius: float = 4.0,
+) -> torch.Tensor:
+    residue_store = batch_obj["protein_residue"]
+    lig_store = batch_obj["ligand_molecule"]
+
+    logits, _, residue_batch, _ = predict_center_proposal_logits(
+        model,
+        batch_obj,
+        device=device,
+    )
+    ligand_centers = scatter_mean(
+        batch_obj["ligand_atom"].pos,
+        batch_obj["ligand_atom"].batch,
+        dim=0,
+        dim_size=lig_store.x_cont.size(0),
+    )
+    target = compute_center_proposal_target(
+        residue_store.pos.to(device),
+        residue_batch,
+        ligand_centers.to(device),
+        positive_radius=positive_radius,
+    )
+    weight = 1.0 + 3.0 * target
+    per_residue = F.binary_cross_entropy_with_logits(logits, target, weight=weight, reduction="none")
+    per_graph = scatter_mean(per_residue.view(-1), residue_batch, dim=0)
+    return per_graph.mean()
+
+
+def select_diverse_center_indices(
+    logits: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    topk: int,
+    min_distance: float,
+) -> torch.Tensor:
+    order = torch.argsort(logits.view(-1), descending=True)
+    selected: list[int] = []
+
+    for idx in order.tolist():
+        if len(selected) >= topk:
+            break
+        if not selected:
+            selected.append(idx)
+            continue
+        pos = positions[idx]
+        if all(torch.norm(pos - positions[j]).item() >= min_distance for j in selected):
+            selected.append(idx)
+
+    if len(selected) < min(topk, positions.size(0)):
+        for idx in order.tolist():
+            if idx not in selected:
+                selected.append(idx)
+            if len(selected) >= min(topk, positions.size(0)):
+                break
+
+    return torch.tensor(selected, dtype=torch.long, device=positions.device)
+
+
+def combine_center_pose_score(
+    center_logit: torch.Tensor,
+    pose_quality_logit: torch.Tensor,
+    *,
+    aff_logit: torch.Tensor | None = None,
+    clash_value: torch.Tensor | None = None,
+    fusion_weights: dict[str, float] | None = None,
+) -> torch.Tensor:
+    fusion = dict(DEFAULT_FUSION_WEIGHTS)
+    if fusion_weights is not None:
+        fusion.update(fusion_weights)
+    center_score = torch.sigmoid(center_logit.view(-1))
+    pose_score = torch.sigmoid(pose_quality_logit.view(-1))
+    result = (
+        fusion["pose_weight"] * pose_score
+        + fusion["center_weight"] * center_score
+        + fusion["bias"]
+    )
+    if aff_logit is not None and fusion.get("aff_weight", 0.0) != 0.0:
+        aff_score = torch.sigmoid(aff_logit.view(-1))
+        result = result + fusion["aff_weight"] * aff_score
+    if clash_value is not None and fusion.get("clash_weight", 0.0) != 0.0:
+        clash_penalty = torch.exp(-clash_value.view(-1) / 10.0)
+        result = result + fusion["clash_weight"] * clash_penalty
+    return result
+
+
+def select_training_crop_centers(
+    ligand_centers: torch.Tensor,
+    proposal_logits: torch.Tensor,
+    residue_pos: torch.Tensor,
+    residue_batch: torch.Tensor,
+    *,
+    progress: float,
+    positive_radius: float,
+    bucket_topk: int = 8,
+    weighted_sampling: bool = True,
+    disable_jitter: bool = False,
+    disable_hard_negative: bool = False,
+) -> tuple[torch.Tensor, list[str]]:
+    progress = float(max(0.0, min(1.0, progress)))
+    stage_weights = {
+        "gt": max(0.10, 0.50 - 0.40 * progress),
+        "jitter": max(0.15, 0.30 - 0.10 * progress),
+        "proposal_pos": 0.10 + 0.20 * progress,
+        "near_miss": 0.05 + 0.15 * progress,
+        "hard_neg": max(0.0, -0.05 + 0.30 * progress),
+    }
+    if disable_jitter:
+        stage_weights["jitter"] = 0.0
+    if disable_hard_negative:
+        stage_weights["hard_neg"] = 0.0
+    jitter_sigma = 2.0 + 6.0 * progress
+    chosen_centers: list[torch.Tensor] = []
+    chosen_modes: list[str] = []
+    num_graphs = int(ligand_centers.size(0))
+
+    def _sample_from_bucket(bucket_pos: torch.Tensor, bucket_logits: torch.Tensor) -> torch.Tensor:
+        if bucket_pos.size(0) == 1:
+            return bucket_pos[0]
+        k = min(max(1, bucket_topk), bucket_pos.size(0))
+        pool_pos = bucket_pos[:k]
+        pool_logits = bucket_logits[:k]
+        if not weighted_sampling:
+            choice_idx = torch.randint(k, (1,), device=pool_pos.device).item()
+            return pool_pos[choice_idx]
+        weight = torch.softmax(pool_logits, dim=0)
+        choice_idx = int(torch.multinomial(weight, 1).item())
+        return pool_pos[choice_idx]
+
+    for graph_idx in range(num_graphs):
+        gt_center = ligand_centers[graph_idx]
+        mask = residue_batch == graph_idx
+        graph_pos = residue_pos[mask]
+        graph_logits = proposal_logits[mask].view(-1)
+        if graph_pos.numel() == 0:
+            chosen_centers.append(gt_center)
+            chosen_modes.append("gt_fallback")
+            continue
+
+        order = torch.argsort(graph_logits, descending=True)
+        ordered_pos = graph_pos[order]
+        ordered_logits = graph_logits[order]
+        ordered_dist = torch.norm(ordered_pos - gt_center.unsqueeze(0), dim=-1)
+        positive_mask = ordered_dist <= positive_radius
+        near_mask = (ordered_dist > positive_radius) & (ordered_dist <= positive_radius * 2.0)
+        hard_mask = ordered_dist > positive_radius * 2.0
+
+        bucket_to_center: dict[str, torch.Tensor] = {
+            "gt": gt_center,
+        }
+        if not disable_jitter:
+            bucket_to_center["jitter"] = gt_center + torch.randn_like(gt_center) * jitter_sigma
+        if positive_mask.any():
+            pos_pool = ordered_pos[positive_mask]
+            pos_logits = ordered_logits[positive_mask]
+            bucket_to_center["proposal_pos"] = _sample_from_bucket(pos_pool, pos_logits)
+        if near_mask.any():
+            near_pool = ordered_pos[near_mask]
+            near_logits = ordered_logits[near_mask]
+            bucket_to_center["near_miss"] = _sample_from_bucket(near_pool, near_logits)
+        if hard_mask.any() and not disable_hard_negative:
+            hard_pool = ordered_pos[hard_mask]
+            hard_logits = ordered_logits[hard_mask]
+            bucket_to_center["hard_neg"] = _sample_from_bucket(hard_pool, hard_logits)
+
+        available_modes = list(bucket_to_center.keys())
+        weight_tensor = torch.tensor(
+            [stage_weights.get(mode, 0.0) for mode in available_modes],
+            dtype=ligand_centers.dtype,
+            device=ligand_centers.device,
+        )
+        if float(weight_tensor.sum().item()) <= 0.0:
+            chosen_mode = "gt"
+        else:
+            chosen_mode = available_modes[int(torch.multinomial(weight_tensor / weight_tensor.sum(), 1).item())]
+
+        chosen_centers.append(bucket_to_center[chosen_mode])
+        chosen_modes.append(chosen_mode)
+
+    return torch.stack(chosen_centers, dim=0), chosen_modes
+
+
+def compute_pairwise_pose_ranking_loss(
+    pose_logit_a: torch.Tensor,
+    pose_target_a: torch.Tensor,
+    pose_logit_b: torch.Tensor,
+    pose_target_b: torch.Tensor,
+    *,
+    margin: float,
+    min_delta: float = 0.05,
+    extra_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, int]:
+    qa = pose_target_a.view(-1)
+    qb = pose_target_b.view(-1)
+    sa = pose_logit_a.view(-1)
+    sb = pose_logit_b.view(-1)
+    delta = qa - qb
+    valid = delta.abs() >= min_delta
+    if extra_mask is not None:
+        valid = valid & extra_mask.view(-1).to(device=valid.device, dtype=torch.bool)
+    if not bool(valid.any()):
+        return sa.new_zeros(()), 0
+    direction = torch.sign(delta[valid])
+    return F.relu(margin - direction * (sa[valid] - sb[valid])).mean(), int(valid.sum().item())
+
+
+def select_wrong_center_candidates(
+    ligand_centers: torch.Tensor,
+    proposal_logits: torch.Tensor,
+    residue_pos: torch.Tensor,
+    residue_batch: torch.Tensor,
+    *,
+    positive_radius: float,
+    bucket_topk: int = 8,
+    weighted_sampling: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_graphs = int(ligand_centers.size(0))
+    wrong_centers: list[torch.Tensor] = []
+    wrong_center_scores: list[torch.Tensor] = []
+    valid_mask: list[bool] = []
+
+    def _sample_bucket(bucket_pos: torch.Tensor, bucket_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        k = min(max(1, bucket_topk), bucket_pos.size(0))
+        pool_pos = bucket_pos[:k]
+        pool_logits = bucket_logits[:k]
+        if pool_pos.size(0) == 1:
+            return pool_pos[0], pool_logits[0]
+        if not weighted_sampling:
+            idx = int(torch.randint(pool_pos.size(0), (1,), device=pool_pos.device).item())
+            return pool_pos[idx], pool_logits[idx]
+        prob = torch.softmax(pool_logits, dim=0)
+        idx = int(torch.multinomial(prob, 1).item())
+        return pool_pos[idx], pool_logits[idx]
+
+    for graph_idx in range(num_graphs):
+        gt_center = ligand_centers[graph_idx]
+        mask = residue_batch == graph_idx
+        graph_pos = residue_pos[mask]
+        graph_logits = proposal_logits[mask].view(-1)
+        if graph_pos.numel() == 0:
+            wrong_centers.append(gt_center)
+            wrong_center_scores.append(gt_center.new_zeros(()))
+            valid_mask.append(False)
+            continue
+        order = torch.argsort(graph_logits, descending=True)
+        ordered_pos = graph_pos[order]
+        ordered_logits = graph_logits[order]
+        dist = torch.norm(ordered_pos - gt_center.unsqueeze(0), dim=-1)
+        near_mask = (dist > positive_radius) & (dist <= positive_radius * 2.0)
+        hard_mask = dist > positive_radius * 2.0
+        if near_mask.any():
+            center, score = _sample_bucket(ordered_pos[near_mask], ordered_logits[near_mask])
+            valid = True
+        elif hard_mask.any():
+            center, score = _sample_bucket(ordered_pos[hard_mask], ordered_logits[hard_mask])
+            valid = True
+        else:
+            center, score = gt_center, gt_center.new_zeros(())
+            valid = False
+        wrong_centers.append(center)
+        wrong_center_scores.append(score)
+        valid_mask.append(valid)
+
+    return (
+        torch.stack(wrong_centers, dim=0),
+        torch.stack([score.view(1) for score in wrong_center_scores], dim=0).view(-1),
+        torch.as_tensor(valid_mask, dtype=torch.bool, device=ligand_centers.device),
+    )
+
+
+def sample_hard_ranking_time_and_centers(
+    t_anchor: torch.Tensor,
+    crop_centers: torch.Tensor,
+    wrong_centers: torch.Tensor,
+    wrong_center_valid_mask: torch.Tensor,
+    *,
+    progress: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample hard ranking variants.
+
+    Returns:
+      t_hard: time steps for hard samples
+      hard_centers: candidate centers
+      strategy_id: 0 same-center-bad-pose, 1 wrong-center
+    """
+    B = t_anchor.size(0)
+    device = t_anchor.device
+
+    strategy = torch.rand(B, device=device)
+    t_hard = t_anchor.clone()
+    hard_centers = crop_centers.clone()
+    strategy_id = torch.zeros(B, device=device, dtype=torch.long)
+
+    mask_worse_time = strategy < 0.45
+    if mask_worse_time.any():
+        n = int(mask_worse_time.sum().item())
+        scale = 0.25 + 0.45 * torch.rand(n, device=device)
+        t_hard[mask_worse_time] = t_anchor[mask_worse_time] * scale
+
+    mask_offset = (~mask_worse_time) & wrong_center_valid_mask.to(device=device)
+    if mask_offset.any():
+        hard_centers[mask_offset] = wrong_centers[mask_offset]
+        strategy_id[mask_offset] = 1
+        scale = 0.65 + 0.25 * torch.rand(int(mask_offset.sum().item()), device=device)
+        t_hard[mask_offset] = torch.clamp(t_anchor[mask_offset] * scale, max=0.85)
+
+    sigma = 1e-3
+    t_hard = t_hard.clamp(min=sigma, max=1.0 - sigma)
+    return t_hard, hard_centers, strategy_id
+
+
+def clone_shares_tensor_storage(batch_obj: Any, node_type: str = "ligand_atom", attr: str = "pos") -> bool:
+    cloned = batch_obj.clone()
+    original_tensor = batch_obj[node_type][attr]
+    cloned_tensor = cloned[node_type][attr]
+    return bool(
+        torch.is_tensor(original_tensor)
+        and torch.is_tensor(cloned_tensor)
+        and original_tensor.data_ptr() == cloned_tensor.data_ptr()
+    )
+
+
+def summarize_blind_candidate_records(
+    candidate_records: list[dict[str, Any]],
+    *,
+    topk_values: tuple[int, ...],
+    fusion_weights: dict[str, float] | None = None,
+) -> dict[str, float]:
+    if not candidate_records:
+        return {"topn_total_graphs": 0.0}
+
+    topk_unique = tuple(sorted({int(k) for k in topk_values if int(k) > 0}))
+    metrics: dict[str, float] = {
+        "topn_total_graphs": float(len(candidate_records)),
+    }
+    center_recall_hits = {1: 0.0, 3: 0.0, 8: 0.0, 16: 0.0}
+    oracle_top1_rmsd: list[float] = []
+    oracle_top5_rmsd: list[float] = []
+    reranked_top1_rmsd: list[float] = []
+    reranked_top5_rmsd: list[float] = []
+    reranked_topk_rmsd: dict[int, list[float]] = {k: [] for k in topk_unique}
+    proposal_failures = 0.0
+    local_failures = 0.0
+    ranking_failures = 0.0
+    successes = 0.0
+
+    for record in candidate_records:
+        center_hits = list(record.get("center_hits", []))
+        candidates = list(record.get("candidates", []))
+        if not candidates:
+            proposal_failures += 1.0
+            continue
+
+        for k in center_recall_hits:
+            if any(center_hits[: min(k, len(center_hits))]):
+                center_recall_hits[k] += 1.0
+
+        oracle_all = min(float(item["rmsd"]) for item in candidates)
+        oracle_first5_pool = [float(item["rmsd"]) for item in candidates if int(item.get("proposal_rank", 999)) <= 5]
+        if not oracle_first5_pool:
+            oracle_first5_pool = [float(item["rmsd"]) for item in candidates]
+        oracle_top1_rmsd.append(oracle_all)
+        oracle_top5_rmsd.append(min(oracle_first5_pool))
+
+        reranked = sorted(
+            candidates,
+            key=lambda item: float(
+                combine_center_pose_score(
+                    torch.tensor([item["center_logit"]], dtype=torch.float32),
+                    torch.tensor([item["pose_logit"]], dtype=torch.float32),
+                    aff_logit=torch.tensor([item.get("aff_logit", 0.0)], dtype=torch.float32),
+                    clash_value=torch.tensor([item.get("clash_value", 0.0)], dtype=torch.float32),
+                    fusion_weights=fusion_weights,
+                )[0].item()
+            ),
+            reverse=True,
+        )
+        reranked_top1 = float(reranked[0]["rmsd"])
+        reranked_top5 = min(float(item["rmsd"]) for item in reranked[: min(5, len(reranked))])
+        reranked_top1_rmsd.append(reranked_top1)
+        reranked_top5_rmsd.append(reranked_top5)
+        for k in topk_unique:
+            reranked_topk_rmsd[k].append(min(float(item["rmsd"]) for item in reranked[: min(k, len(reranked))]))
+
+        has_center_hit = any(center_hits)
+        if not has_center_hit:
+            proposal_failures += 1.0
+        elif oracle_all >= 2.0:
+            local_failures += 1.0
+        elif reranked_top1 >= 2.0:
+            ranking_failures += 1.0
+        else:
+            successes += 1.0
+
+    total = max(1.0, float(len(candidate_records)))
+    for k, hit_count in center_recall_hits.items():
+        metrics[f"center_recall@{k}"] = (hit_count / total) * 100.0
+
+    def _mean(values: list[float]) -> float:
+        return float(sum(values) / max(1, len(values)))
+
+    def _success(values: list[float], threshold: float) -> float:
+        return 100.0 * float(sum(v < threshold for v in values)) / max(1, len(values))
+
+    metrics["oracle_top1_success_2a"] = _success(oracle_top1_rmsd, 2.0)
+    metrics["oracle_top1_success_5a"] = _success(oracle_top1_rmsd, 5.0)
+    metrics["oracle_top5_success_2a"] = _success(oracle_top5_rmsd, 2.0)
+    metrics["oracle_top5_success_5a"] = _success(oracle_top5_rmsd, 5.0)
+    metrics["oracle_top1_mean_best_rmsd"] = _mean(oracle_top1_rmsd)
+    metrics["oracle_top5_mean_best_rmsd"] = _mean(oracle_top5_rmsd)
+    metrics["reranked_top1_success_2a"] = _success(reranked_top1_rmsd, 2.0)
+    metrics["reranked_top1_success_5a"] = _success(reranked_top1_rmsd, 5.0)
+    metrics["reranked_top5_success_2a"] = _success(reranked_top5_rmsd, 2.0)
+    metrics["reranked_top5_success_5a"] = _success(reranked_top5_rmsd, 5.0)
+    metrics["reranked_top1_mean_best_rmsd"] = _mean(reranked_top1_rmsd)
+    metrics["reranked_top5_mean_best_rmsd"] = _mean(reranked_top5_rmsd)
+    metrics["proposal_gap"] = (proposal_failures / total) * 100.0
+    metrics["local_gap"] = (local_failures / total) * 100.0
+    metrics["ranking_gap"] = (ranking_failures / total) * 100.0
+    metrics["pipeline_success"] = (successes / total) * 100.0
+
+    for k in topk_unique:
+        source = reranked_topk_rmsd[k]
+        metrics[f"top{k}_success_2a"] = _success(source, 2.0)
+        metrics[f"top{k}_success_5a"] = _success(source, 5.0)
+        metrics[f"top{k}_mean_best_rmsd"] = _mean(source)
+
+    return metrics
+
+
+def calibrate_linear_fusion_weights(
+    candidate_records: list[dict[str, Any]],
+    *,
+    topk_values: tuple[int, ...],
+    search_center_weights: tuple[float, ...] = (0.0, 0.15, 0.25, 0.35, 0.5, 0.65),
+    search_aff_weights: tuple[float, ...] = (0.0,),
+    search_clash_weights: tuple[float, ...] = (0.0,),
+) -> dict[str, float]:
+    best_weights = dict(DEFAULT_FUSION_WEIGHTS)
+    best_metrics = summarize_blind_candidate_records(
+        candidate_records,
+        topk_values=topk_values,
+        fusion_weights=best_weights,
+    )
+
+    def _is_better(trial: dict, ref: dict) -> bool:
+        t1 = trial.get("reranked_top1_success_2a", 0.0)
+        r1 = ref.get("reranked_top1_success_2a", 0.0)
+        if t1 > r1 + 1e-6:
+            return True
+        if t1 < r1 - 1e-6:
+            return False
+        t5 = trial.get("reranked_top5_success_2a", 0.0)
+        r5 = ref.get("reranked_top5_success_2a", 0.0)
+        if t5 > r5 + 1e-6:
+            return True
+        if t5 < r5 - 1e-6:
+            return False
+        return trial.get("reranked_top1_mean_best_rmsd", float("inf")) < ref.get("reranked_top1_mean_best_rmsd", float("inf")) - 1e-6
+
+    for cw in search_center_weights:
+        for aw in search_aff_weights:
+            for clw in search_clash_weights:
+                trial_weights = {
+                    "pose_weight": 1.0,
+                    "center_weight": float(cw),
+                    "aff_weight": float(aw),
+                    "clash_weight": float(clw),
+                    "bias": 0.0,
+                }
+                trial_metrics = summarize_blind_candidate_records(
+                    candidate_records,
+                    topk_values=topk_values,
+                    fusion_weights=trial_weights,
+                )
+                if _is_better(trial_metrics, best_metrics):
+                    best_weights = trial_weights
+                    best_metrics = trial_metrics
+
+    return best_weights
+
+
+def should_run_bootstrap(
+    *,
+    epoch: int,
+    batch_idx: int,
+    total_epochs: int,
+    frequency: int,
+    start_ratio: float,
+) -> bool:
+    if frequency <= 0:
+        return False
+    progress = 1.0 if total_epochs <= 1 else epoch / max(1, total_epochs - 1)
+    return progress >= start_ratio and batch_idx % frequency == 0
+
+
+def select_bootstrap_blind_centers(
+    ligand_centers: torch.Tensor,
+    proposal_logits: torch.Tensor,
+    residue_pos: torch.Tensor,
+    residue_batch: torch.Tensor,
+    *,
+    positive_radius: float,
+    bucket_topk: int = 8,
+) -> torch.Tensor:
+    wrong_centers, _, wrong_valid_mask = select_wrong_center_candidates(
+        ligand_centers,
+        proposal_logits,
+        residue_pos,
+        residue_batch,
+        positive_radius=positive_radius,
+        bucket_topk=bucket_topk,
+        weighted_sampling=True,
+    )
+    bootstrap_centers = ligand_centers.clone()
+    if wrong_valid_mask.any():
+        mix_mask = (torch.rand_like(wrong_valid_mask.float()) < 0.7) & wrong_valid_mask
+        bootstrap_centers[mix_mask] = wrong_centers[mix_mask]
+    return bootstrap_centers
+
+
+def compute_bootstrap_pose_quality_loss(
+    *,
+    student_model: torch.nn.Module,
+    teacher_model: torch.nn.Module,
+    matcher: ConditionalFlowMatcher,
+    source_batch: Any,
+    placement_centers: torch.Tensor,
+    epoch: int,
+    ode_steps: int,
+    graph_builder: Any,
+    collator: GraphCollator,
+    crop_radius: float,
+) -> torch.Tensor:
+    blind_local_batch = build_local_batch_from_centers(
+        source_batch,
+        centers=placement_centers.detach().cpu(),
+        crop_radius=crop_radius,
+        graph_builder=graph_builder,
+        collator=collator,
+    )
+    device = next(student_model.parameters()).device
+    blind_local_batch = blind_local_batch.to(device)
+    x_ref = blind_local_batch["ligand_atom"].pos
+    lig_batch = blind_local_batch["ligand_atom"].batch
+    masses = blind_local_batch["ligand_atom"].masses
+    B = int(lig_batch.max().item()) + 1
+    with torch.no_grad():
+        teacher_batch = blind_local_batch.clone()
+        x0 = matcher._generate_random_pose(
+            x_ref=x_ref,
+            batch=lig_batch,
+            B=B,
+            masses=masses,
+            torsion_indices=getattr(teacher_batch, "torsion_indices", None),
+            torsion_moving_mask=getattr(teacher_batch, "torsion_moving_mask", None),
+            seed_pos=teacher_batch["ligand_atom"].get("start_pos", None),
+            protein_pos=teacher_batch["protein_atom"].pos,
+            protein_batch=getattr(teacher_batch["protein_atom"], "batch", None),
+            placement_centers=placement_centers,
+            epoch=epoch,
+        )
+        teacher_batch["ligand_atom"].pos = x0
+        final_pos, _ = matcher.ode_solve(
+            model=teacher_model,
+            data=teacher_batch,
+            steps=ode_steps,
+            method="euler",
+            store_trajectory=False,
+        )
+        teacher_target = compute_pose_quality_target(final_pos, x_ref, lig_batch)
+
+    student_batch = blind_local_batch.clone()
+    student_batch["ligand_atom"].pos = final_pos.detach()
+    student_batch.t = torch.ones(B, device=x_ref.device, dtype=x_ref.dtype)
+    student_pred = student_model(student_batch, student_batch.t)
+    pred_pose_quality = student_pred["pose_quality"].view(-1)
+    target_pose_quality = teacher_target.view(-1).to(device=pred_pose_quality.device, dtype=pred_pose_quality.dtype)
+    weight = 1.0 + 2.0 * target_pose_quality
+    return F.binary_cross_entropy_with_logits(pred_pose_quality, target_pose_quality, weight=weight)
 
 
 def train(
@@ -70,7 +806,8 @@ def train(
     pro_res_cont_count: int = 974,     # 14 (torsion) + 960 (ESM)
     esm_dim: int = 960,
     device: str | torch.device = "auto",
-    pocket_radius: float | None = 20.0,
+    pocket_radius: float | None = 10.0,
+    protein_context_mode: str = "full",
     normalization_stats: dict | None = None,
     warmup_epochs: int = 20,
     rmsd_check_ratio: float = 0.2,
@@ -103,6 +840,33 @@ def train(
     min_val_max_nodes_per_batch: int | None = None,
     oom_recover_epochs: int = 3,
     oom_recover_factor: float = 1.1,
+    center_proposal_weight: float = 0.15,
+    center_positive_radius: float = 4.0,
+    center_proposal_topk: int = 8,
+    center_refine_topk: int = 3,
+    center_nms_radius: float = 6.0,
+    stage1_pose_samples: int = 2,
+    stage2_pose_samples: int = 4,
+    crop_candidate_topk: int = 8,
+    disable_jitter_crop: bool = False,
+    disable_hard_negative_crop: bool = False,
+    pose_ranking_pair_weight: float = 0.2,
+    pose_ranking_margin: float = 0.5,
+    pose_bootstrap_weight: float = 0.05,
+    pose_bootstrap_frequency: int = 25,
+    pose_bootstrap_ode_steps: int = 10,
+    enable_fusion_calibration: bool = True,
+    val_ode_steps: int = 50,
+    checkpoint_selection_mode: str = "composite",
+    fusion_search_center_weights: tuple[float, ...] = (0.0, 0.15, 0.25, 0.35, 0.5, 0.65),
+    fusion_search_aff_weights: tuple[float, ...] = (0.0,),
+    fusion_search_clash_weights: tuple[float, ...] = (0.0,),
+    blind_pool_refresh_every: int = 5,
+    blind_pool_start_epoch: int = 10,
+    blind_pool_max_complexes: int = 500,
+    blind_pool_cache_bce_weight: float = 0.5,
+    blind_pool_cache_rank_weight: float = 1.0,
+    blind_pool_pairs_per_complex: int = 4,
     run_name: str | None = None,
     run_log_file: str | None = None,
 ):
@@ -127,7 +891,8 @@ def train(
         pro_res_cont_count: 蛋白残基连续特征数量
         esm_dim: ESM embedding 维度
         device: 训练设备 ("cpu", "cuda", "cuda:0", "cuda:1" 等)，默认为 "auto" (自动检测)
-        pocket_radius: 口袋提取半径 (Å)
+        pocket_radius: 运行时局部 docking 半径 (Å)
+        protein_context_mode: 蛋白上下文缓存模式，full 表示缓存全蛋白并在运行时裁剪
         normalization_stats: 归一化统计数据
         warmup_epochs: 空间课程学习预热轮数
         rmsd_check_ratio: 验证集中计算 RMSD 的样本比例 (0.0 ~ 1.0)
@@ -188,6 +953,8 @@ def train(
     # 2. 准备数据
     logger.info("Initializing Dataset...")
     collator = GraphCollator(follow_batch=["ligand_atom", "protein_atom"])
+    if protein_context_mode not in {"full", "pocket"}:
+        raise ValueError("protein_context_mode must be 'full' or 'pocket'.")
 
     dataset = PDBBindDataset(
         root=data_root,
@@ -195,9 +962,10 @@ def train(
         esm_root=esm_path,
         esm="auto",
         esm_dim=esm_dim,
-        pocket_radius=pocket_radius,
+        pocket_radius=None if protein_context_mode == "full" else pocket_radius,
         interaction_profile="atom_only" if ablation_mode == "inter_multiscale_off" else "full",
     )
+    graph_builder = dataset.graph_builder
 
     # 统一亲和力统计来源：以当前 Dataset 统计为准，避免外部 stats 与训练集不一致
     if normalization_stats is None:
@@ -352,19 +1120,55 @@ def train(
         return metric
 
     def _build_selection_metrics(metrics: dict[str, Any]) -> dict[str, float]:
-        success_2a = _safe_metric(metrics.get("success_2a"), 0.0)
-        success_5a = _safe_metric(metrics.get("success_5a"), 0.0)
-        mean_rmsd = _safe_metric(metrics.get("mean_rmsd_final"), 1e9, higher_is_better=False)
-        val_loss = _safe_metric(metrics.get("val_loss"), 1e9, higher_is_better=False)
-        composite_score = 1.5 * success_2a + 0.15 * success_5a - 0.8 * mean_rmsd
+        success_2a = _safe_metric(metrics.get("reranked_top1_success_2a", metrics.get("success_2a")), 0.0)
+        success_5a = _safe_metric(metrics.get("reranked_top5_success_2a", metrics.get("success_5a")), 0.0)
+        oracle_top5_success_2a = _safe_metric(metrics.get("oracle_top5_success_2a"), 0.0)
+        mean_rmsd = _safe_metric(
+            metrics.get("reranked_top1_mean_best_rmsd", metrics.get("mean_rmsd_final")),
+            1e9,
+            higher_is_better=False,
+        )
+        val_loss = _safe_metric(metrics.get("local_val_loss", metrics.get("val_loss")), 1e9, higher_is_better=False)
+        center_recall = _safe_metric(metrics.get("center_recall@8"), 0.0)
+        proposal_gap = _safe_metric(metrics.get("proposal_gap"), 100.0, higher_is_better=False)
+        ranking_gap = _safe_metric(metrics.get("ranking_gap"), 100.0, higher_is_better=False)
+        composite_score = (
+            1.75 * success_2a
+            + 0.35 * success_5a
+            + 0.20 * oracle_top5_success_2a
+            + 0.10 * center_recall
+            - 0.75 * mean_rmsd
+            - 0.15 * proposal_gap
+            - 0.20 * ranking_gap
+        )
+        blind_combo_score = 1.0 * success_2a + 0.35 * oracle_top5_success_2a - 0.10 * ranking_gap
 
         return {
             "composite_score": composite_score,
+            "blind_combo_score": blind_combo_score,
             "success_2a": success_2a,
             "success_5a": success_5a,
+            "oracle_top5_success_2a": oracle_top5_success_2a,
             "mean_rmsd": mean_rmsd,
             "val_loss": val_loss,
+            "center_recall@8": center_recall,
+            "proposal_gap": proposal_gap,
+            "ranking_gap": ranking_gap,
         }
+
+    def _resolve_selection_rule() -> tuple[str, bool, str]:
+        mapping = {
+            "composite": ("composite_score", True, "Composite"),
+            "reranked_top1_success_2a": ("success_2a", True, "Rerank@1<2A"),
+            "reranked_top5_success_2a": ("success_5a", True, "Rerank@5<2A"),
+            "reranked_top1_plus_oracle_top5": ("blind_combo_score", True, "Rerank@1 + Oracle@5"),
+        }
+        if checkpoint_selection_mode not in mapping:
+            raise ValueError(
+                "checkpoint_selection_mode must be one of "
+                f"{tuple(mapping.keys())}, got {checkpoint_selection_mode!r}"
+            )
+        return mapping[checkpoint_selection_mode]
 
     def _is_better_checkpoint(
         candidate: dict[str, float],
@@ -443,6 +1247,7 @@ def train(
             "avg_train_loss": avg_train_loss_value,
             "val_metrics": dict(val_metrics_obj),
             "selection_metrics": dict(selection_metrics),
+            "fusion_weights": dict(current_fusion_weights),
         }
 
     effective_min_train_nodes_per_batch = max(1, int(min_max_nodes_per_batch))
@@ -629,12 +1434,22 @@ def train(
     best_composite_metrics: dict[str, float] | None = None
     best_success2a_metrics: dict[str, float] | None = None
     best_rmsd_metrics: dict[str, float] | None = None
+    best_selected_metrics: dict[str, float] | None = None
+    current_fusion_weights = dict(DEFAULT_FUSION_WEIGHTS)
     total_oom_batches = 0
     consecutive_clean_epochs = 0  # 连续无 OOM 的 epoch 计数，用于回升决策
     consecutive_clean_val_epochs = 0
     oom_blacklisted_pdb_ids: set[str] = set()
     oom_counts_by_pdb: dict[str, int] = {}
     OOM_BLACKLIST_THRESHOLD = 2
+    clone_safety_checked = False
+    selected_primary_key, selected_higher_is_better, selected_metric_label = _resolve_selection_rule()
+    blind_pool_cache_dir = os.path.join(save_dir, "blind_pool_cache")
+    os.makedirs(blind_pool_cache_dir, exist_ok=True)
+    cached_blind_pool: list[dict[str, Any]] = load_blind_pool(blind_pool_cache_dir)
+    if cached_blind_pool:
+        logger.info("Loaded existing blind pool: %d complexes.", len(cached_blind_pool))
+    best_selected_updated_this_epoch = False
 
     def _extract_batch_pdb_ids(batch_obj: Any) -> list[str]:
         pdb_attr = getattr(batch_obj, "pdb_id", None)
@@ -687,6 +1502,18 @@ def train(
         CIRCUIT_BREAKER_LIMIT = 10  # 连续 OOM 达到此值则熔断当前 epoch
         epoch_fused = False     # 本 epoch 是否被熔断
         optimizer.zero_grad()   # 在循环外初始化梯度清零
+        epoch_proposal_losses: list[float] = []
+        epoch_local_losses: list[float] = []
+        epoch_proposal_residues: list[float] = []
+        epoch_local_residues: list[float] = []
+        epoch_rank_pair_counts = {
+            "same_center": 0,
+            "wrong_center_low_clash": 0,
+            "misleading_center": 0,
+            "misleading_affinity": 0,
+        }
+        epoch_rank_oom_skips = 0
+        epoch_rank_peak_mem_mb = 0.0
 
         for batch_idx, batch in enumerate(train_loader):
             num_graphs = int(batch["ligand_atom"].batch.max().item()) + 1
@@ -718,7 +1545,94 @@ def train(
             # 包裹 batch.to(device) → 采样 → 前向 → 损失 → 反向 的完整流程
             # OOM 可能发生在任何 GPU 操作点：数据迁移、EGNN 消息传递、梯度计算
             try:
-                batch = batch.to(device)
+                source_batch = batch
+                if not clone_safety_checked:
+                    clone_safety_checked = True
+                    logger.info(
+                        "HeteroData.clone() tensor storage check | shared_ligand_pos=%s",
+                        clone_shares_tensor_storage(source_batch),
+                    )
+                ligand_centers = scatter_mean(
+                    source_batch["ligand_atom"].pos,
+                    source_batch["ligand_atom"].batch,
+                    dim=0,
+                    dim_size=num_graphs,
+                )
+                proposal_loss = compute_proposal_loss(
+                    model,
+                    source_batch,
+                    device=device,
+                    positive_radius=center_positive_radius,
+                )
+                proposal_logits, residue_pos_for_crop, residue_batch_for_crop, _ = predict_center_proposal_logits(
+                    model,
+                    source_batch,
+                    device=device,
+                )
+                train_progress = 1.0 if epochs <= 1 else epoch / max(1, epochs - 1)
+                proposal_logits_cpu = proposal_logits.detach().cpu().view(-1)
+                residue_pos_cpu = residue_pos_for_crop.detach().cpu()
+                residue_batch_cpu = residue_batch_for_crop.detach().cpu()
+                wrong_centers_cpu, wrong_center_scores_cpu, wrong_center_valid_cpu = select_wrong_center_candidates(
+                    ligand_centers.detach().cpu(),
+                    proposal_logits_cpu,
+                    residue_pos_cpu,
+                    residue_batch_cpu,
+                    positive_radius=center_positive_radius,
+                    bucket_topk=crop_candidate_topk,
+                    weighted_sampling=True,
+                )
+                bootstrap_centers_cpu = select_bootstrap_blind_centers(
+                    ligand_centers.detach().cpu(),
+                    proposal_logits_cpu,
+                    residue_pos_cpu,
+                    residue_batch_cpu,
+                    positive_radius=center_positive_radius,
+                    bucket_topk=crop_candidate_topk,
+                )
+                proposal_top_scores_cpu = torch.full((num_graphs,), -1e9, dtype=proposal_logits_cpu.dtype)
+                for graph_idx in range(num_graphs):
+                    graph_mask = residue_batch_cpu == graph_idx
+                    graph_logits = proposal_logits_cpu[graph_mask]
+                    if graph_logits.numel() > 0:
+                        proposal_top_scores_cpu[graph_idx] = graph_logits.max()
+                if ablation_mode == "gt_only_crop":
+                    crop_centers_cpu = ligand_centers.detach().cpu()
+                    crop_modes = ["gt_forced"] * num_graphs
+                else:
+                    crop_centers_cpu, crop_modes = select_training_crop_centers(
+                        ligand_centers.detach().cpu(),
+                        proposal_logits_cpu,
+                        residue_pos_cpu,
+                        residue_batch_cpu,
+                        progress=train_progress,
+                        positive_radius=center_positive_radius,
+                        bucket_topk=crop_candidate_topk,
+                        weighted_sampling=True,
+                        disable_jitter=disable_jitter_crop,
+                        disable_hard_negative=disable_hard_negative_crop,
+                    )
+                local_batch = build_local_batch_from_centers(
+                    source_batch,
+                    centers=crop_centers_cpu,
+                    crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+                    graph_builder=graph_builder,
+                    collator=collator,
+                )
+                batch = local_batch.to(device)
+                crop_centers = crop_centers_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
+                wrong_center_valid = wrong_center_valid_cpu.to(device=device)
+                wrong_center_scores = wrong_center_scores_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
+                wrong_centers = wrong_centers_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
+                bootstrap_centers = bootstrap_centers_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
+                proposal_top_scores = proposal_top_scores_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
+                epoch_proposal_losses.append(float(proposal_loss.detach().item()))
+                epoch_proposal_residues.append(
+                    float(source_batch["protein_residue"].pos.size(0)) / max(1, num_graphs)
+                )
+                epoch_local_residues.append(
+                    float(local_batch["protein_residue"].pos.size(0)) / max(1, num_graphs)
+                )
                 _annotate_loss_context(
                     batch,
                     current_epoch=epoch,
@@ -736,6 +1650,7 @@ def train(
                         data=batch,
                         current_epoch=epoch,
                         total_epochs=epochs,
+                        placement_centers=crop_centers,
                     )
 
                 batch["ligand_atom"].pos = x_t
@@ -746,9 +1661,188 @@ def train(
 
                 # 补充结合能 target
                 targets["binding_affinity_target"] = batch.get("y_energy", None)
+                targets["pose_quality_target"] = compute_pose_quality_target(x_t, x_1, batch["ligand_atom"].batch)
 
                 loss_dict = criterion(predictions, targets, batch)
-                loss = loss_dict["total"]
+                epoch_local_losses.append(float(loss_dict["total"].detach().item()))
+                loss_pose_rank = torch.tensor(0.0, device=device)
+                if pose_ranking_pair_weight > 0.0:
+                    try:
+                        rank_terms: list[torch.Tensor] = []
+                        # same-center 好/坏 pose pair
+                        same_center_batch = batch.clone()
+                        with torch.no_grad():
+                            t_same = torch.clamp(
+                                t * (0.25 + 0.45 * torch.rand_like(t)),
+                                min=1e-3,
+                                max=1.0 - 1e-3,
+                            )
+                            _, x_t_same, _ = matcher.sample_location_and_target(
+                                x_1=x_1,
+                                data=same_center_batch,
+                                current_epoch=epoch,
+                                total_epochs=epochs,
+                                placement_centers=crop_centers,
+                                t_override=t_same,
+                            )
+                        same_center_batch["ligand_atom"].pos = x_t_same
+                        same_center_batch.t = t_same
+                        same_center_pred = model(same_center_batch, t_same)
+                        pose_quality_same = compute_pose_quality_target(x_t_same, x_1, batch["ligand_atom"].batch)
+                        loss_same, count_same = compute_pairwise_pose_ranking_loss(
+                            predictions["pose_quality"],
+                            targets["pose_quality_target"],
+                            same_center_pred["pose_quality"],
+                            pose_quality_same,
+                            margin=pose_ranking_margin,
+                        )
+                        if count_same > 0:
+                            rank_terms.append(loss_same)
+                            epoch_rank_pair_counts["same_center"] += count_same
+
+                        # wrong-center but clash small / center-high / affinity-not-bad
+                        if bool(wrong_center_valid.any()):
+                            wrong_local_batch = build_local_batch_from_centers(
+                                source_batch,
+                                centers=wrong_centers_cpu,
+                                crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+                                graph_builder=graph_builder,
+                                collator=collator,
+                            ).to(device)
+                            x_1_wrong = wrong_local_batch["ligand_atom"].pos
+                            with torch.no_grad():
+                                t_wrong = torch.clamp(
+                                    t * (0.65 + 0.25 * torch.rand_like(t)),
+                                    min=1e-3,
+                                    max=0.9,
+                                )
+                                _, x_t_wrong, _ = matcher.sample_location_and_target(
+                                    x_1=x_1_wrong,
+                                    data=wrong_local_batch,
+                                    current_epoch=epoch,
+                                    total_epochs=epochs,
+                                    placement_centers=wrong_centers,
+                                    t_override=t_wrong,
+                                )
+                            wrong_local_batch["ligand_atom"].pos = x_t_wrong
+                            wrong_local_batch.t = t_wrong
+                            wrong_pred = model(wrong_local_batch, t_wrong)
+                            pose_quality_wrong = compute_pose_quality_target(
+                                x_t_wrong,
+                                x_1_wrong,
+                                wrong_local_batch["ligand_atom"].batch,
+                            )
+                            anchor_clash = predictions.get("steric_clash_batch")
+                            wrong_clash = wrong_pred.get("steric_clash_batch")
+                            if anchor_clash is None:
+                                anchor_clash = torch.zeros_like(t)
+                            if wrong_clash is None:
+                                wrong_clash = torch.zeros_like(t)
+                            low_clash_mask = wrong_center_valid & (
+                                wrong_clash.view(-1) <= (anchor_clash.view(-1) + 1.0)
+                            )
+                            loss_wrong, count_wrong = compute_pairwise_pose_ranking_loss(
+                                predictions["pose_quality"],
+                                targets["pose_quality_target"],
+                                wrong_pred["pose_quality"],
+                                pose_quality_wrong,
+                                margin=pose_ranking_margin,
+                                extra_mask=low_clash_mask,
+                            )
+                            if count_wrong > 0:
+                                rank_terms.append(loss_wrong)
+                                epoch_rank_pair_counts["wrong_center_low_clash"] += count_wrong
+
+                            misleading_center_mask = low_clash_mask & (
+                                wrong_center_scores >= (proposal_top_scores - 0.25)
+                            )
+                            loss_center_hard, count_center_hard = compute_pairwise_pose_ranking_loss(
+                                predictions["pose_quality"],
+                                targets["pose_quality_target"],
+                                wrong_pred["pose_quality"],
+                                pose_quality_wrong,
+                                margin=pose_ranking_margin,
+                                extra_mask=misleading_center_mask,
+                            )
+                            if count_center_hard > 0:
+                                rank_terms.append(loss_center_hard)
+                                epoch_rank_pair_counts["misleading_center"] += count_center_hard
+
+                            anchor_aff = predictions.get("binding_affinity")
+                            wrong_aff = wrong_pred.get("binding_affinity")
+                            if anchor_aff is not None and wrong_aff is not None:
+                                misleading_aff_mask = low_clash_mask & (
+                                    wrong_aff.view(-1) >= (anchor_aff.view(-1) - 0.25)
+                                )
+                                loss_aff_hard, count_aff_hard = compute_pairwise_pose_ranking_loss(
+                                    predictions["pose_quality"],
+                                    targets["pose_quality_target"],
+                                    wrong_pred["pose_quality"],
+                                    pose_quality_wrong,
+                                    margin=pose_ranking_margin,
+                                    extra_mask=misleading_aff_mask,
+                                )
+                                if count_aff_hard > 0:
+                                    rank_terms.append(loss_aff_hard)
+                                    epoch_rank_pair_counts["misleading_affinity"] += count_aff_hard
+
+                            del wrong_local_batch, x_1_wrong, t_wrong, x_t_wrong, wrong_pred, pose_quality_wrong
+
+                        if rank_terms:
+                            loss_pose_rank = torch.stack(rank_terms).mean()
+                        loss_dict["loss_pose_rank"] = loss_pose_rank.detach()
+                        loss_dict["rank_pairs_same_center"] = torch.tensor(
+                            epoch_rank_pair_counts["same_center"], device=device
+                        )
+                        loss_dict["rank_pairs_wrong_center"] = torch.tensor(
+                            epoch_rank_pair_counts["wrong_center_low_clash"], device=device
+                        )
+                        if torch.cuda.is_available():
+                            epoch_rank_peak_mem_mb = max(
+                                epoch_rank_peak_mem_mb,
+                                float(torch.cuda.max_memory_allocated(device=device) / (1024 ** 2)),
+                            )
+                        del same_center_batch, same_center_pred, pose_quality_same, t_same, x_t_same
+                    except torch.cuda.OutOfMemoryError:
+                        logger.warning(f"Batch {batch_idx}: ranking forward OOM, skipping pairwise loss.")
+                        loss_pose_rank = torch.tensor(0.0, device=device)
+                        epoch_rank_oom_skips += 1
+                        gc.collect()
+                        torch.cuda.empty_cache()
+
+                loss_pose_bootstrap = torch.tensor(0.0, device=device)
+                teacher_model = ema_model if ema_model is not None else model
+                if pose_bootstrap_weight > 0.0 and should_run_bootstrap(
+                    epoch=epoch,
+                    batch_idx=batch_idx,
+                    total_epochs=epochs,
+                    frequency=pose_bootstrap_frequency,
+                    start_ratio=0.30,
+                ):
+                    loss_pose_bootstrap = compute_bootstrap_pose_quality_loss(
+                        student_model=model,
+                        teacher_model=teacher_model,
+                        matcher=matcher,
+                        source_batch=source_batch,
+                        placement_centers=bootstrap_centers,
+                        epoch=epoch,
+                        ode_steps=pose_bootstrap_ode_steps,
+                        graph_builder=graph_builder,
+                        collator=collator,
+                        crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+                    )
+                    loss_dict["loss_pose_bootstrap"] = loss_pose_bootstrap.detach()
+
+                loss_dict["loss_center_proposal"] = proposal_loss.detach()
+                loss_dict["weight_center_proposal"] = torch.tensor(center_proposal_weight, device=device)
+                loss_dict["weight_pose_rank"] = torch.tensor(pose_ranking_pair_weight, device=device)
+                loss_dict["weight_pose_bootstrap"] = torch.tensor(pose_bootstrap_weight, device=device)
+                loss = (
+                    loss_dict["total"]
+                    + center_proposal_weight * proposal_loss
+                    + pose_ranking_pair_weight * loss_pose_rank
+                    + pose_bootstrap_weight * loss_pose_bootstrap
+                )
 
                 # 防御性检查
                 if loss.grad_fn is None:
@@ -775,12 +1869,18 @@ def train(
                 optimizer.zero_grad(set_to_none=True)
                 accumulated_graphs = 0
                 # 必须删除所有引用 GPU tensor 的局部变量，否则碎片无法回收
-                for _var in ('batch', 'predictions', 'loss_dict', 'loss', 'loss_sum', 'targets', 'x_1', 'x_t', 't'):
-                    if _var in locals():
-                        try:
-                            del locals()[_var]
-                        except Exception:
-                            pass
+                batch = source_batch = local_batch = None  # type: ignore[assignment]
+                predictions = loss_dict = loss = loss_sum = None  # type: ignore[assignment]
+                targets = x_1 = x_t = t = None  # type: ignore[assignment]
+                proposal_loss = ligand_centers = proposal_logits = None  # type: ignore[assignment]
+                proposal_logits_cpu = proposal_top_scores = proposal_top_scores_cpu = None  # type: ignore[assignment]
+                residue_pos_for_crop = residue_batch_for_crop = None  # type: ignore[assignment]
+                residue_pos_cpu = residue_batch_cpu = None  # type: ignore[assignment]
+                crop_centers = crop_centers_cpu = None  # type: ignore[assignment]
+                wrong_centers = wrong_centers_cpu = None  # type: ignore[assignment]
+                wrong_center_scores = wrong_center_scores_cpu = None  # type: ignore[assignment]
+                wrong_center_valid = wrong_center_valid_cpu = None  # type: ignore[assignment]
+                bootstrap_centers = bootstrap_centers_cpu = None  # type: ignore[assignment]
                 gc.collect()
                 torch.cuda.empty_cache()
 
@@ -877,11 +1977,17 @@ def train(
                     "L_tor": f"{loss_dict.get('loss_torsion', torch.tensor(0)).item():.3f}",
                     "L_ene": f"{loss_dict.get('loss_energy', torch.tensor(0)).item():.3f}",
                     "L_cls": f"{loss_dict.get('loss_clash', torch.tensor(0)).item():.3f}",
+                    "L_rank": f"{loss_dict.get('loss_pose_rank', torch.tensor(0)).item():.3f}",
                     "LR": f"{scheduler.get_last_lr()[0]:.2e}",
                 }
             )
 
-            del predictions, loss_dict, loss, loss_sum, targets, x_1, x_t, t, batch
+            del predictions, loss_dict, loss, loss_sum, targets, x_1, x_t, t, batch, source_batch
+            del proposal_logits, proposal_logits_cpu, proposal_top_scores, proposal_top_scores_cpu
+            del residue_pos_for_crop, residue_batch_for_crop, residue_pos_cpu, residue_batch_cpu
+            del crop_centers, crop_centers_cpu, crop_modes
+            del wrong_centers, wrong_centers_cpu, wrong_center_scores, wrong_center_scores_cpu
+            del wrong_center_valid, wrong_center_valid_cpu, bootstrap_centers, bootstrap_centers_cpu
 
         # 循环结束，如果有剩余积累的梯度，进行最后一次 step
         if accumulated_graphs > 0:
@@ -909,6 +2015,33 @@ def train(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         avg_train_loss = train_loss_meter / max(1, actual_batches)
+        if epoch_proposal_losses and epoch_local_losses:
+            proposal_mean = float(np.mean(epoch_proposal_losses))
+            proposal_std = float(np.std(epoch_proposal_losses))
+            local_mean = float(np.mean(epoch_local_losses))
+            local_std = float(np.std(epoch_local_losses))
+            proposal_scale_ratio = proposal_mean / max(local_mean, 1e-8)
+            logger.info(
+                "Loss scale stats | proposal=%.4f±%.4f | local=%.4f±%.4f | ratio=%.4f | "
+                "proposal_res/graph=%.1f | local_res/graph=%.1f",
+                proposal_mean,
+                proposal_std,
+                local_mean,
+                local_std,
+                proposal_scale_ratio,
+                float(np.mean(epoch_proposal_residues)) if epoch_proposal_residues else 0.0,
+                float(np.mean(epoch_local_residues)) if epoch_local_residues else 0.0,
+            )
+        logger.info(
+            "Ranking stats | same_center=%d | wrong_center_low_clash=%d | misleading_center=%d | "
+            "misleading_affinity=%d | rank_oom_skips=%d | rank_peak_mem_mb=%.1f",
+            epoch_rank_pair_counts["same_center"],
+            epoch_rank_pair_counts["wrong_center_low_clash"],
+            epoch_rank_pair_counts["misleading_center"],
+            epoch_rank_pair_counts["misleading_affinity"],
+            epoch_rank_oom_skips,
+            epoch_rank_peak_mem_mb,
+        )
 
         if epoch_oom_batches > 0:
             logger.warning(
@@ -1008,7 +2141,7 @@ def train(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        avg_val_loss = compute_validation_loss(
+        local_metrics_raw = compute_validation_loss(
             model=ema_model if ema_model is not None else model,
             matcher=matcher,
             criterion=criterion,
@@ -1019,13 +2152,66 @@ def train(
             max_rmsd_batches=rmsd_check_batches,
             dataset=dataset,
             warmup_epochs=warmup_epochs,
+            graph_builder=graph_builder,
+            collator=collator,
+            crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+            center_proposal_weight=center_proposal_weight,
+            center_positive_radius=center_positive_radius,
             # [修复] edge_guard 应基于实际的 val_edge_budget 并预留动态边余量
             # 旧算法用 val_max_nodes * 60 = 360K，但批内实际边数远超该值
             # 现在改为 val_edge_budget * 1.5，为前向传播动态边预留 50% headroom
             edge_guard_limit=max(1, int(
                 current_val_max_nodes_per_batch * train_edge_budget_factor * 1.5
             )),
+            ode_steps=val_ode_steps,
         )
+        local_metrics = dict(local_metrics_raw) if isinstance(local_metrics_raw, dict) else {"val_loss": float(local_metrics_raw)}
+
+        blind_eval = evaluate_topn_success(
+            model=ema_model if ema_model is not None else model,
+            matcher=matcher,
+            loader=val_loader,
+            device=device,
+            graph_builder=graph_builder,
+            collator=collator,
+            topk_values=test_topk_values,
+            num_pose_samples=max(test_pose_samples, max(test_topk_values)),
+            center_topk=center_proposal_topk,
+            refine_topk=center_refine_topk,
+            center_nms_radius=center_nms_radius,
+            stage1_pose_samples=stage1_pose_samples,
+            stage2_pose_samples=stage2_pose_samples,
+            crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+            ode_steps=val_ode_steps,
+            warmup_epochs=warmup_epochs,
+            edge_guard_limit=max(1, int(
+                current_val_max_nodes_per_batch * train_edge_budget_factor * 1.5
+            )),
+            center_hit_radius=center_positive_radius,
+            fusion_weights=current_fusion_weights,
+            return_candidate_records=True,
+        )
+        blind_candidate_records = cast(list[dict[str, Any]], blind_eval.get("candidate_records", []))
+        if enable_fusion_calibration and blind_candidate_records:
+            current_fusion_weights = calibrate_linear_fusion_weights(
+                blind_candidate_records,
+                topk_values=test_topk_values,
+                search_center_weights=fusion_search_center_weights,
+                search_aff_weights=fusion_search_aff_weights,
+                search_clash_weights=fusion_search_clash_weights,
+            )
+        blind_metrics = summarize_blind_candidate_records(
+            blind_candidate_records,
+            topk_values=test_topk_values,
+            fusion_weights=current_fusion_weights,
+        )
+        blind_metrics["topn_edge_guard_skips"] = float(blind_eval.get("topn_edge_guard_skips", 0.0))
+        blind_metrics["topn_pose_samples"] = float(blind_eval.get("topn_pose_samples", 0.0))
+        blind_metrics["fusion_pose_weight"] = float(current_fusion_weights["pose_weight"])
+        blind_metrics["fusion_center_weight"] = float(current_fusion_weights["center_weight"])
+        blind_metrics["fusion_aff_weight"] = float(current_fusion_weights.get("aff_weight", 0.0))
+        blind_metrics["fusion_clash_weight"] = float(current_fusion_weights.get("clash_weight", 0.0))
+        blind_metrics["fusion_bias"] = float(current_fusion_weights["bias"])
         
         # [新增] 验证结束，下一轮开始前的清理
         gc.collect()
@@ -1033,16 +2219,15 @@ def train(
             torch.cuda.empty_cache()
 
         # 提取指标
-        if isinstance(avg_val_loss, dict):
-            val_metrics = avg_val_loss
-            avg_val_loss_scalar = val_metrics["val_loss"]
-            mean_rmsd = val_metrics["mean_rmsd_final"]
-        else:
-            avg_val_loss_scalar = avg_val_loss
-            mean_rmsd = float("inf")
-            val_metrics = {}
+        avg_val_loss_scalar = float(local_metrics.get("val_loss", float("nan")))
+        mean_rmsd = float(blind_metrics.get("reranked_top1_mean_best_rmsd", local_metrics.get("mean_rmsd_final", float("inf"))))
+        val_metrics = {f"local_{k}": v for k, v in local_metrics.items()}
+        val_metrics.update(blind_metrics)
+        val_metrics["val_loss"] = avg_val_loss_scalar
+        val_metrics["mean_rmsd_final"] = float(local_metrics.get("mean_rmsd_final", float("inf")))
+        val_metrics["local_val_loss"] = avg_val_loss_scalar
 
-        val_oom_batches = int(val_metrics.get("oom_batches", 0)) if isinstance(val_metrics, dict) else 0
+        val_oom_batches = int(val_metrics.get("local_oom_batches", 0)) if isinstance(val_metrics, dict) else 0
 
         if (
             enable_val_oom_adaptive_batch
@@ -1097,10 +2282,11 @@ def train(
 
         logger.info(
             f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | "
-            f"Val Loss: {avg_val_loss_scalar:.4f} | Val RMSD: {mean_rmsd:.4f} | "
-            f"Median: {val_metrics.get('median_rmsd_final', float('inf')):.4f} | "
-            f"Centroid: {val_metrics.get('centroid_dist_mean', float('inf')):.4f} | "
-            f"Pearson: {val_metrics.get('pearson_r', 0):.4f} | "
+            f"Val-Local Loss: {avg_val_loss_scalar:.4f} | "
+            f"Val-Blind Top1 RMSD: {mean_rmsd:.4f} | "
+            f"Oracle@1<2A: {val_metrics.get('oracle_top1_success_2a', 0.0):.2f} | "
+            f"Rerank@1<2A: {val_metrics.get('reranked_top1_success_2a', 0.0):.2f} | "
+            f"CenterRecall@8: {val_metrics.get('center_recall@8', 0.0):.2f} | "
             f"OOM batches: epoch={epoch_oom_batches}, total={total_oom_batches} | "
             f"Edge-guard skips: {epoch_edge_guard_skips} | "
             f"OOM-blacklisted samples: {len(oom_blacklisted_pdb_ids)}"
@@ -1110,10 +2296,21 @@ def train(
         logger.info(
             "Checkpoint selection metrics | "
             f"Composite: {selection_metrics['composite_score']:.4f} | "
-            f"Success@2A: {selection_metrics['success_2a']:.2f} | "
-            f"Success@5A: {selection_metrics['success_5a']:.2f} | "
+            f"BlindCombo: {selection_metrics['blind_combo_score']:.4f} | "
+            f"Rerank@1<2A: {selection_metrics['success_2a']:.2f} | "
+            f"Rerank@5<2A: {selection_metrics['success_5a']:.2f} | "
+            f"Oracle@5<2A: {selection_metrics['oracle_top5_success_2a']:.2f} | "
+            f"CenterRecall@8: {selection_metrics['center_recall@8']:.2f} | "
+            f"ProposalGap: {selection_metrics['proposal_gap']:.2f} | "
+            f"RankingGap: {selection_metrics['ranking_gap']:.2f} | "
             f"Mean RMSD: {selection_metrics['mean_rmsd']:.4f} | "
             f"Val Loss: {selection_metrics['val_loss']:.4f}"
+        )
+        logger.info(
+            "Checkpoint selection mode | mode=%s | primary=%s | value=%.4f",
+            checkpoint_selection_mode,
+            selected_metric_label,
+            selection_metrics[selected_primary_key],
         )
 
         checkpoint = _compose_checkpoint(
@@ -1131,18 +2328,35 @@ def train(
         if not is_warmup:
             if _is_better_checkpoint(
                 selection_metrics,
+                best_selected_metrics,
+                primary_key=selected_primary_key,
+                primary_higher_is_better=selected_higher_is_better,
+            ):
+                best_selected_metrics = dict(selection_metrics)
+                best_selected_updated_this_epoch = True
+                torch.save(checkpoint, os.path.join(save_dir, "best_selected_model.pt"))
+                torch.save(checkpoint, os.path.join(save_dir, "best_model.pt"))
+                logger.info(
+                    "Saved best selected model | mode=%s | %s=%.4f | Rerank@1<2A=%.2f | Oracle@5<2A=%.2f",
+                    checkpoint_selection_mode,
+                    selected_metric_label,
+                    selection_metrics[selected_primary_key],
+                    selection_metrics["success_2a"],
+                    selection_metrics["oracle_top5_success_2a"],
+                )
+            if _is_better_checkpoint(
+                selection_metrics,
                 best_composite_metrics,
                 primary_key="composite_score",
                 primary_higher_is_better=True,
             ):
                 best_composite_metrics = dict(selection_metrics)
                 torch.save(checkpoint, os.path.join(save_dir, "best_composite_model.pt"))
-                torch.save(checkpoint, os.path.join(save_dir, "best_model.pt"))
                 logger.info(
                     "Saved best composite model | "
                     f"Composite={selection_metrics['composite_score']:.4f}, "
-                    f"Success@2A={selection_metrics['success_2a']:.2f}, "
-                    f"Success@5A={selection_metrics['success_5a']:.2f}, "
+                    f"Rerank@1<2A={selection_metrics['success_2a']:.2f}, "
+                    f"Rerank@5<2A={selection_metrics['success_5a']:.2f}, "
                     f"Mean RMSD={selection_metrics['mean_rmsd']:.4f}."
                 )
 
@@ -1156,8 +2370,8 @@ def train(
                 torch.save(checkpoint, os.path.join(save_dir, "best_success2a_model.pt"))
                 logger.info(
                     "Saved best Success@2A model | "
-                    f"Success@2A={selection_metrics['success_2a']:.2f}, "
-                    f"Success@5A={selection_metrics['success_5a']:.2f}, "
+                    f"Rerank@1<2A={selection_metrics['success_2a']:.2f}, "
+                    f"Rerank@5<2A={selection_metrics['success_5a']:.2f}, "
                     f"Mean RMSD={selection_metrics['mean_rmsd']:.4f}."
                 )
 
@@ -1177,12 +2391,130 @@ def train(
         if (epoch + 1) % 10 == 0:
             torch.save(checkpoint, os.path.join(save_dir, f"model_epoch_{epoch+1}.pt"))
 
+        # 4. 半离线 Blind Candidate Pool 刷新
+        if should_refresh_pool(
+            epoch,
+            refresh_every=blind_pool_refresh_every,
+            min_start_epoch=blind_pool_start_epoch,
+            best_updated_this_epoch=best_selected_updated_this_epoch,
+        ):
+            logger.info("Refreshing blind candidate pool at epoch %d ...", epoch + 1)
+            pool_model = ema_model if ema_model is not None else model
+            pool_loader = _build_eval_loader(train_set, configured_topn_max_nodes_per_batch)
+            try:
+                new_pool = refresh_blind_candidate_pool(
+                    model=pool_model,
+                    matcher=matcher,
+                    loader=pool_loader,
+                    device=device,
+                    graph_builder=graph_builder,
+                    collator=collator,
+                    center_topk=center_proposal_topk,
+                    refine_topk=center_refine_topk,
+                    center_nms_radius=center_nms_radius,
+                    stage1_pose_samples=stage1_pose_samples,
+                    stage2_pose_samples=stage2_pose_samples,
+                    crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+                    ode_steps=val_ode_steps,
+                    warmup_epochs=warmup_epochs,
+                    center_hit_radius=center_positive_radius,
+                    max_complexes=blind_pool_max_complexes,
+                    fusion_weights=current_fusion_weights,
+                    pool_epoch=epoch,
+                    generator_ckpt_id=f"epoch_{epoch}",
+                )
+                if new_pool:
+                    cached_blind_pool = new_pool
+                    save_blind_pool(
+                        new_pool, blind_pool_cache_dir, epoch=epoch,
+                        meta={
+                            "center_proposal_topk": center_proposal_topk,
+                            "center_refine_topk": center_refine_topk,
+                            "stage1_pose_samples": stage1_pose_samples,
+                            "stage2_pose_samples": stage2_pose_samples,
+                            "ode_steps": val_ode_steps,
+                            "crop_radius": float(pocket_radius if pocket_radius is not None else 10.0),
+                        },
+                    )
+                    pool_stats = get_pool_stats(cached_blind_pool)
+                    logger.info("Blind pool stats: %s", pool_stats)
+
+            except Exception as e:
+                logger.warning("Blind pool refresh failed: %s", e)
+            finally:
+                del pool_loader
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+        # 5. Replay-based reranker training: 当前模型重新打分缓存候选
+        if cached_blind_pool and blind_pool_cache_rank_weight > 0:
+            try:
+                import random as _rng
+                replay_dataset = BlindCandidateReplayDataset(
+                    cached_blind_pool,
+                    candidates_per_complex=max(4, blind_pool_pairs_per_complex * 2),
+                )
+                if len(replay_dataset) > 0:
+                    model.train()
+                    replay_sample_size = min(16, len(replay_dataset))
+                    replay_indices = _rng.sample(range(len(replay_dataset)), replay_sample_size)
+                    replay_items = [replay_dataset[i] for i in replay_indices]
+
+                    replay_losses = replay_and_compute_losses(
+                        model=model,
+                        replay_items=replay_items,
+                        train_set=train_set,
+                        graph_builder=graph_builder,
+                        collator=collator,
+                        device=device,
+                        crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+                        margin=pose_ranking_margin,
+                        lambda_bce=blind_pool_cache_bce_weight,
+                        lambda_pair=blind_pool_cache_rank_weight,
+                        lambda_list=0.5,
+                        lambda_center_value=0.3,
+                        use_pose_rank_head=True,
+                    )
+
+                    replay_total = replay_losses["rerank_total"]
+                    center_val_loss = replay_losses.get("center_value_loss", torch.tensor(0.0, device=device))
+                    combined_replay_loss = replay_total + 0.3 * center_val_loss
+
+                    if combined_replay_loss.requires_grad and combined_replay_loss.item() > 0:
+                        optimizer.zero_grad()
+                        combined_replay_loss.backward()
+                        replay_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
+                        if not (torch.isnan(replay_grad_norm) or torch.isinf(replay_grad_norm)):
+                            optimizer.step()
+                            if ema_model is not None:
+                                ema_model.update_parameters(model)
+                        optimizer.zero_grad()
+
+                    logger.info(
+                        "Replay reranker | bce=%.4f | pairwise=%.4f | listwise=%.4f | "
+                        "center_value=%.4f | n_pairs=%d | total=%.4f",
+                        replay_losses["rerank_bce"].item(),
+                        replay_losses["rerank_pairwise"].item(),
+                        replay_losses["rerank_listwise"].item(),
+                        center_val_loss.item(),
+                        int(replay_losses["rerank_n_pairs"].item()),
+                        combined_replay_loss.item(),
+                    )
+                    model.eval()
+
+            except Exception as e:
+                logger.warning("Replay reranker training failed: %s\n%s", e, traceback.format_exc())
+
+        best_selected_updated_this_epoch = False
+
     # 6. 训练完成后的独立测试集评估（用于最终报告/专利材料）
     if run_test_after_training:
         if len(test_set) == 0:
             logger.warning("Test set is empty; skipping final test evaluation.")
         else:
             preferred_ckpt_paths = [
+                os.path.join(save_dir, "best_selected_model.pt"),
                 os.path.join(save_dir, "best_composite_model.pt"),
                 os.path.join(save_dir, "best_model.pt"),
                 os.path.join(save_dir, "best_rmsd_model.pt"),
@@ -1208,30 +2540,61 @@ def train(
                 max_rmsd_batches=max(10_000_000, len(test_set)),
                 dataset=dataset,
                 warmup_epochs=warmup_epochs,
+                graph_builder=graph_builder,
+                collator=collator,
+                crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+                center_proposal_weight=center_proposal_weight,
+                center_positive_radius=center_positive_radius,
                 edge_guard_limit=max(1, int(
                     configured_test_max_nodes_per_batch * train_edge_budget_factor * eval_edge_guard_headroom
                 )),
+                ode_steps=val_ode_steps,
             )
             if isinstance(test_metrics_raw, dict):
-                test_metrics = dict(test_metrics_raw)
+                test_metrics = {f"local_{k}": v for k, v in dict(test_metrics_raw).items()}
+                test_metrics["val_loss"] = float(test_metrics_raw.get("val_loss", float("nan")))
             else:
                 test_metrics = {"val_loss": float(test_metrics_raw)}
 
             topn_loader = _build_eval_loader(test_set, configured_topn_max_nodes_per_batch)
 
-            topn_metrics = evaluate_topn_success(
+            topn_eval = evaluate_topn_success(
                 model=model,
                 matcher=matcher,
                 loader=topn_loader,
                 device=device,
+                graph_builder=graph_builder,
+                collator=collator,
                 topk_values=test_topk_values,
                 num_pose_samples=max(test_pose_samples, max(test_topk_values)),
-                ode_steps=50,
+                center_topk=center_proposal_topk,
+                refine_topk=center_refine_topk,
+                center_nms_radius=center_nms_radius,
+                stage1_pose_samples=stage1_pose_samples,
+                stage2_pose_samples=stage2_pose_samples,
+                crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+                ode_steps=val_ode_steps,
                 warmup_epochs=warmup_epochs,
                 edge_guard_limit=max(1, int(
                     configured_topn_max_nodes_per_batch * train_edge_budget_factor * eval_edge_guard_headroom
                 )),
+                center_hit_radius=center_positive_radius,
+                fusion_weights=current_fusion_weights,
+                return_candidate_records=True,
             )
+            test_candidate_records = cast(list[dict[str, Any]], topn_eval.get("candidate_records", []))
+            topn_metrics = summarize_blind_candidate_records(
+                test_candidate_records,
+                topk_values=test_topk_values,
+                fusion_weights=current_fusion_weights,
+            )
+            topn_metrics["fusion_pose_weight"] = float(current_fusion_weights["pose_weight"])
+            topn_metrics["fusion_center_weight"] = float(current_fusion_weights["center_weight"])
+            topn_metrics["fusion_aff_weight"] = float(current_fusion_weights.get("aff_weight", 0.0))
+            topn_metrics["fusion_clash_weight"] = float(current_fusion_weights.get("clash_weight", 0.0))
+            topn_metrics["fusion_bias"] = float(current_fusion_weights["bias"])
+            topn_metrics["topn_edge_guard_skips"] = float(topn_eval.get("topn_edge_guard_skips", 0.0))
+            topn_metrics["topn_pose_samples"] = float(topn_eval.get("topn_pose_samples", 0.0))
             test_metrics.update(topn_metrics)
 
             report_dir = os.path.join(save_dir, "reports")
@@ -1257,7 +2620,13 @@ def compute_validation_loss(
     max_rmsd_batches: int = 10,
     dataset: PDBBindDataset | None = None,
     warmup_epochs: int = 20,
+    graph_builder: Any | None = None,
+    collator: GraphCollator | None = None,
+    crop_radius: float = 10.0,
+    center_proposal_weight: float = 0.15,
+    center_positive_radius: float = 4.0,
     edge_guard_limit: int | None = None,
+    ode_steps: int = 50,
 ) -> dict | float:
     """
     验证函数：计算 Loss 并统计全量 RMSD 指标
@@ -1284,6 +2653,9 @@ def compute_validation_loss(
     val_total_graphs = len(cast(Any, loader).dataset) if hasattr(loader, "dataset") else 0
     pbar = tqdm(total=val_total_graphs, desc=f"Epoch {(epoch or 0) + 1} [Val]", leave=False, unit="graphs")
 
+    if graph_builder is None or collator is None:
+        raise ValueError("graph_builder and collator are required for runtime local cropping.")
+
     for i, batch in enumerate(loader):
         num_graphs = int(batch["ligand_atom"].batch.max().item()) + 1
         pbar.update(num_graphs)
@@ -1307,7 +2679,27 @@ def compute_validation_loss(
                 continue
 
         try:
-            batch = batch.to(device)
+            ligand_centers = scatter_mean(
+                batch["ligand_atom"].pos,
+                batch["ligand_atom"].batch,
+                dim=0,
+                dim_size=num_graphs,
+            )
+            proposal_loss = compute_proposal_loss(
+                model,
+                batch,
+                device=device,
+                positive_radius=center_positive_radius,
+            )
+            local_batch = build_local_batch_from_centers(
+                batch,
+                centers=ligand_centers,
+                crop_radius=crop_radius,
+                graph_builder=graph_builder,
+                collator=collator,
+            )
+            batch = local_batch.to(device)
+            crop_centers = ligand_centers.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
             apply_loss_context(
                 batch,
                 current_epoch=epoch if epoch is not None else total_epochs - 1,
@@ -1322,7 +2714,8 @@ def compute_validation_loss(
                 x_1=x_1,
                 data=batch,
                 current_epoch=epoch if epoch is not None else 0,
-                total_epochs=total_epochs
+                total_epochs=total_epochs,
+                placement_centers=crop_centers,
             )
 
             batch["ligand_atom"].pos = x_t
@@ -1332,9 +2725,10 @@ def compute_validation_loss(
 
             # matcher 已返回分解好的 SE(3) 目标，直接补全结合能
             targets["binding_affinity_target"] = batch.get("y_energy", None)
+            targets["pose_quality_target"] = compute_pose_quality_target(x_t, x_1, batch["ligand_atom"].batch)
 
             loss_dict = criterion(predictions, targets, batch)
-            loss = loss_dict["total"]
+            loss = loss_dict["total"] + center_proposal_weight * proposal_loss
             
             # 过滤爆炸 Loss
             if not torch.isnan(loss) and not torch.isinf(loss) and loss.item() < 1e6:
@@ -1384,6 +2778,10 @@ def compute_validation_loss(
                         masses=infer_batch["ligand_atom"].masses,
                         torsion_indices=getattr(infer_batch, "torsion_indices", None),
                         torsion_moving_mask=getattr(infer_batch, "torsion_moving_mask", None),
+                        seed_pos=infer_batch["ligand_atom"].get("start_pos", None),
+                        protein_pos=infer_batch["protein_atom"].pos,
+                        protein_batch=getattr(infer_batch["protein_atom"], "batch", None),
+                        placement_centers=crop_centers,
                         epoch=warmup_epochs,
                     )
                     
@@ -1394,12 +2792,11 @@ def compute_validation_loss(
                     # [修改] 强制转 CPU，切断 GPU 显存占用
                     all_rmsd_init.append(rmsd_init.detach().cpu())
 
-                    # 执行推演（Euler 50 步，用于训练期间的趋势监控）
                     infer_batch["ligand_atom"].pos = x_0_infer
                     final_pos, _ = matcher.ode_solve(
                         model=model,
                         data=infer_batch,
-                        steps=50,
+                        steps=ode_steps,
                         method="euler",
                         store_trajectory=False,
                     )
@@ -1441,7 +2838,7 @@ def compute_validation_loss(
                 torch.cuda.empty_cache()
             continue
 
-        del predictions, targets, loss_dict, loss, x_1, x_t, t, batch
+        del predictions, targets, loss_dict, loss, x_1, x_t, t, batch, proposal_loss, ligand_centers, local_batch, crop_centers
 
     # ========== 综合评估指标计算 ==========
     metrics: dict[str, float] = {}
@@ -1518,6 +2915,8 @@ def compute_validation_loss(
     metrics["median_rmsd_final"] = median_final
     metrics["success_2a"] = success_2a
     metrics["success_5a"] = success_5a
+    metrics["single_shot_success_2a"] = success_2a
+    metrics["single_shot_success_5a"] = success_5a
     metrics["centroid_dist_mean"] = mean_centroid
     metrics["centroid_dist_median"] = median_centroid
     metrics["oom_batches"] = float(oom_batches)
@@ -1546,154 +2945,70 @@ def evaluate_topn_success(
     matcher: ConditionalFlowMatcher,
     loader: DataLoader,
     device: torch.device,
+    graph_builder: Any,
+    collator: GraphCollator,
     topk_values: tuple[int, ...] = (1, 5, 10),
     num_pose_samples: int = 10,
+    center_topk: int = 8,
+    refine_topk: int = 3,
+    center_nms_radius: float = 6.0,
+    stage1_pose_samples: int = 2,
+    stage2_pose_samples: int = 4,
+    crop_radius: float = 10.0,
     ode_steps: int = 50,
     warmup_epochs: int = 20,
     edge_guard_limit: int | None = None,
-) -> dict[str, float]:
-    """
-    基于多候选 pose 生成 + 亲和力排序，统计 Top-N 对接成功率。
-
-    评估流程（按 batch）：
-    1. 每个复合物生成 num_pose_samples 个候选 pose；
-    2. 用模型亲和力 head 对候选 pose 打分并排序；
-    3. 对每个 N，统计 Top-N 内最优 RMSD 是否 < 2Å / < 5Å。
-    """
-
-    model.eval()
-
-    if num_pose_samples <= 0:
-        raise ValueError(f"num_pose_samples must be > 0, got {num_pose_samples}")
+    center_hit_radius: float = 4.0,
+    fusion_weights: dict[str, float] | None = None,
+    return_candidate_records: bool = False,
+) -> dict[str, Any]:
+    """基于统一候选生成引擎的 Top-N 对接成功率评估。"""
 
     topk_unique = tuple(sorted({int(k) for k in topk_values if int(k) > 0}))
     if not topk_unique:
         raise ValueError("topk_values must contain at least one positive integer")
 
-    max_k = max(topk_unique)
-    if num_pose_samples < max_k:
-        raise ValueError(
-            f"num_pose_samples ({num_pose_samples}) must be >= max top-k ({max_k})"
-        )
+    candidate_records = generate_candidates_from_loader(
+        model=model,
+        matcher=matcher,
+        loader=loader,
+        device=device,
+        graph_builder=graph_builder,
+        collator=collator,
+        center_topk=center_topk,
+        refine_topk=refine_topk,
+        center_nms_radius=center_nms_radius,
+        stage1_pose_samples=stage1_pose_samples,
+        stage2_pose_samples=stage2_pose_samples,
+        crop_radius=crop_radius,
+        ode_steps=ode_steps,
+        warmup_epochs=warmup_epochs,
+        center_hit_radius=center_hit_radius,
+        fusion_weights=fusion_weights,
+        edge_guard_limit=edge_guard_limit,
+    )
 
-    success_counts_2a = {k: 0.0 for k in topk_unique}
-    success_counts_5a = {k: 0.0 for k in topk_unique}
-    mean_best_rmsd = {k: [] for k in topk_unique}
-    total_graphs = 0
-    edge_guard_skips = 0
-
-    for batch_idx, batch in enumerate(loader):
-        try:
-            if edge_guard_limit is not None:
-                total_edges_cpu = 0
-                edge_types = getattr(batch, "edge_types", None)
-                if edge_types:
-                    for edge_type in edge_types:
-                        edge_store = batch[edge_type]
-                        edge_index = getattr(edge_store, "edge_index", None)
-                        if edge_index is not None and edge_index.ndim == 2:
-                            total_edges_cpu += int(edge_index.size(1))
-
-                if total_edges_cpu > edge_guard_limit:
-                    edge_guard_skips += 1
-                    logger.warning(
-                        f"Top-N eval batch {batch_idx}: preflight skip due to edge-heavy batch "
-                        f"(total_edges={total_edges_cpu} > limit={edge_guard_limit})."
-                    )
-                    continue
-
-            batch = batch.to(device)
-            x_ref = batch["ligand_atom"].pos
-            lig_batch = batch["ligand_atom"].batch
-            masses = batch["ligand_atom"].masses
-            B = int(lig_batch.max().item()) + 1
-
-            torsion_indices = getattr(batch, "torsion_indices", None)
-            torsion_moving_mask = getattr(batch, "torsion_moving_mask", None)
-
-            candidate_rmsd: list[torch.Tensor] = []
-            candidate_scores: list[torch.Tensor] = []
-
-            for pose_id in range(num_pose_samples):
-                infer_batch = batch.clone()
-                x0 = matcher._generate_random_pose(
-                    x_ref=x_ref,
-                    batch=lig_batch,
-                    B=B,
-                    masses=masses,
-                    torsion_indices=torsion_indices,
-                    torsion_moving_mask=torsion_moving_mask,
-                    epoch=warmup_epochs + pose_id,
-                )
-
-                infer_batch["ligand_atom"].pos = x0
-                final_pos, _ = matcher.ode_solve(
-                    model=model,
-                    data=infer_batch,
-                    steps=ode_steps,
-                    method="euler",
-                    store_trajectory=False,
-                )
-
-                sq_diff = ((final_pos - x_ref) ** 2).sum(dim=-1)
-                rmsd_per_graph = torch.sqrt(scatter_mean(sq_diff, lig_batch, dim=0, dim_size=B))
-                candidate_rmsd.append(rmsd_per_graph.detach().cpu())
-
-                score_batch = infer_batch.clone()
-                score_batch["ligand_atom"].pos = final_pos
-                score_t = torch.ones(B, device=device, dtype=final_pos.dtype)
-                score_out = model(score_batch, score_t)
-                score = score_out["binding_affinity"].view(-1)
-                candidate_scores.append(score.detach().cpu())
-
-                del infer_batch, score_batch, x0, final_pos, sq_diff, rmsd_per_graph, score_t, score_out, score
-
-            rmsd_mat = torch.stack(candidate_rmsd, dim=1)    # [B, P]
-            score_mat = torch.stack(candidate_scores, dim=1) # [B, P]
-            rank_idx = torch.argsort(score_mat, dim=1, descending=True)
-
-            for k in topk_unique:
-                topk_idx = rank_idx[:, :k]
-                topk_rmsd = torch.gather(rmsd_mat, dim=1, index=topk_idx)
-                best_rmsd_k = torch.min(topk_rmsd, dim=1).values
-
-                success_counts_2a[k] += float((best_rmsd_k < 2.0).float().sum().item())
-                success_counts_5a[k] += float((best_rmsd_k < 5.0).float().sum().item())
-                mean_best_rmsd[k].append(best_rmsd_k)
-
-            total_graphs += B
-
-            del batch, x_ref, lig_batch, masses, candidate_rmsd, candidate_scores, rmsd_mat, score_mat, rank_idx
-
-        except torch.cuda.OutOfMemoryError:
-            logger.warning(f"Top-N eval batch {batch_idx}: CUDA OOM, skipping.")
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            continue
-        except Exception as exc:
-            logger.warning(f"Top-N eval batch {batch_idx} failed: {exc}\n{traceback.format_exc()}")
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            continue
+    total_graphs = len(candidate_records)
+    total_pose_budget = center_topk * stage1_pose_samples + refine_topk * stage2_pose_samples
 
     if total_graphs == 0:
-        return {
-            "topn_total_graphs": 0.0,
-        }
+        result: dict[str, Any] = {"topn_total_graphs": 0.0}
+        if return_candidate_records:
+            result["candidate_records"] = []
+        return result
 
-    metrics: dict[str, float] = {
+    metrics: dict[str, Any] = {
         "topn_total_graphs": float(total_graphs),
-        "topn_pose_samples": float(num_pose_samples),
-        "topn_edge_guard_skips": float(edge_guard_skips),
+        "topn_pose_samples": float(total_pose_budget),
+        "topn_edge_guard_skips": 0.0,
     }
-
-    for k in topk_unique:
-        best_rmsd_all = torch.cat(mean_best_rmsd[k], dim=0) if mean_best_rmsd[k] else torch.tensor([], dtype=torch.float32)
-        metrics[f"top{k}_success_2a"] = (success_counts_2a[k] / total_graphs) * 100.0
-        metrics[f"top{k}_success_5a"] = (success_counts_5a[k] / total_graphs) * 100.0
-        metrics[f"top{k}_mean_best_rmsd"] = float(best_rmsd_all.mean().item()) if best_rmsd_all.numel() > 0 else float("inf")
-        metrics[f"top{k}_median_best_rmsd"] = float(best_rmsd_all.median().item()) if best_rmsd_all.numel() > 0 else float("inf")
-
+    metrics.update(
+        summarize_blind_candidate_records(
+            candidate_records,
+            topk_values=topk_unique,
+            fusion_weights=fusion_weights,
+        )
+    )
+    if return_candidate_records:
+        metrics["candidate_records"] = candidate_records
     return metrics

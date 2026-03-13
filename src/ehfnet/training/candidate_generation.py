@@ -1,0 +1,474 @@
+"""
+统一 blind candidate 生成引擎。
+
+验证、测试、blind pool refresh、离线候选池生成，全部调用同一套逻辑。
+保证候选分布在任何使用场景下完全一致。
+"""
+
+import gc
+import logging
+import traceback
+from typing import Any, cast
+
+import torch
+from torch import Tensor
+from torch.utils.data import DataLoader
+from torch_scatter import scatter_mean
+
+from ehfnet.graph import GraphCollator, crop_graph_to_center
+
+logger = logging.getLogger(__name__)
+
+
+def _rmsd_to_soft_target(rmsd: float, center: float = 4.0, scale: float = 0.75) -> float:
+    import math
+    return 1.0 / (1.0 + math.exp((rmsd - center) / scale))
+
+
+def _classify_rank_bucket(rmsd: float) -> str:
+    if rmsd < 2.0:
+        return "near"
+    if rmsd < 5.0:
+        return "medium"
+    return "bad"
+
+
+def _classify_center_success(best_rmsd: float) -> str:
+    if best_rmsd < 2.0:
+        return "strong_positive"
+    if best_rmsd < 5.0:
+        return "weak_positive"
+    return "negative"
+
+
+@torch.no_grad()
+def generate_blind_candidates(
+    *,
+    model: torch.nn.Module,
+    matcher: Any,
+    samples: list[Any],
+    device: torch.device,
+    graph_builder: Any,
+    collator: GraphCollator,
+    center_topk: int = 8,
+    refine_topk: int = 3,
+    center_nms_radius: float = 6.0,
+    stage1_pose_samples: int = 2,
+    stage2_pose_samples: int = 4,
+    crop_radius: float = 10.0,
+    ode_steps: int = 50,
+    warmup_epochs: int = 20,
+    center_hit_radius: float = 4.0,
+    fusion_weights: dict[str, float] | None = None,
+    dataset_indices: list[int] | None = None,
+    pool_epoch: int = -1,
+    generator_ckpt_id: str = "",
+) -> list[dict[str, Any]]:
+    """Run the full two-stage blind pipeline on a list of samples.
+
+    This is the *single source of truth* for candidate generation.
+    Both validation metrics and blind pool refresh call this function.
+
+    Args:
+        samples: list of HeteroData (full-protein) samples.
+        dataset_indices: optional parallel list of indices into the original dataset,
+            stored in records so replay can look up the original sample.
+
+    Returns:
+        Per-complex records with center-level and pose-level data, including
+        ``pose_xyz`` for replay.
+    """
+    from ehfnet.training.trainer import (
+        predict_center_proposal_logits,
+        select_diverse_center_indices,
+        combine_center_pose_score,
+    )
+
+    model.eval()
+    records: list[dict[str, Any]] = []
+
+    for sample_idx, sample in enumerate(samples):
+        try:
+            batch = collator.collate([sample])
+            proposal_logits, residue_pos_device, residue_batch_device, _ = predict_center_proposal_logits(
+                model, batch, device=device,
+            )
+            graph_logits = proposal_logits.view(-1).detach().cpu()
+            graph_positions = residue_pos_device.detach().cpu()
+
+            if graph_positions.numel() == 0:
+                continue
+
+            pdb_id = getattr(sample, "pdb_id", f"sample_{sample_idx}")
+            gt_pos = sample["ligand_atom"].pos.detach().cpu()
+            gt_center = gt_pos.mean(dim=0)
+
+            center_indices = select_diverse_center_indices(
+                graph_logits, graph_positions,
+                topk=min(center_topk, graph_positions.size(0)),
+                min_distance=center_nms_radius,
+            ).cpu()
+
+            center_records: list[dict[str, Any]] = []
+            pose_records: list[dict[str, Any]] = []
+            center_best_stage1: list[tuple[float, int, Tensor, float]] = []
+            pose_counter = 0
+
+            # ── Stage 1: screen all proposal centers ──
+            for proposal_rank, center_idx in enumerate(center_indices.tolist(), start=1):
+                center_pos = graph_positions[center_idx]
+                center_logit = float(graph_logits[center_idx].item())
+                center_to_gt = float(torch.norm(center_pos - gt_center).item())
+
+                center_rec: dict[str, Any] = {
+                    "center_id": proposal_rank,
+                    "center_xyz": center_pos.tolist(),
+                    "proposal_logit": center_logit,
+                    "proposal_rank": proposal_rank,
+                    "is_center_hit_4A": center_to_gt <= center_hit_radius,
+                    "is_center_hit_6A": center_to_gt <= 6.0,
+                    "center_to_gt_dist": center_to_gt,
+                }
+
+                local_sample = crop_graph_to_center(
+                    sample, center=center_pos, radius=crop_radius,
+                    graph_builder=graph_builder,
+                )
+
+                best_s1_score = -1e9
+                best_s1_rmsd = 999.0
+
+                for pose_id in range(stage1_pose_samples):
+                    pose_rec = _generate_single_pose(
+                        local_sample=local_sample,
+                        center_pos=center_pos,
+                        center_logit=center_logit,
+                        gt_pos=gt_pos,
+                        model=model,
+                        matcher=matcher,
+                        collator=collator,
+                        device=device,
+                        ode_steps=ode_steps,
+                        warmup_epochs=warmup_epochs,
+                        epoch_offset=pose_id,
+                        stage_id="stage1",
+                        center_id=proposal_rank,
+                        pose_counter=pose_counter,
+                        fusion_weights=fusion_weights,
+                    )
+                    if pose_rec is not None:
+                        pose_records.append(pose_rec)
+                        pose_counter += 1
+                        best_s1_score = max(best_s1_score, pose_rec["combined_score"])
+                        best_s1_rmsd = min(best_s1_rmsd, pose_rec["rmsd"])
+
+                center_rec["stage1_best_score"] = best_s1_score
+                center_rec["stage1_best_rmsd"] = best_s1_rmsd
+                center_records.append(center_rec)
+                center_best_stage1.append((best_s1_score, proposal_rank, center_pos, center_logit))
+
+            # ── Stage 2: refine top centers by stage1 score ──
+            center_best_stage1.sort(key=lambda x: x[0], reverse=True)
+            refined_center_ids = set()
+
+            for _, c_rank, center_pos, center_logit_val in center_best_stage1[:max(1, min(refine_topk, len(center_best_stage1)))]:
+                refined_center_ids.add(c_rank)
+                local_sample = crop_graph_to_center(
+                    sample, center=center_pos, radius=crop_radius,
+                    graph_builder=graph_builder,
+                )
+                for pose_id in range(stage2_pose_samples):
+                    pose_rec = _generate_single_pose(
+                        local_sample=local_sample,
+                        center_pos=center_pos,
+                        center_logit=center_logit_val,
+                        gt_pos=gt_pos,
+                        model=model,
+                        matcher=matcher,
+                        collator=collator,
+                        device=device,
+                        ode_steps=ode_steps,
+                        warmup_epochs=warmup_epochs,
+                        epoch_offset=stage1_pose_samples + pose_id,
+                        stage_id="stage2",
+                        center_id=c_rank,
+                        pose_counter=pose_counter,
+                        fusion_weights=fusion_weights,
+                    )
+                    if pose_rec is not None:
+                        pose_records.append(pose_rec)
+                        pose_counter += 1
+
+            if not pose_records:
+                continue
+
+            # back-fill center success labels
+            for crec in center_records:
+                cid = crec["center_id"]
+                center_poses = [p for p in pose_records if p["center_id"] == cid]
+                if center_poses:
+                    best_rmsd = min(p["rmsd"] for p in center_poses)
+                    crec["center_success_label"] = _classify_center_success(best_rmsd)
+                else:
+                    crec["center_success_label"] = "negative"
+
+            # center_hits list for backward-compat with summarize_blind_candidate_records
+            center_hits = [crec["is_center_hit_4A"] for crec in center_records]
+
+            # backward-compat candidates list
+            compat_candidates = [
+                {
+                    "score": p["combined_score"],
+                    "rmsd": p["rmsd"],
+                    "pose_logit": p["pose_quality_logit"],
+                    "center_logit": p["center_logit"],
+                    "aff_logit": p["binding_affinity_teacher"],
+                    "clash_value": p["steric_clash_teacher"],
+                    "proposal_rank": float(p["center_id"]),
+                }
+                for p in pose_records
+            ]
+
+            ds_idx = dataset_indices[sample_idx] if dataset_indices is not None else sample_idx
+
+            records.append({
+                "complex_id": str(pdb_id),
+                "dataset_index": ds_idx,
+                "pdb_id": str(pdb_id),
+                "gt_center_xyz": gt_center.tolist(),
+                "n_ligand_atoms": int(gt_pos.size(0)),
+                "pool_epoch": pool_epoch,
+                "generator_ckpt_id": generator_ckpt_id,
+                "pipeline_config": {
+                    "proposal_topk": center_topk,
+                    "center_refine_topk": refine_topk,
+                    "stage1_pose_samples": stage1_pose_samples,
+                    "stage2_pose_samples": stage2_pose_samples,
+                    "ode_steps": ode_steps,
+                    "crop_radius": crop_radius,
+                },
+                "centers": center_records,
+                "poses": pose_records,
+                # backward-compat fields for summarize_blind_candidate_records
+                "center_hits": center_hits,
+                "candidates": compat_candidates,
+            })
+
+            del batch
+        except torch.cuda.OutOfMemoryError:
+            logger.warning("Candidate generation: OOM on sample %d, skipping.", sample_idx)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as exc:
+            logger.warning("Candidate generation: sample %d failed: %s\n%s", sample_idx, exc, traceback.format_exc())
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    return records
+
+
+def _generate_single_pose(
+    *,
+    local_sample: Any,
+    center_pos: Tensor,
+    center_logit: float,
+    gt_pos: Tensor,
+    model: torch.nn.Module,
+    matcher: Any,
+    collator: GraphCollator,
+    device: torch.device,
+    ode_steps: int,
+    warmup_epochs: int,
+    epoch_offset: int,
+    stage_id: str,
+    center_id: int,
+    pose_counter: int,
+    fusion_weights: dict[str, float] | None,
+) -> dict[str, Any] | None:
+    """Generate one pose at a given center. Returns None on OOM."""
+    from ehfnet.training.trainer import combine_center_pose_score
+
+    try:
+        infer_batch = cast(Any, collator.collate([local_sample])).to(device)
+        x_ref = infer_batch["ligand_atom"].pos
+        lig_batch = infer_batch["ligand_atom"].batch
+        masses = infer_batch["ligand_atom"].masses
+
+        x0 = matcher._generate_random_pose(
+            x_ref=x_ref, batch=lig_batch, B=1, masses=masses,
+            torsion_indices=getattr(infer_batch, "torsion_indices", None),
+            torsion_moving_mask=getattr(infer_batch, "torsion_moving_mask", None),
+            seed_pos=infer_batch["ligand_atom"].get("start_pos", None),
+            protein_pos=infer_batch["protein_atom"].pos,
+            protein_batch=getattr(infer_batch["protein_atom"], "batch", None),
+            placement_centers=center_pos.view(1, 3).to(device=device, dtype=x_ref.dtype),
+            epoch=warmup_epochs + epoch_offset,
+        )
+        infer_batch["ligand_atom"].pos = x0
+        final_pos, _ = matcher.ode_solve(
+            model=model, data=infer_batch, steps=ode_steps,
+            method="euler", store_trajectory=False,
+        )
+
+        sq_diff = ((final_pos - x_ref) ** 2).sum(dim=-1)
+        rmsd = float(torch.sqrt(scatter_mean(sq_diff, lig_batch, dim=0, dim_size=1))[0].item())
+
+        centroid_pred = final_pos.mean(dim=0).detach().cpu()
+        centroid_gt = x_ref.mean(dim=0).detach().cpu()
+        centroid_dist = float(torch.norm(centroid_pred - centroid_gt).item())
+
+        score_batch = infer_batch.clone()
+        score_batch["ligand_atom"].pos = final_pos
+        score_out = model(score_batch, torch.ones(1, device=device, dtype=final_pos.dtype))
+
+        pose_logit = float(score_out["pose_quality"].detach().cpu().view(-1)[0].item())
+        aff_raw = score_out.get("binding_affinity", torch.zeros(1))
+        clash_raw = score_out.get("steric_clash_batch", None)
+        force_atom = score_out.get("ligand_force", None)
+        rank_score_raw = score_out.get("pose_rank_score", None)
+
+        aff_val = float(aff_raw.detach().cpu().view(-1)[0].item())
+        clash_val = float(clash_raw.detach().cpu().view(-1)[0].item()) if clash_raw is not None else 0.0
+        force_norm = 0.0
+        if force_atom is not None and force_atom.numel() > 0:
+            force_norm = float(force_atom.detach().norm(dim=-1).mean().cpu().item())
+        rank_score = float(rank_score_raw.detach().cpu().view(-1)[0].item()) if rank_score_raw is not None else None
+
+        center_logit_t = torch.tensor([center_logit], dtype=torch.float32)
+        pose_logit_t = torch.tensor([pose_logit], dtype=torch.float32)
+        combined_score = float(combine_center_pose_score(
+            center_logit_t, pose_logit_t,
+            aff_logit=torch.tensor([aff_val]),
+            clash_value=torch.tensor([clash_val]),
+            fusion_weights=fusion_weights,
+        )[0].item())
+
+        pose_xyz = final_pos.detach().cpu().tolist()
+
+        del infer_batch, x_ref, lig_batch, masses, x0, final_pos, sq_diff
+        del score_batch, score_out
+
+        rec: dict[str, Any] = {
+            "pose_id": pose_counter,
+            "center_id": center_id,
+            "stage_id": stage_id,
+            "pose_xyz": pose_xyz,
+            "rmsd": rmsd,
+            "centroid_dist": centroid_dist,
+            "pose_quality_logit": pose_logit,
+            "binding_affinity_teacher": aff_val,
+            "steric_clash_teacher": clash_val,
+            "force_norm_teacher": force_norm,
+            "center_logit": center_logit,
+            "combined_score": combined_score,
+            "is_hit_2A": rmsd < 2.0,
+            "is_hit_5A": rmsd < 5.0,
+            "soft_target": _rmsd_to_soft_target(rmsd),
+            "rank_bucket": _classify_rank_bucket(rmsd),
+        }
+        if rank_score is not None:
+            rec["pose_rank_score_teacher"] = rank_score
+        return rec
+
+    except torch.cuda.OutOfMemoryError:
+        logger.warning("Single pose generation OOM at center_id=%d, stage=%s", center_id, stage_id)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return None
+
+
+@torch.no_grad()
+def generate_candidates_from_loader(
+    *,
+    model: torch.nn.Module,
+    matcher: Any,
+    loader: DataLoader,
+    device: torch.device,
+    graph_builder: Any,
+    collator: GraphCollator,
+    center_topk: int = 8,
+    refine_topk: int = 3,
+    center_nms_radius: float = 6.0,
+    stage1_pose_samples: int = 2,
+    stage2_pose_samples: int = 4,
+    crop_radius: float = 10.0,
+    ode_steps: int = 50,
+    warmup_epochs: int = 20,
+    center_hit_radius: float = 4.0,
+    fusion_weights: dict[str, float] | None = None,
+    edge_guard_limit: int | None = None,
+    max_complexes: int | None = None,
+    pool_epoch: int = -1,
+    generator_ckpt_id: str = "",
+) -> list[dict[str, Any]]:
+    """Convenience wrapper: iterate over a DataLoader, unbatch, and generate candidates.
+
+    This replaces both ``evaluate_topn_success`` (partially) and
+    ``refresh_blind_candidate_pool``.
+    """
+    all_records: list[dict[str, Any]] = []
+    total_complexes = 0
+
+    for batch_idx, batch in enumerate(loader):
+        try:
+            if edge_guard_limit is not None:
+                total_edges_cpu = 0
+                edge_types = getattr(batch, "edge_types", None)
+                if edge_types:
+                    for edge_type in edge_types:
+                        edge_store = batch[edge_type]
+                        edge_index = getattr(edge_store, "edge_index", None)
+                        if edge_index is not None and edge_index.ndim == 2:
+                            total_edges_cpu += int(edge_index.size(1))
+                if total_edges_cpu > edge_guard_limit:
+                    logger.warning("Candidate gen batch %d: edge-guard skip (%d > %d)", batch_idx, total_edges_cpu, edge_guard_limit)
+                    continue
+
+            data_list = batch.to_data_list() if hasattr(batch, "to_data_list") else [batch]
+
+            if max_complexes is not None and total_complexes + len(data_list) > max_complexes:
+                data_list = data_list[:max(1, max_complexes - total_complexes)]
+
+            batch_records = generate_blind_candidates(
+                model=model,
+                matcher=matcher,
+                samples=data_list,
+                device=device,
+                graph_builder=graph_builder,
+                collator=collator,
+                center_topk=center_topk,
+                refine_topk=refine_topk,
+                center_nms_radius=center_nms_radius,
+                stage1_pose_samples=stage1_pose_samples,
+                stage2_pose_samples=stage2_pose_samples,
+                crop_radius=crop_radius,
+                ode_steps=ode_steps,
+                warmup_epochs=warmup_epochs,
+                center_hit_radius=center_hit_radius,
+                fusion_weights=fusion_weights,
+                pool_epoch=pool_epoch,
+                generator_ckpt_id=generator_ckpt_id,
+            )
+            all_records.extend(batch_records)
+            total_complexes += len(batch_records)
+
+            del batch, data_list
+
+        except torch.cuda.OutOfMemoryError:
+            logger.warning("Candidate gen batch %d: CUDA OOM, skipping.", batch_idx)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as exc:
+            logger.warning("Candidate gen batch %d failed: %s\n%s", batch_idx, exc, traceback.format_exc())
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        if max_complexes is not None and total_complexes >= max_complexes:
+            break
+
+    return all_records

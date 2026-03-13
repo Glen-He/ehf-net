@@ -27,6 +27,8 @@ class EHFNetOutput(TypedDict):
     v_rotation: Tensor                      # 刚体旋转速度 [B, 3]
     v_torsion: Tensor                       # 扭转角速度 [T] （numel 可为 0）
     binding_affinity: Tensor                # 结合能 [B, 1]
+    pose_quality: Tensor                    # pose 质量分数 [B, 1]
+    pose_rank_score: Tensor                 # 候选集排序分数 [B, 1]
     steric_clash_batch: Tensor | None       # 每分子位阻惩罚量 [B]，无边时为 None
 
 
@@ -166,6 +168,66 @@ class EHFNet(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
+
+        self.center_proposal_head = nn.Sequential(
+            nn.Linear(hidden_dim * 3 + 8, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+
+    def predict_center_logits(
+        self,
+        *,
+        residue_x_cat: Tensor,
+        residue_x_cont: Tensor,
+        residue_pos: Tensor,
+        residue_batch: Tensor,
+        lig_mol_x_cont: Tensor,
+        residue_esm_missing_mask: Tensor | None = None,
+        residue_prior_feat: Tensor | None = None,
+    ) -> Tensor:
+        residue_feat = self.encoder.protein_residue_embedder(
+            residue_x_cat,
+            residue_x_cont,
+            esm_missing_mask=residue_esm_missing_mask,
+        )
+        lig_feat = self.encoder.ligand_molecule_embedder(lig_mol_x_cont)
+
+        if lig_feat.size(0) == 0 or residue_feat.size(0) == 0:
+            return residue_feat.new_zeros((residue_feat.size(0), 1))
+
+        protein_context = scatter_mean(
+            residue_feat,
+            residue_batch,
+            dim=0,
+            dim_size=lig_feat.size(0),
+        )
+        protein_center = scatter_mean(
+            residue_pos,
+            residue_batch,
+            dim=0,
+            dim_size=lig_feat.size(0),
+        )
+        rel_pos = residue_pos - protein_center[residue_batch]
+        rel_norm = torch.norm(rel_pos, dim=-1, keepdim=True)
+        if residue_prior_feat is None:
+            residue_prior_feat = residue_pos.new_zeros((residue_pos.size(0), 4))
+
+        proposal_input = torch.cat(
+            [
+                residue_feat,
+                protein_context[residue_batch],
+                lig_feat[residue_batch],
+                rel_pos,
+                rel_norm,
+                residue_prior_feat,
+            ],
+            dim=-1,
+        )
+        return self.center_proposal_head(proposal_input)
 
 
     def forward(self, data: HeteroData, t: Tensor) -> EHFNetOutput:
@@ -309,6 +371,8 @@ class EHFNet(nn.Module):
             v_torsion = torch.zeros(0, device=device, dtype=lig_mol_feat.dtype)
 
         binding_affinity = predictions["binding_affinity"]
+        pose_quality = predictions["pose_quality"]
+        pose_rank_score = predictions["pose_rank_score"]
         steric_clash_batch = predictions.get("steric_clash_batch")
 
         return {
@@ -317,5 +381,7 @@ class EHFNet(nn.Module):
             "v_rotation": v_rotation,
             "v_torsion": v_torsion,
             "binding_affinity": binding_affinity,
+            "pose_quality": pose_quality,
+            "pose_rank_score": pose_rank_score,
             "steric_clash_batch": steric_clash_batch,
         }

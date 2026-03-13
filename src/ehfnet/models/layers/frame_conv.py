@@ -156,6 +156,10 @@ def compute_mean_direction_frame(
     e1_norm = e1_raw.norm(dim=-1, keepdim=True).clamp(min=eps)
     e1      = e1_raw / e1_norm                                # [N_dst, 3]
 
+    degenerate_frame = has_nbrs & (e1_norm.squeeze(-1) < eps * 10)
+    if degenerate_frame.any():
+        has_nbrs = has_nbrs & ~degenerate_frame
+
     # ── Gram-Schmidt：用参考轴构造与 e1 正交的 e2 ─────────────────────────────
     # 默认参考轴：x 轴；若 e1 与 x 轴近似平行（|cos| > 0.9），改用 y 轴
     ref = torch.zeros_like(e1)
@@ -260,7 +264,7 @@ class FrameAwareConv(nn.Module):
 
         # ── 几何特征（全为旋转不变量） ─────────────────────────────────────────
         r_vec    = pos_src[src_idx] - pos_dst[dst_idx]           # [E, 3]
-        dist     = r_vec.norm(dim=-1)                             # [E]
+        dist     = torch.sqrt((r_vec ** 2).sum(dim=-1) + 1e-8)     # [E]
         rbf_feat = self.rbf(dist)                                 # [E, num_rbf]
 
         # dst 局部帧：[N_dst, 3, 3]，列向量 = 体轴（body→world），已 detach

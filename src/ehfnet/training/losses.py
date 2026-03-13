@@ -29,6 +29,7 @@ class FlowMatchingLoss(nn.Module):
         weight_torsion: float = 0.2,
         weight_energy: float = 0.05,
         weight_clash: float = 0.001,  # 初始极小权重：clash_batch 量级 O(10²)，须防止压垮 SE(3) 损失
+        weight_pose_quality: float = 0.1,
     ) -> None:
         """
         初始化损失函数。
@@ -51,6 +52,7 @@ class FlowMatchingLoss(nn.Module):
             "torsion": weight_torsion,
             "energy": weight_energy,
             "clash": weight_clash,
+            "pose_quality": weight_pose_quality,
         }
 
         self.curriculum_weights = {
@@ -60,6 +62,7 @@ class FlowMatchingLoss(nn.Module):
                 "torsion": 0.05,
                 "energy": 0.0,
                 "clash": 0.0,
+                "pose_quality": 0.02,
             },
             "transition": {
                 "trans": 1.0,
@@ -67,6 +70,7 @@ class FlowMatchingLoss(nn.Module):
                 "torsion": 0.25,
                 "energy": 0.08,
                 "clash": 0.01,
+                "pose_quality": 0.10,
             },
             "refine": {
                 "trans": 0.8,
@@ -74,6 +78,7 @@ class FlowMatchingLoss(nn.Module):
                 "torsion": 0.6,
                 "energy": 0.20,
                 "clash": 0.03,
+                "pose_quality": 0.20,
             },
         }
 
@@ -262,11 +267,28 @@ class FlowMatchingLoss(nn.Module):
                 loss_clash = clash_batch.mean() * float(gate_sum)
 
         loss_dict["loss_clash"] = loss_clash.detach()
+        loss_pose_quality = torch.tensor(0.0, device=device)
+        pred_pose_quality = predictions.get("pose_quality")
+        gt_pose_quality = targets.get("pose_quality_target")
+
+        if pred_pose_quality is not None and gt_pose_quality is not None:
+            pred_pose_quality = pred_pose_quality.view(-1)
+            gt_pose_quality = gt_pose_quality.view(-1).to(device=device, dtype=pred_pose_quality.dtype)
+            if not torch.isnan(pred_pose_quality).any() and not torch.isnan(gt_pose_quality).any():
+                weight = 1.0 + 2.0 * gt_pose_quality
+                loss_pose_quality = F.binary_cross_entropy_with_logits(
+                    pred_pose_quality,
+                    gt_pose_quality.clamp(min=0.0, max=1.0),
+                    weight=weight,
+                )
+
+        loss_dict["loss_pose_quality"] = loss_pose_quality.detach()
         loss_dict["weight_trans"] = torch.tensor(schedule["trans"], device=device)
         loss_dict["weight_rot"] = torch.tensor(schedule["rot"], device=device)
         loss_dict["weight_torsion"] = torch.tensor(schedule["torsion"], device=device)
         loss_dict["weight_energy"] = torch.tensor(schedule["energy"], device=device)
         loss_dict["weight_clash"] = torch.tensor(schedule["clash"], device=device)
+        loss_dict["weight_pose_quality"] = torch.tensor(schedule["pose_quality"], device=device)
 
         # 6. 总损失
         total_loss = (
@@ -275,6 +297,7 @@ class FlowMatchingLoss(nn.Module):
             + schedule["torsion"] * loss_torsion
             + schedule["energy"] * loss_energy
             + schedule["clash"] * loss_clash
+            + schedule["pose_quality"] * loss_pose_quality
         )
 
         loss_dict["total"] = total_loss

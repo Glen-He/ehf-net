@@ -12,6 +12,7 @@ import logging
 from torch import Tensor
 from torch_geometric.data import HeteroData
 import torch.nn.functional as F
+from torch_scatter import scatter_mean
 from ehfnet.geometry.dynamics import PathInterpolator, PoseUpdater, PhysicsConstants, compute_center_of_mass, TangentTargetProjector
 
 
@@ -101,6 +102,8 @@ class ConditionalFlowMatcher:
         x_0: Tensor | None = None,
         current_epoch: int = 0,
         total_epochs: int = 1,
+        placement_centers: Tensor | None = None,
+        t_override: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
         """
         [训练接口] 采样时间 t，构造插值坐标 x_t 和 SE(3) x T^m 目标字典
@@ -138,6 +141,7 @@ class ConditionalFlowMatcher:
 
         # 1. 生成 x_0（联合三自由度课程学习）
         if x_0 is None:
+            seed_pos = data["ligand_atom"].get("start_pos", None)
             x_0 = self._generate_random_pose(
                 x_ref=x_1,
                 batch=batch,
@@ -145,13 +149,20 @@ class ConditionalFlowMatcher:
                 masses=masses,
                 torsion_indices=torsion_indices,
                 torsion_moving_mask=torsion_moving_mask,
+                seed_pos=seed_pos,
+                protein_pos=data["protein_atom"].pos if "protein_atom" in data else None,
+                protein_batch=getattr(data["protein_atom"], "batch", None) if "protein_atom" in data else None,
+                placement_centers=placement_centers,
                 epoch=current_epoch,
             )
 
         # 2. 采样时间 t，显式避开边界：t ~ U[sigma_min, 1-sigma_min]
-        sigma = float(self.sigma_min)
-        sigma = max(0.0, min(0.49, sigma))
-        t = torch.rand(B, device=device) * (1.0 - 2 * sigma) + sigma
+        if t_override is not None:
+            t = t_override.to(device=device, dtype=x_1.dtype)
+        else:
+            sigma = float(self.sigma_min)
+            sigma = max(0.0, min(0.49, sigma))
+            t = torch.rand(B, device=device) * (1.0 - 2 * sigma) + sigma
 
         # 3. 计算物理插值路径参数
         path_params = self.interpolator.compute_path_parameters(
@@ -408,6 +419,10 @@ class ConditionalFlowMatcher:
         masses: Tensor,
         torsion_indices: Tensor | None,
         torsion_moving_mask: Tensor | None,
+        seed_pos: Tensor | None = None,
+        protein_pos: Tensor | None = None,
+        protein_batch: Tensor | None = None,
+        placement_centers: Tensor | None = None,
         epoch: int = 0,
     ) -> Tensor:
         """
@@ -425,7 +440,11 @@ class ConditionalFlowMatcher:
         current_tor_scale = self.get_torsion_scale(epoch)
 
         # 1. 受控随机扭转
-        x_torsioned = x_ref.clone()
+        base_pos = x_ref
+        if seed_pos is not None and seed_pos.shape == x_ref.shape:
+            base_pos = seed_pos.to(device=device, dtype=dtype)
+
+        x_torsioned = base_pos.clone()
 
         if torsion_indices is not None and torsion_moving_mask is not None:
             T = torsion_indices.shape[0]
@@ -450,8 +469,17 @@ class ConditionalFlowMatcher:
                 )
 
         # 2. 受控随机刚体位姿
-        center = compute_center_of_mass(x_torsioned, batch, masses, dim_size=B)
-        x_centered = x_torsioned - center[batch]
+        lig_center = compute_center_of_mass(x_torsioned, batch, masses, dim_size=B)
+        x_centered = x_torsioned - lig_center[batch]
+
+        if placement_centers is not None and placement_centers.shape == (B, 3):
+            pocket_center = placement_centers.to(device=device, dtype=dtype)
+        elif protein_pos is not None:
+            if protein_batch is None:
+                protein_batch = torch.zeros(protein_pos.size(0), dtype=torch.long, device=device)
+            pocket_center = scatter_mean(protein_pos.to(device=device, dtype=dtype), protein_batch, dim=0, dim_size=B)
+        else:
+            pocket_center = compute_center_of_mass(x_ref, batch, masses, dim_size=B)
 
         # 受控旋转：轴角采样，角度上限随课程学习逐步扩大
         rot_matrices = self._random_bounded_rotation(B, device, dtype, max_angle=current_rot_max)
@@ -460,7 +488,7 @@ class ConditionalFlowMatcher:
         # 受控平移
         translation_offset = torch.randn(B, 3, device=device, dtype=dtype) * current_trans_scale
 
-        return x_rotated + center[batch] + translation_offset[batch]
+        return x_rotated + pocket_center[batch] + translation_offset[batch]
 
 
     @staticmethod

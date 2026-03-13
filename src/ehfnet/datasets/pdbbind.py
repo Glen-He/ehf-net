@@ -7,6 +7,7 @@ PDBBind 数据集
 import os
 import os.path as osp
 import logging
+import zlib
 import torch
 import pandas as pd
 
@@ -21,6 +22,7 @@ from torch_geometric.data import Dataset, HeteroData
 
 from ehfnet.graph import GraphBuilder, ESMEmbeddingFiller
 from ehfnet.datasets.prepare import prepare_graph, get_esm_model
+from ehfnet.datasets.pose_initialization import generate_decoupled_ligand_positions
 
 
 logger = logging.getLogger(__name__)
@@ -260,6 +262,12 @@ class PDBBindDataset(Dataset):
         return self.cleaned_dir
 
     @property
+    def processed_dir(self) -> str:
+        if self.pocket_radius is None:
+            return osp.join(self.root, "processed_full")
+        return osp.join(self.root, "processed")
+
+    @property
     def raw_file_names(self) -> list[str]:
         """
         Returns:
@@ -400,6 +408,39 @@ class PDBBindDataset(Dataset):
         logger.info(f"Dataset ready: {len(valid_pdb_ids)} valid samples")
 
 
+    def _diffdock_like_cache_path(self, pdb_id: str) -> str:
+        return osp.join(self.root, "candidates", "diffdock_like_init", pdb_id, "poses.pt")
+
+
+    def _load_or_build_start_pos(self, pdb_id: str, expected_num_atoms: int) -> torch.Tensor | None:
+        cache_path = self._diffdock_like_cache_path(pdb_id)
+
+        if osp.exists(cache_path):
+            cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+            start_pos = cached.get("ligand_start_pos") if isinstance(cached, dict) else cached
+            if isinstance(start_pos, torch.Tensor) and start_pos.ndim == 2 and start_pos.size(1) == 3:
+                if int(start_pos.size(0)) == expected_num_atoms:
+                    return start_pos.float()
+
+        pdb_dir = osp.join(self.raw_dir, pdb_id)
+        lig_path = ligand_path(pdb_id, pdb_dir)
+        if lig_path is None:
+            return None
+
+        seed = zlib.adler32(pdb_id.encode("utf-8")) & 0xFFFFFFFF
+        start_pos_np = generate_decoupled_ligand_positions(lig_path, random_seed=seed)
+        start_pos = torch.as_tensor(start_pos_np, dtype=torch.float32)
+        if int(start_pos.size(0)) != expected_num_atoms:
+            logger.warning(
+                f"Start pose atom count mismatch for {pdb_id}: expected {expected_num_atoms}, got {int(start_pos.size(0))}."
+            )
+            return None
+
+        os.makedirs(osp.dirname(cache_path), exist_ok=True)
+        torch.save({"ligand_start_pos": start_pos}, cache_path)
+        return start_pos
+
+
     def len(self) -> int:
         """
         Returns:
@@ -461,5 +502,11 @@ class PDBBindDataset(Dataset):
             mean = self.affinity_stats["mean"]
             std = self.affinity_stats["std"]
             data.y_energy = (raw_val - mean) / std
+
+        if hasattr(data["ligand_atom"], "pos"):
+            expected_num_atoms = int(data["ligand_atom"].pos.size(0))
+            start_pos = self._load_or_build_start_pos(pdb_id, expected_num_atoms)
+            if start_pos is not None:
+                data["ligand_atom"]["start_pos"] = start_pos
             
         return data

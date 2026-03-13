@@ -262,6 +262,27 @@ class PredictionHead(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
         )
 
+        self.pose_quality_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 3 + 6, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, 1),
+        )
+
+        self.pose_rank_mlp = nn.Sequential(
+            nn.Linear(hidden_dim * 2 + 3 + 6, hidden_dim),
+            nn.SiLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 4, 1),
+        )
+
         self.norm = nn.LayerNorm(hidden_dim)
 
 
@@ -301,6 +322,9 @@ class PredictionHead(nn.Module):
 
             return {
                 "binding_affinity": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
+                "pose_quality": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
+                "pose_rank_score": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
+                "steric_clash_batch": torch.zeros(B, device=device, dtype=torch.float32),
                 "ligand_interaction_context": torch.zeros_like(lig_atom_feat),
                 "ligand_force": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
             }
@@ -361,6 +385,8 @@ class PredictionHead(nn.Module):
 
             return {
                 "binding_affinity": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
+                "pose_quality": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
+                "pose_rank_score": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
                 "steric_clash_batch": torch.zeros(B, device=device, dtype=torch.float32),
                 "ligand_interaction_context": torch.zeros_like(lig_atom_feat),
                 "ligand_force": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
@@ -463,6 +489,8 @@ class PredictionHead(nn.Module):
         # 归一化聚合
         context_sum = scatter_add(context_atom, lig_batch, dim=0, dim_size=B)
         context_global = context_sum / atom_counts.clamp(min=1).unsqueeze(-1)
+        force_norm_sum = scatter_add(force_atom.norm(dim=-1), lig_batch, dim=0, dim_size=B)
+        force_norm_global = force_norm_sum / atom_counts.clamp(min=1.0)
 
         # 全局修正
         global_input = torch.cat([lig_mol_feat, context_global], dim=-1)
@@ -479,8 +507,54 @@ class PredictionHead(nn.Module):
         # 模型端不做反归一化：保持训练目标与输出标度一致
         binding_affinity = score_norm.unsqueeze(-1)
 
+        lig_centroid = scatter_add(
+            lig_atom_pos, lig_batch, dim=0, dim_size=B
+        ) / atom_counts.clamp(min=1).unsqueeze(-1)
+        pro_centroid = scatter_add(
+            pro_atom_pos, pro_atom_batch, dim=0, dim_size=B
+        ) / scatter_add(
+            torch.ones(N_pro, device=device, dtype=torch.float32),
+            pro_atom_batch, dim=0, dim_size=B,
+        ).clamp(min=1).unsqueeze(-1)
+        centroid_dist = torch.norm(lig_centroid - pro_centroid, dim=-1, keepdim=True)
+
+        min_dist_per_lig = torch.full((N_lig,), float("inf"), device=device)
+        if edge_index.size(1) > 0:
+            min_dist_per_lig.scatter_reduce_(0, i_idx, dist.float(), reduce="amin", include_self=True)
+        min_dist_per_mol = scatter_add(
+            min_dist_per_lig, lig_batch, dim=0, dim_size=B
+        ) / atom_counts.clamp(min=1)
+
+        dist_mean_edge = scatter_add(dist.float(), lig_batch[i_idx], dim=0, dim_size=B) / atom_counts.clamp(min=1)
+        dist_sq_edge = scatter_add(dist.float().pow(2), lig_batch[i_idx], dim=0, dim_size=B) / atom_counts.clamp(min=1)
+        dist_std_edge = (dist_sq_edge - dist_mean_edge.pow(2)).clamp(min=0).sqrt()
+
+        geo_features = torch.cat([
+            centroid_dist,
+            min_dist_per_mol.unsqueeze(-1),
+            dist_mean_edge.unsqueeze(-1),
+            dist_std_edge.unsqueeze(-1),
+            (atom_counts / 50.0).unsqueeze(-1),
+            (steric_clash_batch / atom_counts.clamp(min=1)).unsqueeze(-1),
+        ], dim=-1)
+
+        pose_quality_input = torch.cat(
+            [
+                global_input,
+                binding_affinity,
+                steric_clash_batch.unsqueeze(-1),
+                force_norm_global.unsqueeze(-1),
+                geo_features,
+            ],
+            dim=-1,
+        )
+        pose_quality = self.pose_quality_mlp(pose_quality_input)
+        pose_rank_score = self.pose_rank_mlp(pose_quality_input)
+
         return {
             "binding_affinity": binding_affinity,
+            "pose_quality": pose_quality,
+            "pose_rank_score": pose_rank_score,
             "steric_clash_batch": steric_clash_batch,
             "ligand_interaction_context": context_atom,
             "ligand_force": force_atom,

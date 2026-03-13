@@ -102,6 +102,13 @@ def compute_principal_frame(
 
     r = pos_d - com[batch]                 # [N, 3] 质心系坐标
 
+    # 单/双原子分子安全处理：协方差秩 < 3，直接退化为单位矩阵
+    atoms_per_mol = scatter_sum(
+        torch.ones(pos_d.size(0), device=device, dtype=torch.long),
+        batch, dim=0, dim_size=B,
+    )
+    degenerate_mol_mask = atoms_per_mol < 3
+
     # ── 向量化构建协方差矩阵 [B, 3, 3] ────────────────────────────────────
     weighted_r = r * masses_clamped                                    # [N, 3]
     # 原子级外积：[N, 3, 1] @ [N, 1, 3] → [N, 3, 3]
@@ -139,6 +146,16 @@ def compute_principal_frame(
         bad_mask = ~torch.isfinite(R_b).all(dim=-1).all(dim=-1)       # [B]
         if bad_mask.any():
             R_b[bad_mask] = eye.expand(int(bad_mask.sum()), -1, -1)
+
+        # 对单/双原子或线性分子：强制使用单位矩阵
+        if degenerate_mol_mask.any():
+            R_b[degenerate_mol_mask] = eye.expand(int(degenerate_mol_mask.sum()), -1, -1)
+            small_sv_mask = (~degenerate_mol_mask) & (S[:, -1] < 1e-5)
+            if small_sv_mask.any():
+                for idx in small_sv_mask.nonzero(as_tuple=False).view(-1).tolist():
+                    u_fix = U[idx].clone()
+                    u_fix[:, -1] = torch.linalg.cross(u_fix[:, 0], u_fix[:, 1])
+                    R_b[idx] = u_fix @ Vh[idx]
 
         return R_b
 

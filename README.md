@@ -31,7 +31,7 @@ $$x_t = (1 - t)\,x_0 + t\,x_1, \quad t \in [0, 1]$$
 - **旋转角速度** $\omega \in \mathbb{R}^3$（Rodrigues 参数化，轴角表示）
 - **扭转角速度** $\dot{\tau} \in \mathbb{R}^T$（每个可旋转键一个标量）
 
-推理时支持 Euler 和 RK4 两种 ODE 积分器，默认 100 步。
+推理时支持 Euler 和 RK4 两种 ODE 积分器，默认 50 步。
 
 ### Architecture
 
@@ -150,6 +150,20 @@ uv run python scripts/organize_data.py \
 `--accumulation_steps` 用于在不增加峰值显存的情况下提升等效 batch。
 训练入口已自动设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128`。
 
+当前默认训练流程不再在预处理阶段依赖真实配体裁 pocket，而是缓存 full protein，然后在运行时执行：
+1. residue-level center proposal
+2. 10A local crop
+3. local flow docking
+4. pose confidence reranking
+
+推荐优先使用配置文件：
+
+```bash
+uv run python train.py --config configs/train.toml
+```
+
+常改参数已整理到 `configs/train.toml`，代码仍然保留默认值；命令行参数会覆盖配置文件，适合临时实验。
+
 ```bash
 uv run python train.py \
     --data_root  ./data/processed/pdbbind \
@@ -163,6 +177,8 @@ uv run python train.py \
     --lr 1e-4 \
     --hidden_dim 128 \
     --num_gnn_blocks 4 \
+    --protein_context_mode full \
+    --pocket_radius 10 \
     --warmup_epochs 20 \
     --ema_decay 0.999 \
     --rmsd_ratio 0.2 \
@@ -174,6 +190,10 @@ uv run python train.py \
     --run_test_after_training \
     --test_topk 1,5,10 \
     --test_pose_samples 10 \
+    --center_proposal_topk 8 \
+    --center_refine_topk 3 \
+    --stage1_pose_samples 2 \
+    --stage2_pose_samples 4 \
     --enable_oom_adaptive_batch \
     --oom_reduce_threshold 3 \
     --oom_reduce_factor 0.85 \
@@ -202,6 +222,8 @@ nohup uv run python train.py \
     --lr 1e-4 \
     --hidden_dim 128 \
     --num_gnn_blocks 4 \
+    --protein_context_mode full \
+    --pocket_radius 10 \
     --warmup_epochs 20 \
     --ema_decay 0.999 \
     --rmsd_ratio 0.2 \
@@ -242,7 +264,8 @@ tail -f logs/nohup.log
 | `--rmsd_ratio` | float | 0.2 | 验证集中执行 RMSD 推演的样本比例 |
 | `--hidden_dim` | int | 128 | 隐藏层维度 |
 | `--num_gnn_blocks` | int | 4 | GNN Block 数量（显存不足时可降至 3） |
-| `--pocket_radius` | float | 12.0 | 口袋提取截断半径（Å） |
+| `--protein_context_mode` | str | `full` | `full` 为缓存全蛋白并在运行时局部裁剪；`pocket` 为旧的预裁 pocket 模式 |
+| `--pocket_radius` | float | 10.0 | 运行时 local docking 裁剪半径（Å） |
 | `--esm_dim` | int | 960 | ESM Embedding 维度（ESMC-300M 为 960） |
 | `--split_train_frac` | float | 0.7 | 训练集比例（Scaffold Split） |
 | `--split_val_frac` | float | 0.1 | 验证集比例（Scaffold Split） |
@@ -250,10 +273,31 @@ tail -f logs/nohup.log
 | `--split_seed` | int | 42 | 划分随机种子 |
 | `--split_cache_file` | str | 自动路径 | 划分索引 JSON 路径；用于严格复现 |
 | `--force_resplit` | flag | 关闭 | 强制重建划分索引 |
-| `--ablation_mode` | str | `none` | 消融模式：`none` / `inter_multiscale_off` |
+| `--ablation_mode` | str | `none` | 消融模式：`none` / `inter_multiscale_off` / `gt_only_crop` |
 | `--run_test_after_training` | flag | 启用 | 训练后自动运行独立 test 评估 |
 | `--test_topk` | str | `1,5,10` | Top-N 成功率统计阈值列表 |
 | `--test_pose_samples` | int | 10 | 每个复合物生成的候选 pose 数 |
+| `--center_proposal_weight` | float | 0.15 | residue-level center proposal 损失权重 |
+| `--center_positive_radius` | float | 4.0 | center proposal 正样本半径（Å） |
+| `--center_proposal_topk` | int | 8 | stage-1 保留的候选中心数量 |
+| `--center_refine_topk` | int | 3 | stage-2 深化对接的中心数量 |
+| `--center_nms_radius` | float | 6.0 | 候选中心去冗余半径（Å） |
+| `--stage1_pose_samples` | int | 2 | 每个中心在 stage-1 的局部采样数 |
+| `--stage2_pose_samples` | int | 4 | 每个中心在 stage-2 的局部采样数 |
+| `--pose_ranking_pair_weight` | float | 0.2 | pose confidence 的 pairwise ranking 损失权重 |
+| `--pose_ranking_margin` | float | 0.5 | pairwise ranking margin |
+| `--pose_bootstrap_weight` | float | 0.05 | model-generated pose bootstrap 损失权重 |
+| `--pose_bootstrap_frequency` | int | 25 | 每 N 个训练 batch 执行一次 bootstrap pose 打分（0 表示关闭） |
+| `--pose_bootstrap_ode_steps` | int | 10 | bootstrap pose 生成使用的 ODE 步数 |
+| `--enable_fusion_calibration / --disable_fusion_calibration` | flag | 启用 | 是否在 Val-Blind 上网格搜索 pose/center 线性融合权重 |
+| `--val_ode_steps` | int | 50 | 验证和测试的 ODE 积分步数 |
+| `--crop_candidate_topk` | int | 8 | crop curriculum 在各 proposal bucket 内做 weighted sampling 时使用的 top-k 池大小 |
+| `--disable_jitter_crop` | flag | 关闭 | 关闭 jitter crop，用于 ablation |
+| `--disable_hard_negative_crop` | flag | 关闭 | 关闭 hard-negative crop，用于 ablation |
+| `--checkpoint_selection_mode` | str | `composite` | blind checkpoint 选择主指标：`composite` / `reranked_top1_success_2a` / `reranked_top5_success_2a` / `reranked_top1_plus_oracle_top5` |
+| `--fusion_search_center_weights` | str | `0,0.15,0.25,0.35,0.5,0.65` | 融合 ablation 中 center 权重搜索网格（逗号分隔） |
+| `--fusion_search_aff_weights` | str | `0` | 融合 ablation 中 affinity 权重搜索网格（逗号分隔） |
+| `--fusion_search_clash_weights` | str | `0` | 融合 ablation 中 clash 权重搜索网格（逗号分隔） |
 | `--dataloader_num_workers` | int | 4 | DataLoader worker 数 |
 | `--dataloader_pin_memory / --no_dataloader_pin_memory` | flag | 启用 | 是否启用 pinned memory |
 | `--dataloader_persistent_workers / --no_dataloader_persistent_workers` | flag | 启用 | 是否启用 persistent workers |
@@ -284,7 +328,9 @@ tail -f logs/nohup.log
 每轮训练结束后自动输出：
 
 - **分项损失**：`loss_trans` / `loss_rot` / `loss_torsion` / `loss_energy` / `loss_clash`
-- **验证 RMSD**：Init RMSD → Final RMSD，以及 <2Å 和 <5Å 成功率
+- **Val-Local**：GT-center 局部裁剪下的 `val_loss`、RMSD、centroid、affinity 指标
+- **Val-Blind**：`center_recall@1/@3/@8/@16`、`oracle_top1/top5`、`reranked_top1/top5`、`proposal_gap`、`ranking_gap`
+- **融合校准**：每轮可在 Val-Blind 上自动调节 pose / center 线性融合权重
 - **日志文件**：`logs/train/train_{timestamp}.log`
 - **运行目录**：`checkpoints/train_{timestamp}/`
 - **最新模型**：`checkpoints/train_{timestamp}/latest_model.pt`
@@ -296,19 +342,50 @@ tail -f logs/nohup.log
 训练结束后（若启用 `--run_test_after_training`）额外输出：
 
 - **独立测试集报告**：`checkpoints/train_{timestamp}/reports/test_metrics.json`
-- **Top-N 指标**：`top1/top5/top10` 在 `<2Å` 和 `<5Å` 下的成功率，以及 Top-N 最优 RMSD 的均值/中位数
+- **三段式 blind 指标**：proposal recall、oracle upper bound、rerank 实际效果，以及 proposal/local/ranking failure decomposition
+- **Top-N 指标**：`top1/top5/top10` 在 `<2Å` 和 `<5Å` 下的成功率，以及 Top-N 最优 RMSD 的均值
 
-## Ablation Protocol (2-run)
+## Ablation Protocol
 
-推荐最省时且可用于专利交底的两次实验：
+推荐可用于论文/专利交底的实验矩阵：
 
-1. **Full Model（主实验）**
-    - `--ablation_mode none`
-2. **Multiscale-Interaction Ablation（消融）**
-    - `--ablation_mode inter_multiscale_off`
-    - 仅保留 `ligand_atom <-> protein_atom` 跨图边，关闭 atom-residue / atom-pocket / molecule-pocket 多尺度交互
+### 核心 ablation（4 组）
 
-最佳实践：两次实验保持同一 `split_cache_file`、同一 seed、同一训练超参，只改变 `--ablation_mode`。
+1. **GT-only training vs Proposal-aware training**
+    - `--ablation_mode gt_only_crop`（baseline：仅用 GT center 裁 pocket）
+    - `--ablation_mode none`（主方案：5 类 proposal-aware crop）
+    - 可进一步叠加 `--disable_jitter_crop` / `--disable_hard_negative_crop` 做细粒度 crop ablation
+2. **BCE only vs BCE + Pairwise ranking**
+    - `--pose_ranking_pair_weight 0`（baseline）
+    - `--pose_ranking_pair_weight 0.2`（主方案）
+3. **No bootstrap vs Bootstrap**
+    - `--pose_bootstrap_frequency 0`（baseline）
+    - `--pose_bootstrap_frequency 25`（主方案）
+4. **Pose-only rank vs Pose + Center rank**
+    - 通过 `--disable_fusion_calibration` 并固定 `center_weight=0`（baseline）
+    - 通过 `--enable_fusion_calibration` 自动搜索最优 `center_weight`（主方案）
+
+### 融合维度 ablation
+
+测试 affinity/clash 信号是否有增益（默认不纳入主方案）：
+
+```bash
+# pose + center + clash
+--fusion_search_clash_weights 0,0.02,0.05
+
+# pose + center + affinity
+--fusion_search_aff_weights 0,0.05,0.1
+
+# full grid
+--fusion_search_aff_weights 0,0.05,0.1 --fusion_search_clash_weights 0,0.02,0.05
+```
+
+### 多尺度交互 ablation
+
+- `--ablation_mode inter_multiscale_off`
+- 仅保留 `ligand_atom <-> protein_atom` 跨图边，关闭 atom-residue / atom-pocket / molecule-pocket 多尺度交互
+
+最佳实践：所有实验保持同一 `split_cache_file`、同一 seed、同一训练超参，只改变目标 ablation 开关。
 
 ## Utilities
 

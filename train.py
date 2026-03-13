@@ -8,6 +8,7 @@ import argparse
 import os
 import sys
 import logging
+import tomllib
 
 from datetime import datetime
 from pathlib import Path
@@ -30,8 +31,48 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
+
+def _flatten_config(config: dict, *, prefix: str = "") -> dict[str, object]:
+    flat: dict[str, object] = {}
+    for key, value in config.items():
+        full_key = f"{prefix}{key}" if not prefix else f"{prefix}.{key}"
+        if isinstance(value, dict):
+            flat.update(_flatten_config(value, prefix=full_key))
+        else:
+            flat[full_key] = value
+    return flat
+
+
+def _config_to_arg_defaults(config: dict) -> dict[str, object]:
+    flat = _flatten_config(config)
+    defaults: dict[str, object] = {}
+    for key, value in flat.items():
+        defaults[key.split(".")[-1]] = value
+    return defaults
+
+
+def load_train_config(config_path: str | None) -> dict[str, object]:
+    if config_path is None:
+        return {}
+    path = Path(config_path)
+    if not path.exists():
+        return {}
+    with path.open("rb") as f:
+        raw = tomllib.load(f)
+    return _config_to_arg_defaults(raw)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Train EHFNet for molecular docking prediction")
+    default_config_path = PROJECT_ROOT / "configs" / "train.toml"
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=str, default=str(default_config_path), help="Path to TOML config file")
+    pre_args, _ = pre_parser.parse_known_args()
+    config_defaults = load_train_config(pre_args.config)
+
+    parser = argparse.ArgumentParser(
+        description="Train EHFNet for molecular docking prediction",
+        parents=[pre_parser],
+    )
     
     # 数据相关参数
     # 使用动态路径作为默认值
@@ -60,7 +101,8 @@ def main():
     parser.add_argument("--pro_atom_cont_count", type=int, default=5, help="Protein atom continuous feature count")
     parser.add_argument("--esm_dim", type=int, default=960, help="ESM embedding dimension (default: 960 for ESMC-300M)")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use for training (e.g., 'cuda:0', 'cuda:1', 'cpu')")
-    parser.add_argument("--pocket_radius", type=float, default=12.0, help="Radius (A) for protein pocket extraction (default: 12.0)")
+    parser.add_argument("--pocket_radius", type=float, default=10.0, help="Runtime local docking radius in angstroms (default: 10.0)")
+    parser.add_argument("--protein_context_mode", type=str, default="full", choices=["full", "pocket"], help="Protein caching mode: full keeps whole protein and crops local pockets at runtime")
     parser.add_argument("--warmup_epochs", type=int, default=20, help="Number of warmup epochs for spatial curriculum learning (default: 20)")
     parser.add_argument("--rmsd_ratio", type=float, default=0.2, help="Ratio of validation set to compute RMSD (0.0-1.0)")
     parser.add_argument("--accumulation_steps", type=int, default=8, help="Gradient accumulation steps")
@@ -96,13 +138,54 @@ def main():
         "--ablation_mode",
         type=str,
         default="none",
-        choices=["none", "inter_multiscale_off"],
-        help="Ablation mode: none (full model) or inter_multiscale_off (atom-atom only)",
+        choices=["none", "inter_multiscale_off", "gt_only_crop"],
+        help="Ablation mode: none (full model), inter_multiscale_off (atom-atom only), gt_only_crop (GT center only training)",
     )
     parser.add_argument("--run_test_after_training", action="store_true", default=True, help="Run final test-set evaluation after training")
     parser.add_argument("--skip_test_after_training", dest="run_test_after_training", action="store_false", help="Skip final test-set evaluation")
     parser.add_argument("--test_topk", type=str, default="1,5,10", help="Comma-separated top-k values for final test evaluation")
     parser.add_argument("--test_pose_samples", type=int, default=10, help="Number of candidate poses per complex for Top-N evaluation")
+    parser.add_argument("--center_proposal_weight", type=float, default=0.15, help="Loss weight for residue-level center proposal")
+    parser.add_argument("--center_positive_radius", type=float, default=4.0, help="Positive radius in angstroms for residue center supervision")
+    parser.add_argument("--center_proposal_topk", type=int, default=8, help="Number of diverse residue centers kept in stage-1 proposal")
+    parser.add_argument("--center_refine_topk", type=int, default=3, help="Number of centers refined in stage-2 local docking")
+    parser.add_argument("--center_nms_radius", type=float, default=6.0, help="Diversity radius in angstroms for center NMS")
+    parser.add_argument("--stage1_pose_samples", type=int, default=2, help="Number of local docking samples per center in stage-1")
+    parser.add_argument("--stage2_pose_samples", type=int, default=4, help="Number of local docking samples per center in stage-2")
+    parser.add_argument("--crop_candidate_topk", type=int, default=8, help="Top-k proposal candidates used for weighted crop sampling in each curriculum bucket")
+    parser.add_argument("--disable_jitter_crop", action="store_true", default=False, help="Disable jitter crop branch for ablation")
+    parser.add_argument("--disable_hard_negative_crop", action="store_true", default=False, help="Disable hard-negative crop branch for ablation")
+    parser.add_argument("--pose_ranking_pair_weight", type=float, default=0.2, help="Pairwise ranking loss weight for pose confidence")
+    parser.add_argument("--pose_ranking_margin", type=float, default=0.5, help="Margin used by the pairwise ranking loss")
+    parser.add_argument("--pose_bootstrap_weight", type=float, default=0.05, help="Bootstrap loss weight for model-generated poses")
+    parser.add_argument("--pose_bootstrap_frequency", type=int, default=25, help="Run bootstrap scoring every N training batches (0 disables)")
+    parser.add_argument("--pose_bootstrap_ode_steps", type=int, default=10, help="ODE steps used to generate bootstrap poses")
+    parser.add_argument("--enable_fusion_calibration", action="store_true", default=True, help="Grid-search center/pose fusion weight on Val-Blind")
+    parser.add_argument("--disable_fusion_calibration", dest="enable_fusion_calibration", action="store_false", help="Disable Val-Blind fusion calibration")
+    parser.add_argument("--val_ode_steps", type=int, default=50, help="ODE integration steps for validation and test evaluation (default: 50)")
+    parser.add_argument(
+        "--checkpoint_selection_mode",
+        type=str,
+        default="composite",
+        choices=[
+            "composite",
+            "reranked_top1_success_2a",
+            "reranked_top5_success_2a",
+            "reranked_top1_plus_oracle_top5",
+        ],
+        help="Primary blind metric used for best_selected_model checkpoint selection",
+    )
+    parser.add_argument("--fusion_search_center_weights", type=str, default="0,0.15,0.25,0.35,0.5,0.65", help="Comma-separated center weights for fusion ablation grid")
+    parser.add_argument("--fusion_search_aff_weights", type=str, default="0", help="Comma-separated affinity weights for fusion ablation grid (default: '0' = disabled)")
+    parser.add_argument("--fusion_search_clash_weights", type=str, default="0", help="Comma-separated clash weights for fusion ablation grid (default: '0' = disabled)")
+    parser.add_argument("--blind_pool_refresh_every", type=int, default=5, help="Refresh blind candidate pool every N epochs")
+    parser.add_argument("--blind_pool_start_epoch", type=int, default=10, help="Earliest epoch to start pool refresh")
+    parser.add_argument("--blind_pool_max_complexes", type=int, default=500, help="Max complexes per pool refresh")
+    parser.add_argument("--blind_pool_cache_bce_weight", type=float, default=0.5, help="Cache BCE loss weight")
+    parser.add_argument("--blind_pool_cache_rank_weight", type=float, default=1.0, help="Cache pairwise ranking loss weight")
+    parser.add_argument("--blind_pool_pairs_per_complex", type=int, default=4, help="Hard pairs sampled per complex from cache")
+
+    parser.set_defaults(**config_defaults)
 
     args = parser.parse_args()
 
@@ -113,6 +196,13 @@ def main():
         args.test_topk_values = parsed_topk
     except Exception as e:
         raise ValueError(f"Invalid --test_topk='{args.test_topk}': {e}") from e
+
+    try:
+        args.parsed_fusion_center_weights = tuple(float(x.strip()) for x in args.fusion_search_center_weights.split(",") if x.strip())
+        args.parsed_fusion_aff_weights = tuple(float(x.strip()) for x in args.fusion_search_aff_weights.split(",") if x.strip())
+        args.parsed_fusion_clash_weights = tuple(float(x.strip()) for x in args.fusion_search_clash_weights.split(",") if x.strip())
+    except Exception as e:
+        raise ValueError(f"Invalid fusion search weights: {e}") from e
     
     # 动态计算 pro_res_cont_count: 14 (扭转角) + esm_dim
     args.pro_res_cont_count = 14 + args.esm_dim
@@ -192,6 +282,7 @@ def main():
             esm_dim=args.esm_dim,
             device=args.device,
             pocket_radius=args.pocket_radius,
+            protein_context_mode=args.protein_context_mode,
             normalization_stats=normalization_stats,
             warmup_epochs=args.warmup_epochs,
             rmsd_check_ratio=args.rmsd_ratio,
@@ -224,6 +315,33 @@ def main():
             min_val_max_nodes_per_batch=args.min_val_max_nodes_per_batch,
             oom_recover_epochs=args.oom_recover_epochs,
             oom_recover_factor=args.oom_recover_factor,
+            center_proposal_weight=args.center_proposal_weight,
+            center_positive_radius=args.center_positive_radius,
+            center_proposal_topk=args.center_proposal_topk,
+            center_refine_topk=args.center_refine_topk,
+            center_nms_radius=args.center_nms_radius,
+            stage1_pose_samples=args.stage1_pose_samples,
+            stage2_pose_samples=args.stage2_pose_samples,
+            crop_candidate_topk=args.crop_candidate_topk,
+            disable_jitter_crop=args.disable_jitter_crop,
+            disable_hard_negative_crop=args.disable_hard_negative_crop,
+            pose_ranking_pair_weight=args.pose_ranking_pair_weight,
+            pose_ranking_margin=args.pose_ranking_margin,
+            pose_bootstrap_weight=args.pose_bootstrap_weight,
+            pose_bootstrap_frequency=args.pose_bootstrap_frequency,
+            pose_bootstrap_ode_steps=args.pose_bootstrap_ode_steps,
+            enable_fusion_calibration=args.enable_fusion_calibration,
+            val_ode_steps=args.val_ode_steps,
+            checkpoint_selection_mode=args.checkpoint_selection_mode,
+            fusion_search_center_weights=args.parsed_fusion_center_weights,
+            fusion_search_aff_weights=args.parsed_fusion_aff_weights,
+            fusion_search_clash_weights=args.parsed_fusion_clash_weights,
+            blind_pool_refresh_every=args.blind_pool_refresh_every,
+            blind_pool_start_epoch=args.blind_pool_start_epoch,
+            blind_pool_max_complexes=args.blind_pool_max_complexes,
+            blind_pool_cache_bce_weight=args.blind_pool_cache_bce_weight,
+            blind_pool_cache_rank_weight=args.blind_pool_cache_rank_weight,
+            blind_pool_pairs_per_complex=args.blind_pool_pairs_per_complex,
             run_name=run_name,
             run_log_file=log_file,
         )
