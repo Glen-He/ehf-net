@@ -14,6 +14,7 @@ from torch import Tensor
 from torch_geometric.data import HeteroData
 
 from ehfnet.graph.builder import GraphBuilder
+from ehfnet.graph.pocket_features import build_pocket_features
 
 
 def compute_ligand_center(data: HeteroData) -> Tensor:
@@ -106,18 +107,27 @@ def crop_graph_to_center(
 
     out["protein_atom"].residue_idx = local_atom_residue_idx.long()
 
-    if out["protein_residue"].num_nodes > 0:
-        pocket_cont = out["protein_residue"].x_cont.mean(dim=0, keepdim=True)
-    else:
-        feat_dim = data["protein_residue"].x_cont.size(1)
-        pocket_cont = torch.zeros((1, feat_dim), dtype=data["protein_residue"].x_cont.dtype)
-
-    out["protein_pocket"].x_cont = pocket_cont
+    out["protein_pocket"].x_cont = build_pocket_features(
+        residue_x_cont=out["protein_residue"].x_cont,
+        residue_pos=out["protein_residue"].pos,
+        protein_atom_pos=out["protein_atom"].pos,
+        center=center,
+    )
     out["protein_pocket"].num_nodes = 1
 
     out = graph_builder._build_graph_topology(out)
 
-    for attr in ["pdb_id", "y_energy", "torsion_indices", "torsion_moving_mask", "loss_progress", "loss_warmup_end", "loss_is_training"]:
+    for attr in [
+        "pdb_id",
+        "dataset_index",
+        "dataset_pdb_id",
+        "y_energy",
+        "torsion_indices",
+        "torsion_moving_mask",
+        "loss_progress",
+        "loss_warmup_end",
+        "loss_is_training",
+    ]:
         if hasattr(data, attr):
             value = getattr(data, attr)
             setattr(out, attr, value.clone() if torch.is_tensor(value) else copy.deepcopy(value))

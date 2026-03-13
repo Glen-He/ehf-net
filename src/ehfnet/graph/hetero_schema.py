@@ -32,24 +32,36 @@ AGGREGATE_EDGES: list[tuple[str, str, str]] = [
 
 
 # 阶段 3: 跨图交互（inter-graph interaction / docking）
-INTER_EDGES: list[tuple[str, str, str]] = [
+#
+# 设计约定：
+# - DYNAMIC_INTER_EDGES: 随 pose / protein 坐标变化、由 encoder 在每个 block 动态重建
+# - STATIC_INTER_EDGES: 几何关系近似全局稳定、在 graph builder / runtime crop 中构建
+#
+# 这样可以避免 builder 和 encoder 对同一类跨图边重复负责，保持语义清晰。
 
-    # 1. 核心物理交互：原子-原子 (基于半径图)
+DYNAMIC_INTER_EDGES: list[tuple[str, str, str]] = [
+    # 1. 核心物理交互：配体原子 <-> 蛋白原子
     ("ligand_atom", "inter_proximity", "protein_atom"),
     ("protein_atom", "inter_proximity", "ligand_atom"),
 
-    # 2. 多尺度融合：配体原子-蛋白残基 (直接利用 ESM 进化信息)
+    # 2. 多尺度交互：配体原子 <-> 蛋白残基
     ("ligand_atom", "inter_proximity", "protein_residue"),
     ("protein_residue", "inter_proximity", "ligand_atom"),
+]
 
-    # 3. 全局上下文定位：配体原子-蛋白口袋 (低成本全局坐标感)
+
+STATIC_INTER_EDGES: list[tuple[str, str, str]] = [
+    # 3. 全局上下文定位：配体原子 <-> 蛋白口袋
     ("ligand_atom", "inter_proximity", "protein_pocket"),
     ("protein_pocket", "inter_proximity", "ligand_atom"),
 
-    # 4. 宏观形状匹配：配体分子-蛋白口袋 (整体极性/形状互补)
+    # 4. 宏观形状匹配：配体分子 <-> 蛋白口袋
     ("ligand_molecule", "inter_proximity", "protein_pocket"),
     ("protein_pocket", "inter_proximity", "ligand_molecule"),
 ]
+
+
+INTER_EDGES: list[tuple[str, str, str]] = DYNAMIC_INTER_EDGES + STATIC_INTER_EDGES
 
 
 # 阶段 4: 自顶向下广播（top-down broadcast）

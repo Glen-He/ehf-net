@@ -94,8 +94,8 @@ class Element(Enum):
     Co = (17, 27, 200.0, 58.933, 1.88, 0.662, 7.881)
     Ni = (18, 28, 163.0, 58.693, 1.91, 1.157, 7.640)
     Cu = (19, 29, 140.0, 63.546, 1.90, 1.236, 7.726)
-    # AtomicNum, Valence, VDWRadius, AtomicWeight, Electronegativity, HBondDonor, HBondAcceptor
-    UNK = (20, 0, 1.70, 12.0, 0.0, 0.0, 0.0)
+    # UNK 连续特征使用已知元素的中位量级，避免与真实元素分布出现百倍量纲跳变。
+    UNK = (20, 0, 204.5, 33.755, 2.115, 0.9556, 9.877)
 
 
 class ResidueType(Enum):

@@ -8,7 +8,6 @@ import logging
 import numpy as np
 import MDAnalysis as mda
 
-from pathlib import Path
 from typing import TypedDict
 from MDAnalysis.core.groups import Residue as MDAResidue
 
@@ -19,6 +18,7 @@ from ehfnet.encoders.feature_specs import (
     PROTEIN_RESIDUE_CAT_SCHEMA,
     PROTEIN_RESIDUE_CONT_SCHEMA,
 )
+from ehfnet.encoders.protein_segments import segment_residues_by_continuity
 from ehfnet.geometry.static import calculate_dihedral
 
 logger = logging.getLogger(__name__)
@@ -243,7 +243,6 @@ class ProteinEncoder:
         universe: mda.Universe,
         *,
         esm_embeddings: dict[int, np.ndarray] | None = None,
-        esm_embedding_file: str | Path | None = None,
         pocket_radius: float | None = None,
         ligand_positions: np.ndarray | None = None,
     ) -> ProteinEncodingResult:
@@ -253,7 +252,6 @@ class ProteinEncoder:
         Args:
             universe: MDAnalysis Universe 对象
             esm_embeddings: 预计算的 ESM 嵌入字典 {residue_index: embedding}
-            esm_embedding_file: ESM 嵌入文件路径（.npz 格式）
             pocket_radius: 口袋提取半径 (Å)。如果提供，则仅保留该半径内的残基。
             ligand_positions: 配体原子坐标 [L, 3]，用于确定口袋中心。
 
@@ -292,30 +290,20 @@ class ProteinEncoder:
         all_atoms = sorted(protein_atoms.atoms, key=lambda a: a.ix)
         all_residues = sorted(list(protein_atoms.residues), key=lambda r: r.ix)
 
-        # 建立残基查找表 (segid, resid) -> Residue
-        res_lookup = {(r.segid, r.resid): r for r in all_residues}
+        # 基于真实肽链连续性切段，统一服务于 torsion 邻接与 ESM 分段逻辑
+        residue_segments = segment_residues_by_continuity(all_residues)
+        prev_res_by_ix: dict[int, MDAResidue | None] = {}
+        next_res_by_ix: dict[int, MDAResidue | None] = {}
 
-        # ESM Embedding 加载
-        if esm_embeddings is None and esm_embedding_file is not None:
+        for segment in residue_segments:
+            seg_residues = list(segment.residues)
 
-            try:
-                esm_path = Path(esm_embedding_file)
-
-                if esm_path.exists():
-
-                    with np.load(esm_path) as data:
-                        esm_embeddings = {int(k): data[k].copy() for k in data.files}
-                    logger.info(
-                        f"Loaded ESM embeddings from {esm_path} ({len(esm_embeddings)} residues)"
-                    )
-
-                else:
-                    logger.warning(f"ESM embedding file not found: {esm_path}")
-                    esm_embeddings = None
-
-            except Exception as e:
-                logger.error(f"Failed to load ESM embeddings from {esm_embedding_file}: {e}")
-                esm_embeddings = None
+            for seg_pos, seg_res in enumerate(seg_residues):
+                res_ix = int(seg_res.ix)
+                prev_res_by_ix[res_ix] = seg_residues[seg_pos - 1] if seg_pos > 0 else None
+                next_res_by_ix[res_ix] = (
+                    seg_residues[seg_pos + 1] if seg_pos + 1 < len(seg_residues) else None
+                )
 
         # 原子特征
         atom_data = {
@@ -370,8 +358,8 @@ class ProteinEncoder:
             res_data["residue_id"].append(min(_PROTEIN_RES_CAT_MAX["residue_id"], idx))
 
             # 连续特征（扭转角）
-            prev_res = res_lookup.get((res.segid, res.resid - 1))
-            next_res = res_lookup.get((res.segid, res.resid + 1))
+            prev_res = prev_res_by_ix.get(int(res.ix))
+            next_res = next_res_by_ix.get(int(res.ix))
 
             torsion_feats = _compute_residue_torsions(res, prev_res, next_res, res_type)
 

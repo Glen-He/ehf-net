@@ -245,6 +245,15 @@ class BlindCandidateReplayDataset(Dataset):
         # 构造回放数据
         candidates = []
         for p in selected:
+            candidate_role = "random"
+            if p in positives:
+                candidate_role = "positive"
+            elif p in same_center_negs:
+                candidate_role = "same_center_negative"
+            elif p in wrong_center_negs:
+                candidate_role = "wrong_center_negative"
+            elif p in deceptive_negs:
+                candidate_role = "deceptive_negative"
             candidates.append({
                 "dataset_index": dataset_index,
                 "center_xyz": self._get_center_xyz(p, centers),
@@ -255,6 +264,9 @@ class BlindCandidateReplayDataset(Dataset):
                 "stage_id": p.get("stage_id", "unknown"),
                 "rank_bucket": p.get("rank_bucket", "bad"),
                 "is_hit_2A": p.get("is_hit_2A", False),
+                "candidate_role": candidate_role,
+                "binding_affinity_teacher": p.get("binding_affinity_teacher", 0.0),
+                "steric_clash_teacher": p.get("steric_clash_teacher", 0.0),
             })
 
         # center-value targets
@@ -273,6 +285,7 @@ class BlindCandidateReplayDataset(Dataset):
             "dataset_index": dataset_index,
             "gt_center_xyz": record.get("gt_center_xyz", [0.0, 0.0, 0.0]),
             "candidates": candidates,
+            "centers": centers,
             "center_values": center_values,
             "n_ligand_atoms": record.get("n_ligand_atoms", 0),
         }
@@ -320,19 +333,32 @@ def replay_and_compute_losses(
         replay_items: list of items from BlindCandidateReplayDataset
         train_set: the original training dataset for looking up samples by index
     """
-    all_logits: list[Tensor] = []
-    all_rmsd: list[Tensor] = []
+    per_group_totals: list[Tensor] = []
+    per_group_bce: list[Tensor] = []
+    per_group_pair: list[Tensor] = []
+    per_group_list: list[Tensor] = []
+    total_pairs = 0
     all_center_logits: list[Tensor] = []
     all_center_targets: list[Tensor] = []
 
     for item in replay_items:
         candidates = item["candidates"]
         center_values = item.get("center_values", {})
+        if not candidates:
+            continue
+
+        ds_idx = int(item["dataset_index"])
+
+        try:
+            sample = _resolve_replay_sample(train_set, ds_idx)
+        except Exception:
+            continue
+
+        group_logits: list[Tensor] = []
+        group_rmsd: list[Tensor] = []
 
         for cand in candidates:
             try:
-                ds_idx = cand["dataset_index"]
-                sample = train_set[ds_idx]
                 center_xyz = torch.tensor(cand["center_xyz"], dtype=torch.float32)
                 pose_xyz = torch.tensor(cand["pose_xyz"], dtype=torch.float32)
 
@@ -357,8 +383,8 @@ def replay_and_compute_losses(
                 else:
                     logit = out["pose_quality"].view(-1)
 
-                all_logits.append(logit)
-                all_rmsd.append(torch.tensor([cand["rmsd"]], device=device, dtype=torch.float32))
+                group_logits.append(logit)
+                group_rmsd.append(torch.tensor([cand["rmsd"]], device=device, dtype=torch.float32))
 
                 del infer_batch, out
 
@@ -371,11 +397,28 @@ def replay_and_compute_losses(
             except Exception:
                 continue
 
+        if group_logits:
+            logits_cat = torch.cat(group_logits)
+            rmsd_cat = torch.cat(group_rmsd)
+            pair_indices = _build_group_pair_indices(candidates, device=device)
+            rerank_results = compute_rerank_losses(
+                logits_cat,
+                rmsd_cat,
+                margin=margin,
+                pair_indices=pair_indices,
+                lambda_bce=lambda_bce,
+                lambda_pair=lambda_pair,
+                lambda_list=lambda_list,
+            )
+            per_group_totals.append(rerank_results["rerank_total"])
+            per_group_bce.append(rerank_results["rerank_bce"])
+            per_group_pair.append(rerank_results["rerank_pairwise"])
+            per_group_list.append(rerank_results["rerank_listwise"])
+            total_pairs += int(rerank_results["rerank_n_pairs"].item())
+
         # center-value: run proposal on the full-protein sample once per complex
         if lambda_center_value > 0 and center_values:
             try:
-                ds_idx = item["dataset_index"]
-                sample = train_set[ds_idx]
                 sample_batch = cast(Any, collator.collate([sample])).to(device)
 
                 from ehfnet.training.trainer import predict_center_proposal_logits
@@ -400,21 +443,16 @@ def replay_and_compute_losses(
 
                 del sample_batch
             except Exception:
-                pass
+                    pass
 
     result: dict[str, Tensor] = {}
 
-    if all_logits:
-        logits_cat = torch.cat(all_logits)
-        rmsd_cat = torch.cat(all_rmsd)
-        rerank_results = compute_rerank_losses(
-            logits_cat, rmsd_cat,
-            margin=margin,
-            lambda_bce=lambda_bce,
-            lambda_pair=lambda_pair,
-            lambda_list=lambda_list,
-        )
-        result.update(rerank_results)
+    if per_group_totals:
+        result["rerank_total"] = torch.stack(per_group_totals).mean()
+        result["rerank_bce"] = torch.stack(per_group_bce).mean()
+        result["rerank_pairwise"] = torch.stack(per_group_pair).mean()
+        result["rerank_listwise"] = torch.stack(per_group_list).mean()
+        result["rerank_n_pairs"] = torch.tensor(float(total_pairs), device=device)
     else:
         result["rerank_total"] = torch.tensor(0.0, device=device)
         result["rerank_bce"] = torch.tensor(0.0, device=device)
@@ -430,6 +468,58 @@ def replay_and_compute_losses(
         result["center_value_loss"] = torch.tensor(0.0, device=device)
 
     return result
+
+
+def _resolve_replay_sample(train_subset_or_dataset: Any, dataset_index: int) -> Any:
+    """Resolve replay samples against the base dataset.
+
+    blind pool stores indices from the underlying dataset; when training uses
+    torch.utils.data.Subset wrappers, replay must bypass subset-local indexing.
+    """
+    if hasattr(train_subset_or_dataset, "dataset") and hasattr(train_subset_or_dataset, "indices"):
+        return train_subset_or_dataset.dataset[int(dataset_index)]
+    return train_subset_or_dataset[int(dataset_index)]
+
+
+def _build_group_pair_indices(
+    candidates: list[dict[str, Any]],
+    *,
+    device: torch.device,
+    positive_rmsd_threshold: float = 2.0,
+    min_rmsd_gap: float = 0.25,
+) -> Tensor | None:
+    if len(candidates) < 2:
+        return None
+
+    rmsd_values = [float(c["rmsd"]) for c in candidates]
+    positive_indices = [i for i, c in enumerate(candidates) if float(c["rmsd"]) < positive_rmsd_threshold]
+    pair_list: list[tuple[int, int]] = []
+
+    if positive_indices:
+        positive_center_ids = {int(candidates[i]["center_id"]) for i in positive_indices}
+        for pos_idx in positive_indices:
+            pos_center = int(candidates[pos_idx]["center_id"])
+            for neg_idx, cand in enumerate(candidates):
+                if neg_idx == pos_idx:
+                    continue
+                neg_rmsd = float(cand["rmsd"])
+                if neg_rmsd <= rmsd_values[pos_idx] + min_rmsd_gap:
+                    continue
+                neg_center = int(cand["center_id"])
+                role = str(cand.get("candidate_role", "random"))
+                if neg_center == pos_center or neg_center not in positive_center_ids or role.endswith("negative"):
+                    pair_list.append((pos_idx, neg_idx))
+
+    if not pair_list:
+        ordered = sorted(range(len(candidates)), key=lambda i: rmsd_values[i])
+        for better, worse in zip(ordered[:-1], ordered[1:]):
+            if rmsd_values[worse] - rmsd_values[better] >= min_rmsd_gap:
+                pair_list.append((better, worse))
+
+    if not pair_list:
+        return None
+
+    return torch.tensor(pair_list, device=device, dtype=torch.long)
 
 
 # ──────────────────────────────────────────────────────────────────────────────

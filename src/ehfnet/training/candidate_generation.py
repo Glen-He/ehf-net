@@ -220,7 +220,9 @@ def generate_blind_candidates(
                 {
                     "score": p["combined_score"],
                     "rmsd": p["rmsd"],
-                    "pose_logit": p["pose_quality_logit"],
+                    "pose_logit": p.get("pose_rank_logit", p["pose_quality_logit"]),
+                    "pose_quality_logit": p["pose_quality_logit"],
+                    "pose_rank_logit": p.get("pose_rank_logit", p["pose_quality_logit"]),
                     "center_logit": p["center_logit"],
                     "aff_logit": p["binding_affinity_teacher"],
                     "clash_value": p["steric_clash_teacher"],
@@ -229,11 +231,15 @@ def generate_blind_candidates(
                 for p in pose_records
             ]
 
-            ds_idx = dataset_indices[sample_idx] if dataset_indices is not None else sample_idx
+            sample_dataset_index = getattr(sample, "dataset_index", None)
+            if sample_dataset_index is None and dataset_indices is not None:
+                sample_dataset_index = dataset_indices[sample_idx]
+            if sample_dataset_index is None:
+                sample_dataset_index = sample_idx
 
             records.append({
                 "complex_id": str(pdb_id),
-                "dataset_index": ds_idx,
+                "dataset_index": int(sample_dataset_index),
                 "pdb_id": str(pdb_id),
                 "gt_center_xyz": gt_center.tolist(),
                 "n_ligand_atoms": int(gt_pos.size(0)),
@@ -335,9 +341,10 @@ def _generate_single_pose(
         if force_atom is not None and force_atom.numel() > 0:
             force_norm = float(force_atom.detach().norm(dim=-1).mean().cpu().item())
         rank_score = float(rank_score_raw.detach().cpu().view(-1)[0].item()) if rank_score_raw is not None else None
+        primary_pose_logit = rank_score if rank_score is not None else pose_logit
 
         center_logit_t = torch.tensor([center_logit], dtype=torch.float32)
-        pose_logit_t = torch.tensor([pose_logit], dtype=torch.float32)
+        pose_logit_t = torch.tensor([primary_pose_logit], dtype=torch.float32)
         combined_score = float(combine_center_pose_score(
             center_logit_t, pose_logit_t,
             aff_logit=torch.tensor([aff_val]),
@@ -358,6 +365,7 @@ def _generate_single_pose(
             "rmsd": rmsd,
             "centroid_dist": centroid_dist,
             "pose_quality_logit": pose_logit,
+            "pose_rank_logit": primary_pose_logit,
             "binding_affinity_teacher": aff_val,
             "steric_clash_teacher": clash_val,
             "force_norm_teacher": force_norm,
@@ -428,6 +436,11 @@ def generate_candidates_from_loader(
                     continue
 
             data_list = batch.to_data_list() if hasattr(batch, "to_data_list") else [batch]
+            batch_dataset_indices = [
+                int(getattr(sample, "dataset_index"))
+                for sample in data_list
+                if getattr(sample, "dataset_index", None) is not None
+            ]
 
             if max_complexes is not None and total_complexes + len(data_list) > max_complexes:
                 data_list = data_list[:max(1, max_complexes - total_complexes)]
@@ -449,6 +462,7 @@ def generate_candidates_from_loader(
                 warmup_epochs=warmup_epochs,
                 center_hit_radius=center_hit_radius,
                 fusion_weights=fusion_weights,
+                dataset_indices=batch_dataset_indices if len(batch_dataset_indices) == len(data_list) else None,
                 pool_epoch=pool_epoch,
                 generator_ckpt_id=generator_ckpt_id,
             )

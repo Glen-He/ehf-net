@@ -368,29 +368,37 @@ class ProteinPocketEmbedding(nn.Module):
     """
     蛋白质口袋（整体）嵌入
 
-    为每个口袋节点学习一个可训练的初始嵌入向量。
+    将显式 pocket summary 特征投影到隐藏空间，并叠加可学习 token。
     """
 
-    def __init__(self, hidden_dim: int) -> None:
+    def __init__(self, cont_feature_count: int, hidden_dim: int) -> None:
         """
         Args:
+            cont_feature_count: pocket 连续特征维度
             hidden_dim: 隐藏层维度
         """
 
         super().__init__()
-        self.initial_pocket_emb = nn.Parameter(torch.randn(1, hidden_dim))
+        self.cont_norm = nn.LayerNorm(cont_feature_count)
+        self.projection_mlp = nn.Sequential(
+            nn.Linear(cont_feature_count, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.initial_pocket_emb = nn.Parameter(torch.randn(1, hidden_dim) * 0.02)
         self.output_dim = hidden_dim
 
 
-    def forward(self, num_nodes: int) -> Tensor:
+    def forward(self, x_cont: Tensor) -> Tensor:
         """
         前向传播
 
         Args:
-            num_nodes: 口袋节点数量
+            x_cont: 口袋连续特征 [N_pocket, D]
 
         Returns:
             口袋节点嵌入 [num_nodes, hidden_dim]
         """
 
-        return self.initial_pocket_emb.repeat(num_nodes, 1)
+        projected = self.projection_mlp(self.cont_norm(x_cont))
+        return projected + self.initial_pocket_emb.expand(x_cont.size(0), -1)

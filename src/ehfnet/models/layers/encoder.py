@@ -7,13 +7,11 @@ EHFNet 编码器
 import logging
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from typing import Any, cast
 from torch import Tensor
 from torch.nn import ModuleList
 from torch_geometric.data import HeteroData
-from torch_geometric.nn import radius
 from torch_scatter import scatter_mean
 from egnn_pytorch import EGNN_Sparse
 from ehfnet.models.layers.frame_conv import FrameAwareConv, FrameAwareHeteroConv
@@ -34,9 +32,12 @@ from ehfnet.graph.hetero_schema import (
     ATOM_NODE_TYPES,
     INTRA_EDGES,
     AGGREGATE_EDGES,
+    DYNAMIC_INTER_EDGES,
     INTER_EDGES,
     BROADCAST_EDGES,
 )
+from ehfnet.graph.inter_edges import build_batched_radius_or_knn_edges
+from ehfnet.graph.pocket_features import build_pocket_features, pocket_feature_dim
 from ehfnet.models.layers.embeddings import (
     TimeEmbedding,
     LigandAtomEmbedding,
@@ -77,6 +78,7 @@ class EHFEncoder(nn.Module):
         dropout_rate: float = 0.0,
         fix_protein: bool = True,
         stats: dict | None = None,
+        interaction_profile: str = "full",
         dynamic_inter_cutoff: float = 10.0,
         dynamic_inter_knn_k: int = 8,
         dynamic_residue_cutoff: float = 14.0,
@@ -96,6 +98,7 @@ class EHFEncoder(nn.Module):
             dropout_rate: Dropout 比例
             fix_protein: 是否冻结蛋白坐标
             stats: 统计数据字典 (用于输入归一化)
+            interaction_profile: 跨图交互配置，支持 "full" 或 "atom_only"
             dynamic_inter_cutoff: 动态跨图原子边半径
             dynamic_inter_knn_k: 半径为空时的 kNN 回退邻居数
             dynamic_residue_cutoff: 动态 ligand-residue 跨图边半径
@@ -106,10 +109,17 @@ class EHFEncoder(nn.Module):
         self.hidden_dim  = hidden_dim
         self.num_rbf     = num_rbf
         self.fix_protein = fix_protein
+        self.interaction_profile = interaction_profile
         self.dynamic_inter_cutoff = float(dynamic_inter_cutoff)
         self.dynamic_inter_knn_k = max(1, int(dynamic_inter_knn_k))
         self.dynamic_residue_cutoff = float(dynamic_residue_cutoff)
         self.dynamic_residue_knn_k = max(1, int(dynamic_residue_knn_k))
+
+        if self.interaction_profile not in {"full", "atom_only"}:
+            raise ValueError(
+                f"Unsupported interaction_profile='{self.interaction_profile}'. "
+                "Use one of {'full', 'atom_only'}."
+            )
 
         # 1. 特征嵌入
         self.ligand_atom_embedder = LigandAtomEmbedding(
@@ -132,7 +142,16 @@ class EHFEncoder(nn.Module):
             hidden_dim=hidden_dim,
             stats=stats.get("protein_residue") if stats else None
         )
-        self.protein_pocket_embedder = ProteinPocketEmbedding(hidden_dim=hidden_dim)
+        self.protein_pocket_embedder = ProteinPocketEmbedding(
+            cont_feature_count=pocket_feature_dim(pro_res_cont_count),
+            hidden_dim=hidden_dim,
+        )
+        self.pocket_refresh_mlp = nn.Sequential(
+            nn.LayerNorm(hidden_dim * 2),
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
 
         self.time_embedder = TimeEmbedding(dim=time_dim, hidden_dim=hidden_dim)
 
@@ -143,9 +162,12 @@ class EHFEncoder(nn.Module):
         self.intra_feat_edges = [e for e in INTRA_EDGES if e not in self.intra_atom_edges]
         self.agg_edges = AGGREGATE_EDGES
         self.inter_atom_edges = [
-            e for e in INTER_EDGES if "atom" in e[0] and "atom" in e[2]
+            e for e in DYNAMIC_INTER_EDGES if "atom" in e[0] and "atom" in e[2]
         ]
-        self.inter_feat_edges = [e for e in INTER_EDGES if e not in self.inter_atom_edges]
+        if self.interaction_profile == "atom_only":
+            self.inter_feat_edges = []
+        else:
+            self.inter_feat_edges = [e for e in INTER_EDGES if e not in self.inter_atom_edges]
         self.bcast_edges = BROADCAST_EDGES
 
         # 3. 构造 GNN 模块序列
@@ -328,7 +350,7 @@ class EHFEncoder(nn.Module):
             esm_missing_mask=esm_missing_mask,
         )
         x_dict["protein_pocket"] = self.protein_pocket_embedder(
-            data["protein_pocket"].num_nodes
+            data["protein_pocket"].x_cont
         )
 
         return x_dict, pos_dict, initial_lig_pos
@@ -547,49 +569,6 @@ class EHFEncoder(nn.Module):
         return torch.zeros(num_nodes, dtype=torch.long, device=device)
 
 
-    @staticmethod
-    def _bipartite_knn_edges(
-        *,
-        src_pos: Tensor,
-        src_batch: Tensor,
-        dst_pos: Tensor,
-        dst_batch: Tensor,
-        k: int,
-    ) -> Tensor:
-        """
-        为 dst 节点构建 src->dst 的批内 kNN 边。
-        返回格式：[src_idx, dst_idx]
-        """
-
-        device = src_pos.device
-
-        if src_pos.numel() == 0 or dst_pos.numel() == 0:
-            return torch.zeros((2, 0), dtype=torch.long, device=device)
-
-        edges: list[Tensor] = []
-        batch_ids = torch.unique(dst_batch)
-
-        for b in batch_ids:
-            src_ids = torch.where(src_batch == b)[0]
-            dst_ids = torch.where(dst_batch == b)[0]
-
-            if src_ids.numel() == 0 or dst_ids.numel() == 0:
-                continue
-
-            dist = torch.cdist(dst_pos[dst_ids], src_pos[src_ids])
-            k_eff = min(k, int(src_ids.numel()))
-            nn_src_local = torch.topk(dist, k=k_eff, largest=False, dim=1).indices
-
-            dst_rep = dst_ids.repeat_interleave(k_eff)
-            src_sel = src_ids[nn_src_local.reshape(-1)]
-            edges.append(torch.stack([src_sel, dst_rep], dim=0))
-
-        if not edges:
-            return torch.zeros((2, 0), dtype=torch.long, device=device)
-
-        return torch.cat(edges, dim=1)
-
-
     def _build_dynamic_inter_atom_edges(
         self,
         *,
@@ -620,52 +599,18 @@ class EHFEncoder(nn.Module):
 
         # radius 返回 [dst(y), src(x)]，此处 y=ligand, x=protein
         # 输出正向边使用 [lig_idx, pro_idx]
-        radius_edges = radius(
-            x=pro_pos,
-            y=lig_pos,
-            r=self.dynamic_inter_cutoff,
-            batch_x=pro_batch,
-            batch_y=lig_batch,
+        edge_fw = build_batched_radius_or_knn_edges(
+            src_pos=lig_pos,
+            src_batch=lig_batch,
+            dst_pos=pro_pos,
+            dst_batch=pro_batch,
+            radius_cutoff=self.dynamic_inter_cutoff,
+            knn_k=self.dynamic_inter_knn_k,
+            ensure_src_coverage=True,
             max_num_neighbors=max(64, self.dynamic_inter_knn_k * 4),
         )
 
-        if radius_edges.numel() > 0:
-            edge_fw = torch.stack([radius_edges[0], radius_edges[1]], dim=0)
-        else:
-            edge_fw = self._bipartite_knn_edges(
-                src_pos=pro_pos,
-                src_batch=pro_batch,
-                dst_pos=lig_pos,
-                dst_batch=lig_batch,
-                k=self.dynamic_inter_knn_k,
-            )
-
-        # 覆盖性修复：确保每个 ligand 原子至少有一条跨图边
-        if edge_fw.numel() > 0:
-            covered_lig = torch.unique(edge_fw[1])
-            all_lig = torch.arange(lig_pos.size(0), device=device)
-            uncovered = all_lig[~torch.isin(all_lig, covered_lig)]
-
-            if uncovered.numel() > 0:
-                extra = self._bipartite_knn_edges(
-                    src_pos=pro_pos,
-                    src_batch=pro_batch,
-                    dst_pos=lig_pos[uncovered],
-                    dst_batch=lig_batch[uncovered],
-                    k=1,
-                )
-
-                if extra.numel() > 0:
-                    # extra 的 dst 索引是局部 0..len(uncovered)-1，需要映射回全局 ligand 索引
-                    extra_dst_global = uncovered[extra[1]]
-                    extra_fw = torch.stack([extra[0], extra_dst_global], dim=0)
-                    edge_fw = torch.cat([edge_fw, extra_fw], dim=1)
-
-        if edge_fw.numel() > 0:
-            edge_fw = torch.unique(edge_fw, dim=1)
-
-        # key_fw 约定为 [lig_idx, pro_idx]
-        edge_dict[key_fw] = torch.stack([edge_fw[1], edge_fw[0]], dim=0) if edge_fw.numel() > 0 else edge_fw
+        edge_dict[key_fw] = edge_fw if edge_fw.numel() > 0 else torch.zeros((2, 0), dtype=torch.long, device=device)
         edge_dict[key_bw] = edge_dict[key_fw].flip(0) if edge_dict[key_fw].numel() > 0 else edge_dict[key_fw]
 
         return edge_dict
@@ -677,6 +622,7 @@ class EHFEncoder(nn.Module):
         data: HeteroData,
         pos_dict: dict[str, Tensor],
         edge_dict: dict[tuple[str, str, str], Tensor],
+        residue_pos: Tensor,
     ) -> dict[tuple[str, str, str], Tensor]:
         """
         动态重建 ligand_atom<->protein_residue 跨图边（Stage-3 多尺度交互）。
@@ -689,7 +635,7 @@ class EHFEncoder(nn.Module):
             return edge_dict
 
         lig_pos = pos_dict["ligand_atom"]
-        res_pos = data["protein_residue"].pos
+        res_pos = residue_pos
 
         if lig_pos.numel() == 0 or res_pos.numel() == 0:
             return edge_dict
@@ -698,55 +644,119 @@ class EHFEncoder(nn.Module):
         lig_batch = self._get_node_batch(data, "ligand_atom", lig_pos.size(0), device)
         res_batch = self._get_node_batch(data, "protein_residue", res_pos.size(0), device)
 
-        radius_edges = radius(
-            x=res_pos,
-            y=lig_pos,
-            r=self.dynamic_residue_cutoff,
-            batch_x=res_batch,
-            batch_y=lig_batch,
+        edge_fw = build_batched_radius_or_knn_edges(
+            src_pos=lig_pos,
+            src_batch=lig_batch,
+            dst_pos=res_pos,
+            dst_batch=res_batch,
+            radius_cutoff=self.dynamic_residue_cutoff,
+            knn_k=self.dynamic_residue_knn_k,
+            ensure_src_coverage=True,
             max_num_neighbors=max(64, self.dynamic_residue_knn_k * 6),
         )
-
-        if radius_edges.numel() > 0:
-            # [lig_idx, res_idx]
-            edge_fw = torch.stack([radius_edges[0], radius_edges[1]], dim=0)
-        else:
-            edge_fw = self._bipartite_knn_edges(
-                src_pos=res_pos,
-                src_batch=res_batch,
-                dst_pos=lig_pos,
-                dst_batch=lig_batch,
-                k=self.dynamic_residue_knn_k,
-            )
-            # 转为 [lig_idx, res_idx]
-            if edge_fw.numel() > 0:
-                edge_fw = edge_fw.flip(0)
-
-        if edge_fw.numel() > 0:
-            covered_lig = torch.unique(edge_fw[0])
-            all_lig = torch.arange(lig_pos.size(0), device=device)
-            uncovered = all_lig[~torch.isin(all_lig, covered_lig)]
-
-            if uncovered.numel() > 0:
-                extra = self._bipartite_knn_edges(
-                    src_pos=res_pos,
-                    src_batch=res_batch,
-                    dst_pos=lig_pos[uncovered],
-                    dst_batch=lig_batch[uncovered],
-                    k=1,
-                )
-                if extra.numel() > 0:
-                    # extra 为 [res_idx, local_lig_idx]
-                    extra_lig_global = uncovered[extra[1]]
-                    extra_fw = torch.stack([extra_lig_global, extra[0]], dim=0)
-                    edge_fw = torch.cat([edge_fw, extra_fw], dim=1)
-
-            edge_fw = torch.unique(edge_fw, dim=1)
 
         edge_dict[key_fw] = edge_fw if edge_fw.numel() > 0 else torch.zeros((2, 0), dtype=torch.long, device=device)
         edge_dict[key_bw] = edge_dict[key_fw].flip(0) if edge_dict[key_fw].numel() > 0 else edge_dict[key_fw]
 
         return edge_dict
+
+
+    def _compute_current_residue_positions(
+        self,
+        *,
+        data: HeteroData,
+        pos_dict: dict[str, Tensor],
+    ) -> Tensor:
+        """
+        从当前 protein_atom 坐标派生 residue 几何中心。
+
+        rigid 模式直接复用输入 residue 坐标；
+        flexible 模式下保持 atom / residue / pocket 几何一致。
+        """
+
+        if self.fix_protein:
+            return data["protein_residue"].pos
+
+        if "protein_atom" not in pos_dict or pos_dict["protein_atom"].numel() == 0:
+            return data["protein_residue"].pos
+
+        residue_idx = data["protein_atom"].residue_idx.long()
+        num_residues = int(data["protein_residue"].num_nodes)
+        residue_pos = scatter_mean(
+            pos_dict["protein_atom"],
+            residue_idx,
+            dim=0,
+            dim_size=num_residues,
+        )
+        counts = torch.bincount(residue_idx, minlength=num_residues).to(
+            device=residue_pos.device
+        )
+        missing_mask = counts == 0
+        if bool(missing_mask.any()):
+            residue_pos[missing_mask] = data["protein_residue"].pos.to(residue_pos.device)[missing_mask]
+        return residue_pos
+
+
+    def _refresh_protein_context(
+        self,
+        *,
+        data: HeteroData,
+        x_dict: dict[str, Tensor],
+        pos_dict: dict[str, Tensor],
+        device: torch.device,
+        batch_size: int,
+    ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
+        """
+        构建当前 block 使用的 residue / pocket 几何与 pocket 隐状态。
+
+        flexible 模式下：
+        - residue / pocket 坐标随当前 protein atom 坐标刷新
+        - pocket 连续特征随当前几何刷新
+        - pocket 隐表示通过 refresh MLP 融合当前语义与几何 summary
+        """
+
+        residue_pos = self._compute_current_residue_positions(data=data, pos_dict=pos_dict)
+        residue_batch = self._get_node_batch(
+            data, "protein_residue", residue_pos.size(0), device
+        )
+        protein_atom_batch = self._get_node_batch(
+            data, "protein_atom", data["protein_atom"].num_nodes, device
+        )
+        pocket_pos = scatter_mean(
+            residue_pos.detach(),
+            residue_batch,
+            dim=0,
+            dim_size=batch_size,
+        )
+
+        if not self.fix_protein:
+            pocket_x_cont = build_pocket_features(
+                residue_x_cont=data["protein_residue"].x_cont.to(device),
+                residue_pos=residue_pos,
+                protein_atom_pos=pos_dict["protein_atom"].detach(),
+                residue_batch=residue_batch,
+                protein_atom_batch=protein_atom_batch,
+                center=pocket_pos.detach(),
+            )
+            refreshed_pocket = self.protein_pocket_embedder(pocket_x_cont)
+            refresh_input = torch.cat(
+                [x_dict["protein_pocket"], refreshed_pocket], dim=-1
+            )
+            x_dict["protein_pocket"] = x_dict["protein_pocket"] + self.pocket_refresh_mlp(refresh_input)
+
+        full_pos_dict: dict[str, Tensor] = {
+            "ligand_atom": pos_dict["ligand_atom"],
+            "protein_atom": pos_dict["protein_atom"],
+            "ligand_molecule": scatter_mean(
+                pos_dict["ligand_atom"].detach(),
+                data["ligand_atom"].batch,
+                dim=0,
+                dim_size=batch_size,
+            ),
+            "protein_residue": residue_pos,
+            "protein_pocket": pocket_pos,
+        }
+        return residue_pos, pocket_pos, full_pos_dict
 
 
     def forward(self, data: HeteroData, t: Tensor) -> dict[str, Any]:
@@ -796,41 +806,27 @@ class EHFEncoder(nn.Module):
         lig_batch = data["ligand_atom"].batch
         B         = int(lig_batch.max().item()) + 1
 
-        # 蓋白质和口袋的固定坐标（蛋白不动，仅计算一次）
-        pro_res_pos   = data["protein_residue"].pos                      # [N_res, 3] Cα 坐标
-        pro_res_batch = self._get_node_batch(
-            data, "protein_residue", pro_res_pos.shape[0], device
-        )
-        # 口袋几何中心：每个 batch 内所有残基坐标的均值
-        pro_pocket_pos = scatter_mean(
-            pro_res_pos.detach(), pro_res_batch, dim=0, dim_size=B
-        )                                                                # [B, 3]
-
         for block in self.gnn_blocks:
-            # 配体分子质心每个 block 重算（配体坐标随 EGNN 更新而移动）
-            pos_mol = scatter_mean(
-                pos_dict["ligand_atom"].detach(), lig_batch, dim=0, dim_size=B
-            )                                                            # [B, 3]
-
-            # full_pos_dict 为 FrameAwareHeteroConv 提供所有节点类型的坐标
-            full_pos_dict: dict[str, Tensor] = {
-                "ligand_atom":     pos_dict["ligand_atom"],
-                "protein_atom":    pos_dict["protein_atom"],
-                "ligand_molecule": pos_mol,
-                "protein_residue": pro_res_pos,
-                "protein_pocket":  pro_pocket_pos,
-            }
+            residue_pos, _, full_pos_dict = self._refresh_protein_context(
+                data=data,
+                x_dict=x_dict,
+                pos_dict=pos_dict,
+                device=device,
+                batch_size=B,
+            )
 
             edge_dict = self._build_dynamic_inter_atom_edges(
                 data=data,
                 pos_dict=pos_dict,
                 edge_dict=edge_dict,
             )
-            edge_dict = self._build_dynamic_ligand_residue_edges(
-                data=data,
-                pos_dict=pos_dict,
-                edge_dict=edge_dict,
-            )
+            if self.interaction_profile == "full":
+                edge_dict = self._build_dynamic_ligand_residue_edges(
+                    data=data,
+                    pos_dict=pos_dict,
+                    edge_dict=edge_dict,
+                    residue_pos=residue_pos,
+                )
             x_dict, pos_dict = self._run_block(
                 cast(nn.ModuleDict, block), x_dict, pos_dict, edge_dict, full_pos_dict
             )

@@ -10,7 +10,7 @@ import numpy as np
 from typing import Any, cast
 from torch import Tensor
 from torch_geometric.data import HeteroData
-from torch_geometric.nn import radius, radius_graph, knn_graph
+from torch_geometric.nn import knn_graph
 from ehfnet.encoders.ligand_encoder import LigandEncodingResult
 from ehfnet.encoders.protein_encoder import ProteinEncodingResult
 from ehfnet.encoders.feature_specs import (
@@ -25,10 +25,11 @@ from ehfnet.encoders.feature_specs import (
 from ehfnet.graph.hetero_schema import (
     INTRA_EDGES,
     AGGREGATE_EDGES,
-    INTER_EDGES,
+    STATIC_INTER_EDGES,
     BROADCAST_EDGES,
 )
 from ehfnet.graph.collate import GraphCollator
+from ehfnet.graph.pocket_features import build_pocket_features
 
 
 class ESMEmbeddingFiller:
@@ -132,9 +133,9 @@ class GraphBuilder:
         """
         Args:
             r_cutoff_intra: 图内边的距离阈值（原子/残基内部）
-            r_cutoff_inter: 跨图边的距离阈值（配体-蛋白交互）
+            r_cutoff_inter: 保留兼容参数；动态跨图边现由 encoder 侧控制
             max_neighbors_intra: 图内最大邻居数（PyG radius_graph）
-            max_neighbors_inter: 跨图最大邻居数（PyG radius）
+            max_neighbors_inter: 保留兼容参数；动态跨图边现由 encoder 侧控制
             esm_filler: ESM embedding 填充器（默认使用 ESMEmbeddingFiller）
             interaction_profile: 跨图交互配置，支持：
                 - "full": 保留全部跨图边（默认）
@@ -368,19 +369,11 @@ class GraphBuilder:
             更新后的 HeteroData
         """
 
-        n_residues = int(data["protein_residue"].num_nodes)
-
-        if n_residues > 0:
-            pocket_cont = data["protein_residue"].x_cont.mean(dim=0, keepdim=True)
-
-        else:
-            feat_dim = data["protein_residue"].x_cont.size(1)
-            pocket_cont = torch.zeros(
-                (1, feat_dim),
-                device=data["protein_residue"].x_cont.device,
-                dtype=data["protein_residue"].x_cont.dtype,
-            )
-
+        pocket_cont = build_pocket_features(
+            residue_x_cont=data["protein_residue"].x_cont,
+            residue_pos=data["protein_residue"].pos,
+            protein_atom_pos=data["protein_atom"].pos,
+        )
         data["protein_pocket"].x_cont = pocket_cont
         data["protein_pocket"].num_nodes = 1
 
@@ -488,14 +481,11 @@ class GraphBuilder:
 
     def _build_inter_edges(self, data: HeteroData) -> HeteroData:
         """
-        构建配体与蛋白质之间的跨图交互边。
+        构建静态跨图交互边。
 
         规则：
-        - atom/residue 之间使用 radius 构图；
-        - protein_pocket 相关关系使用全连接（全局节点通常不具备可用的几何坐标）。
-
-        为避免重复计算，若 schema 同时包含 (src, rel, dst) 与 (dst, rel, src)，则仅计算一次，
-        并在 schema 允许的前提下用 flip(0) 补齐反向边。
+        - 仅构建 pocket 相关的全局静态边；
+        - atom-atom / atom-residue 动态交互边由 encoder 在每个 block 重新生成。
 
         Args:
             data: HeteroData
@@ -504,10 +494,10 @@ class GraphBuilder:
             更新后的 HeteroData
         """
 
-        inter_edge_types = set(INTER_EDGES)
+        inter_edge_types = set(STATIC_INTER_EDGES)
         processed_edges: set[tuple[str, str, str]] = set()
 
-        for src, rel, dst in INTER_EDGES:
+        for src, rel, dst in STATIC_INTER_EDGES:
             if not self._is_inter_edge_enabled(src, dst):
                 continue
 
@@ -517,63 +507,20 @@ class GraphBuilder:
             if edge_key in processed_edges:
                 continue
 
-            is_pocket_edge = (src == "protein_pocket") or (dst == "protein_pocket")
-
-            if not is_pocket_edge:
-
-                if not hasattr(data[src], "pos") or not hasattr(data[dst], "pos"):
-                    continue
-
-                if data[src].pos.numel() == 0 or data[dst].pos.numel() == 0:
-                    continue
-
             if hasattr(data["ligand_atom"], "pos"):
                 edge_device = data["ligand_atom"].pos.device
             else:
                 edge_device = torch.device("cpu")
 
-            edge_index = torch.zeros((2, 0), dtype=torch.long, device=edge_device)
+            n_src_nodes = int(data[src].num_nodes)
+            n_dst_nodes = int(data[dst].num_nodes)
 
-            if is_pocket_edge:
-                n_src_nodes = int(data[src].num_nodes)
-                n_dst_nodes = int(data[dst].num_nodes)
-
-                # 构建全连接边: [0...N] -> [0...M]
-                src_idx = torch.arange(n_src_nodes, device=edge_device).repeat_interleave(
-                    n_dst_nodes
-                )
-                dst_idx = torch.arange(n_dst_nodes, device=edge_device).repeat(n_src_nodes)
-                edge_index = torch.stack([src_idx, dst_idx], dim=0)
-
-            else:
-                # [修改] 完全抛弃二部半径图，直接使用二部 KNN 进行关联
-                # 默认使用 K=128 (用户指定) 或者配体侧按需减少
-                k = 128 if "residue" in src or "residue" in dst else 32
-                
-                edge_index = self._bipartite_knn_graph(
-                    data[src].pos,
-                    data[dst].pos,
-                    k=k,
-                )
-
-                # 保证每个目标节点至少有一条入边（避免部分节点无跨图信息）
-                if edge_index.numel() > 0:
-                    covered_dst = torch.unique(edge_index[1])
-                    all_dst = torch.arange(int(data[dst].num_nodes), device=edge_device)
-                    uncovered_mask = torch.ones_like(all_dst, dtype=torch.bool)
-                    uncovered_mask[covered_dst] = False
-                    uncovered_dst = all_dst[uncovered_mask]
-
-                    if uncovered_dst.numel() > 0:
-                        extra_edges = self._bipartite_knn_graph(
-                            data[src].pos,
-                            data[dst].pos,
-                            k=1,
-                            dst_indices=uncovered_dst,
-                        )
-                        if extra_edges.numel() > 0:
-                            edge_index = torch.cat([edge_index, extra_edges], dim=1)
-                            edge_index = torch.unique(edge_index, dim=1)
+            # pocket 相关边使用全连接，全局节点不依赖显式局部半径拓扑。
+            src_idx = torch.arange(n_src_nodes, device=edge_device).repeat_interleave(
+                n_dst_nodes
+            )
+            dst_idx = torch.arange(n_dst_nodes, device=edge_device).repeat(n_src_nodes)
+            edge_index = torch.stack([src_idx, dst_idx], dim=0)
 
             data[src, rel, dst].edge_index = edge_index
             reverse_edge_type = (dst, rel, src)
@@ -589,28 +536,6 @@ class GraphBuilder:
             processed_edges.add(edge_key)
 
         return data
-
-
-    def _resolve_inter_cutoff(self, src: str, dst: str) -> float:
-        """
-        按节点类型选择跨图半径阈值。
-        """
-
-        if "residue" in src or "residue" in dst:
-            return self.r_cutoff_inter * 2.0
-
-        return self.r_cutoff_inter
-
-
-    def _resolve_inter_max_neighbors(self, src: str, dst: str) -> int:
-        """
-        按节点类型选择跨图最大邻居数。
-        """
-
-        if "residue" in src or "residue" in dst:
-            return max(self.max_neighbors_inter, 64)
-
-        return self.max_neighbors_inter
 
 
     def _build_broadcast_edges(self, data: HeteroData) -> HeteroData:
@@ -677,93 +602,6 @@ class GraphBuilder:
         return data
 
 
-    @staticmethod
-    def _radius_graph(pos: Tensor, r_cutoff: float, *, max_num_neighbors: int = 64) -> Tensor:
-        """
-        基于 radius_graph 构建同集合内的邻接边。
-
-        Args:
-            pos: 节点坐标，形状 [N, 3]
-            r_cutoff: 半径阈值
-            max_num_neighbors: 每个节点的最大邻居数
-
-        Returns:
-            edge_index，形状 [2, E]
-        """
-
-        return radius_graph(pos, r=r_cutoff, loop=False, max_num_neighbors=max_num_neighbors)
-
-
-    @staticmethod
-    def _bipartite_radius_graph(
-        pos_src: Tensor,
-        pos_dst: Tensor,
-        r_cutoff: float,
-        *,
-        max_num_neighbors: int = 32,
-    ) -> Tensor:
-        """
-        构建二部图半径邻接边（src -> dst）。
-
-        Args:
-            pos_src: 源节点坐标，形状 [N_src, 3]
-            pos_dst: 目标节点坐标，形状 [N_dst, 3]
-            r_cutoff: 半径阈值
-            max_num_neighbors: 每个目标节点的最大邻居数（PyG radius 约束）
-
-        Returns:
-            edge_index（source_index, target_index），形状 [2, E]
-        """
-
-        # PyG radius 返回 (target_index, source_index)
-        edge_index = radius(
-            pos_src,
-            pos_dst,
-            r=r_cutoff,
-            batch_x=None,
-            batch_y=None,
-            max_num_neighbors=max_num_neighbors,
-        )
-        # 翻转为 (source_index, target_index) 以符合直觉
-        if edge_index.numel() > 0:
-            edge_index = edge_index.flip(0)
-
-        return edge_index
-
-
-    @staticmethod
-    def _bipartite_knn_graph(
-        pos_src: Tensor,
-        pos_dst: Tensor,
-        k: int,
-        *,
-        dst_indices: Tensor | None = None,
-    ) -> Tensor:
-        """
-        构建 src->dst 的 kNN 边，保证在远距离时仍有跨图连接。
-        """
-
-        device = pos_src.device
-
-        if pos_src.numel() == 0 or pos_dst.numel() == 0:
-            return torch.zeros((2, 0), dtype=torch.long, device=device)
-
-        if dst_indices is None:
-            dst_indices = torch.arange(pos_dst.size(0), device=device)
-
-        if dst_indices.numel() == 0:
-            return torch.zeros((2, 0), dtype=torch.long, device=device)
-
-        dist = torch.cdist(pos_dst[dst_indices], pos_src)
-        k_eff = min(max(1, int(k)), pos_src.size(0))
-        nn_src = torch.topk(dist, k=k_eff, largest=False, dim=1).indices
-
-        dst_rep = dst_indices.repeat_interleave(k_eff)
-        src_sel = nn_src.reshape(-1)
-
-        return torch.stack([src_sel, dst_rep], dim=0)
-
-
 def create_graph_tools(
     *,
     r_cutoff_intra: float = 5.0,
@@ -778,9 +616,9 @@ def create_graph_tools(
 
     Args:
         r_cutoff_intra: 图内边构建半径阈值
-        r_cutoff_inter: 跨图边构建半径阈值
+        r_cutoff_inter: 保留兼容参数；动态跨图边现由 encoder 侧控制
         max_neighbors_intra: 图内最大邻居数
-        max_neighbors_inter: 跨图最大邻居数
+        max_neighbors_inter: 保留兼容参数；动态跨图边现由 encoder 侧控制
         esm_fill_strategy: ESM embedding 缺失时的填充策略
         interaction_profile: 跨图交互配置（"full" 或 "atom_only"）
 

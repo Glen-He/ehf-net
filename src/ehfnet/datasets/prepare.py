@@ -4,24 +4,23 @@
 提供从原始文件（配体/蛋白）读取、ESM embedding 获取，以及构建 HeteroData 的工具函数。
 """
 
-
 import numpy as np
 
 from typing import Any, cast
 
 import torch
-from rdkit import Chem
 import MDAnalysis as mda
 
 from esm.models.esmc import ESMC
 from torch_geometric.data import HeteroData
 
 from ehfnet.encoders import LigandEncoder, ProteinEncoder
+from ehfnet.datasets.ligand_sanitize import load_ligand_mol
 from ehfnet.encoders.esm_embedding import load_or_compute_esm_embeddings
 from ehfnet.graph import GraphBuilder
 
 
-def load_ligand(ligand_path: str) -> Chem.Mol:
+def load_ligand(ligand_path: str):
     """
     读取配体分子，并确保包含 3D conformer。
 
@@ -32,28 +31,7 @@ def load_ligand(ligand_path: str) -> Chem.Mol:
         RDKit Mol 对象（去氢后）
     """
 
-    if ligand_path.endswith(".mol2"):
-        mol = Chem.MolFromMol2File(ligand_path, sanitize=False)
-
-    else:
-        suppl = Chem.SDMolSupplier(ligand_path, sanitize=False)
-        mol = suppl[0] if len(suppl) > 0 else None
-
-    if mol is None:
-        raise ValueError(f"Failed to load ligand: {ligand_path}")
-
-    try:
-        Chem.SanitizeMol(mol)
-
-    except Exception:
-        mol.UpdatePropertyCache(strict=False)
-
-    mol = Chem.RemoveHs(mol)
-
-    if mol.GetNumConformers() == 0:
-        raise ValueError(f"Ligand has no conformer: {ligand_path}")
-
-    return mol
+    return load_ligand_mol(ligand_path, remove_hs=True, require_conformer=True)
 
 
 def load_protein(protein_path: str) -> mda.Universe:
@@ -182,7 +160,6 @@ def prepare_graph(
     protein_result = protein_encoder.encode(
         universe,
         esm_embeddings=esm_embeddings,
-        esm_embedding_file=None,
         pocket_radius=pocket_radius,
         ligand_positions=ligand_positions,
     )

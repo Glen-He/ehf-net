@@ -15,6 +15,7 @@ from esm.models.esmc import ESMC
 from esm.sdk.api import ESMProtein, LogitsConfig
 
 from ehfnet.encoders.chemistry import ResidueType
+from ehfnet.encoders.protein_segments import segment_residues_by_continuity
 
 
 logger = logging.getLogger(__name__)
@@ -22,51 +23,41 @@ logger = logging.getLogger(__name__)
 
 def extract_protein_chain_sequences(universe: Universe) -> list[tuple[str, str, list[int]]]:
     """
-    从 Universe 中提取蛋白质链序列及对应的残基索引（residue.ix）
-    
-    提取过程保证序列 (sequence) 与 索引列表 (residue_ixs) 的长度严格一致，
-    为后续的一一映射提供基础保障。
+    从 Universe 中提取按真实肽链连续性切分的蛋白质链段序列及 residue.ix。
+
+    不再直接按 segment 拼接整条蛋白，而是基于真实链标签和 backbone 连续性切段，
+    避免多链或断链时把不存在的序列上下文硬拼给 ESM。
 
     Args:
         universe: MDAnalysis Universe 对象
 
     Returns:
-        包含 (segid, sequence, residue_ixs) 的列表
+        包含 (segment_key, sequence, residue_ixs) 的列表
     """
-    
-    protein_segments = universe.select_atoms("protein").segments
 
-    if not protein_segments:
+    protein_residues = list(universe.select_atoms("protein").residues)
+    if not protein_residues:
         return []
 
     out: list[tuple[str, str, list[int]]] = []
-    
-    for seg_idx, segment in enumerate(protein_segments):
-        # 按照 ix 排序确保顺序确定
-        chain_residues = sorted(segment.residues, key=lambda r: r.ix)
 
-        if not chain_residues:
-            continue
-
-        segid = str(getattr(segment, "segid", "") or f"segment_{seg_idx}")
+    for segment in segment_residues_by_continuity(protein_residues):
         seq_list: list[str] = []
         residue_ixs: list[int] = []
 
-        for res in chain_residues:
+        for res in segment.residues:
             res_type = ResidueType.safe_get(res.resname)
-            
-            # 处理非标准氨基酸
+
             if res_type == ResidueType.UNK:
                 logger.warning(
-                    f"Unknown residue '{res.resname}' at ix={res.ix} in segment {segid}, "
+                    f"Unknown residue '{res.resname}' at ix={res.ix} in segment {segment.key}, "
                     f"mapped to UNK ('{res_type.one_letter}')"
                 )
-            
-            # 关键步骤：同步添加序列字符和对应的唯一索引
+
             seq_list.append(res_type.one_letter)
             residue_ixs.append(int(res.ix))
 
-        out.append((segid, "".join(seq_list), residue_ixs))
+        out.append((segment.key, "".join(seq_list), residue_ixs))
 
     return out
 

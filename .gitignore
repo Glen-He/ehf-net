@@ -1,24 +1,33 @@
-# Python-generated files
+# Python 缓存与编译文件
 __pycache__/
 *.py[oc]
+.pytest_cache/
+
+# Python 构建产物
 build/
 dist/
 wheels/
 *.egg-info
-.pytest_cache/
 
-# Virtual environments
+# 虚拟环境
 .venv
 
-# Project Specifics
+# 项目运行产生的数据
 /data/
 !data/.gitkeep
 logs/
 outputs/
-nohup.out
 checkpoints/
+nohup.out
 
-# IDE files
+# 系统临时文件
+.DS_Store
+*.swp
+*.swo
+.*.swp
+.*.swo
+
+# IDE / 编辑器配置
 .idea/
 .vscode/
 .trae/

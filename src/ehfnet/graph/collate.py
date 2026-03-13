@@ -44,7 +44,8 @@ class GraphCollator:
             follow_batch=self.follow_batch,
             exclude_keys=exclude_keys,
         )
-        return self._collate_torsion_constraints(batch, samples)
+        batch = self._collate_torsion_constraints(batch, samples)
+        return self._collate_residue_indices(batch, samples)
 
 
     def _collate_torsion_constraints(self, batch: Batch, samples: list[HeteroData]) -> Batch:
@@ -145,5 +146,36 @@ class GraphCollator:
                 "torsion_moving_mask",
                 torch.zeros((0, total_n_lig), dtype=torch.bool),
             )
+
+        return batch
+
+
+    def _collate_residue_indices(self, batch: Batch, samples: list[HeteroData]) -> Batch:
+        """
+        对 protein_atom.residue_idx 做显式偏移。
+
+        这是 atom -> residue 的结构映射，不属于 PyG 默认会识别并自动偏移的 edge_index。
+        为支持 batched 下的动态 residue 几何重建，需要把它改成全局 residue 索引。
+        """
+
+        if not samples or "protein_atom" not in batch.node_types:
+            return batch
+
+        if not hasattr(batch["protein_atom"], "residue_idx"):
+            return batch
+
+        all_indices: list[torch.Tensor] = []
+        residue_offset = 0
+
+        for data in samples:
+            if not hasattr(data["protein_atom"], "residue_idx"):
+                continue
+
+            residue_idx = cast(torch.Tensor, data["protein_atom"].residue_idx).long()
+            all_indices.append(residue_idx + residue_offset)
+            residue_offset += int(data["protein_residue"].num_nodes)
+
+        if all_indices:
+            batch["protein_atom"].residue_idx = torch.cat(all_indices, dim=0)
 
         return batch

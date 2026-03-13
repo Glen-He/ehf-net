@@ -147,15 +147,17 @@ def compute_principal_frame(
         if bad_mask.any():
             R_b[bad_mask] = eye.expand(int(bad_mask.sum()), -1, -1)
 
-        # 对单/双原子或线性分子：强制使用单位矩阵
+        # 对单/双原子分子：强制使用单位矩阵
         if degenerate_mol_mask.any():
             R_b[degenerate_mol_mask] = eye.expand(int(degenerate_mol_mask.sum()), -1, -1)
-            small_sv_mask = (~degenerate_mol_mask) & (S[:, -1] < 1e-5)
-            if small_sv_mask.any():
-                for idx in small_sv_mask.nonzero(as_tuple=False).view(-1).tolist():
-                    u_fix = U[idx].clone()
-                    u_fix[:, -1] = torch.linalg.cross(u_fix[:, 0], u_fix[:, 1])
-                    R_b[idx] = u_fix @ Vh[idx]
+
+        # 对线性/近线性或平面分子：显式修复最小奇异向量，避免第三轴不稳定
+        small_sv_mask = (~degenerate_mol_mask) & (S[:, -1] < 1e-5)
+        if small_sv_mask.any():
+            for idx in small_sv_mask.nonzero(as_tuple=False).view(-1).tolist():
+                u_fix = U[idx].clone()
+                u_fix[:, -1] = torch.linalg.cross(u_fix[:, 0], u_fix[:, 1])
+                R_b[idx] = u_fix @ Vh[idx]
 
         return R_b
 

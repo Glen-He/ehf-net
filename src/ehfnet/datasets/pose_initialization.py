@@ -13,25 +13,10 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import AllChem
 
+from ehfnet.datasets.ligand_sanitize import load_ligand_mol
 
-def load_ligand_for_initialization(ligand_path: str) -> Chem.Mol:
-    suffix = ligand_path.lower()
-
-    if suffix.endswith(".mol2"):
-        mol = Chem.MolFromMol2File(ligand_path, sanitize=False, removeHs=False)
-    else:
-        supplier = Chem.SDMolSupplier(ligand_path, sanitize=False, removeHs=False)
-        mol = supplier[0] if len(supplier) > 0 else None
-
-    if mol is None:
-        raise ValueError(f"Failed to load ligand for initialization: {ligand_path}")
-
-    try:
-        Chem.SanitizeMol(mol)
-    except Exception:
-        mol.UpdatePropertyCache(strict=False)
-
-    return mol
+def load_ligand_for_initialization(ligand_path: str):
+    return load_ligand_mol(ligand_path, remove_hs=False, require_conformer=False)
 
 
 def remove_all_hs_safe(mol: Chem.Mol) -> Chem.Mol:

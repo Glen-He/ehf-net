@@ -18,6 +18,7 @@ from rdkit import Chem
 from rdkit.Chem.Scaffolds import MurckoScaffold
 
 from torch.utils.data import Dataset, Subset
+from ehfnet.datasets.ligand_sanitize import load_ligand_mol
 
 logger = logging.getLogger(__name__)
 
@@ -70,32 +71,11 @@ def _read_ligand_safe(path: str) -> Chem.Mol | None:
     if not os.path.exists(path):
         return None
 
-    mol = None
-
     try:
-
-        # 优先尝试 SDF (PDBBind 标准格式)
-        if path.endswith(".sdf"):
-            suppl = Chem.SDMolSupplier(path, sanitize=False)
-            mol = suppl[0] if len(suppl) > 0 else None
-
-        # 备选 MOL2
-        elif path.endswith(".mol2"):
-            mol = Chem.MolFromMol2File(path, sanitize=False)
-        
-        # 简单的清洗，防止坏分子导致骨架提取崩溃
-        if mol is not None:
-
-            try:
-                Chem.SanitizeMol(mol)
-
-            except Exception:
-                mol.UpdatePropertyCache(strict=False)
-
-    except Exception:
+        return load_ligand_mol(path, remove_hs=False, require_conformer=False)
+    except Exception as exc:
+        logger.warning("Failed to read ligand for scaffold split: %s (%s)", path, exc)
         return None
-
-    return mol
 
 
 class ScaffoldSplitter:

@@ -21,11 +21,14 @@ from rdkit.Chem import ChemicalFeatures, RDConfig
 from torch_geometric.data import Dataset, HeteroData
 
 from ehfnet.graph import GraphBuilder, ESMEmbeddingFiller
+from ehfnet.graph.pocket_features import build_pocket_features, pocket_feature_dim
 from ehfnet.datasets.prepare import prepare_graph, get_esm_model
 from ehfnet.datasets.pose_initialization import generate_decoupled_ligand_positions
 
 
 logger = logging.getLogger(__name__)
+
+ESM_CACHE_VERSION_TAG = "chainseg_v2"
 
 
 def load_index(index_file: str) -> pd.DataFrame:
@@ -110,6 +113,7 @@ def esm_cache_paths(pdb_id: str, pdb_dir: str, esm_root: str | None) -> tuple[st
     """
     获取 ESM embedding 缓存的读路径与写路径。
 
+    使用带版本标签的缓存文件名，避免继续复用旧的“按 segment 粗暴拼链”缓存。
     优先使用复合物目录下的本地缓存；若配置了 esm_root，则尝试在 esm_root 下读取/写入。
 
     Args:
@@ -121,14 +125,13 @@ def esm_cache_paths(pdb_id: str, pdb_dir: str, esm_root: str | None) -> tuple[st
         (read_path, write_path)
     """
 
-
-    local_path = osp.join(pdb_dir, f"{pdb_id}_esm.npz")
+    local_path = osp.join(pdb_dir, f"{pdb_id}_esm_{ESM_CACHE_VERSION_TAG}.npz")
 
     if osp.exists(local_path):
         return local_path, local_path
 
     if esm_root and osp.isdir(esm_root):
-        global_path = osp.join(esm_root, f"{pdb_id}.npz")
+        global_path = osp.join(esm_root, f"{pdb_id}_{ESM_CACHE_VERSION_TAG}.npz")
 
         if osp.exists(global_path):
             return global_path, global_path
@@ -177,9 +180,9 @@ class PDBBindDataset(Dataset):
             pre_transform: PyG Dataset 的 pre_transform（可选）
             pre_filter: PyG Dataset 的 pre_filter（可选）
             r_cutoff_intra: 图内边半径阈值
-            r_cutoff_inter: 跨图边半径阈值
+            r_cutoff_inter: 保留兼容参数；动态跨图边现由 encoder 侧控制
             max_neighbors_intra: 图内最大邻居数
-            max_neighbors_inter: 跨图最大邻居数
+            max_neighbors_inter: 保留兼容参数；动态跨图边现由 encoder 侧控制
             interaction_profile: 跨图交互配置（"full" 或 "atom_only"）
             force_reprocess: 是否强制重建缓存
             esm_dim: ESM embedding 维度
@@ -508,5 +511,24 @@ class PDBBindDataset(Dataset):
             start_pos = self._load_or_build_start_pos(pdb_id, expected_num_atoms)
             if start_pos is not None:
                 data["ligand_atom"]["start_pos"] = start_pos
+
+        expected_pocket_dim = pocket_feature_dim(int(data["protein_residue"].x_cont.size(1)))
+        pocket_x_cont = getattr(data["protein_pocket"], "x_cont", None)
+        if (
+            pocket_x_cont is None
+            or pocket_x_cont.ndim != 2
+            or int(pocket_x_cont.size(1)) != expected_pocket_dim
+        ):
+            data["protein_pocket"].x_cont = build_pocket_features(
+                residue_x_cont=data["protein_residue"].x_cont,
+                residue_pos=data["protein_residue"].pos,
+                protein_atom_pos=data["protein_atom"].pos,
+            )
+            data["protein_pocket"].num_nodes = int(data["protein_pocket"].x_cont.size(0))
+
+        # 为 blind candidate replay 提供稳定、可重放的数据集索引。
+        # 该索引基于底层 PDBBindDataset，而不是 DataLoader/batch 内局部编号。
+        data.dataset_index = int(idx)
+        data.dataset_pdb_id = str(pdb_id)
             
         return data

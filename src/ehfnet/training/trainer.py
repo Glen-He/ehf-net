@@ -1388,6 +1388,7 @@ def train(
         lig_mol_cont_count=lig_mol_cont_count,
         pro_atom_cont_count=pro_atom_cont_count,
         pro_res_cont_count=pro_res_cont_count,
+        interaction_profile="atom_only" if ablation_mode == "inter_multiscale_off" else "full",
         normalization_stats=normalization_stats,
     ).to(device)
 
