@@ -18,6 +18,16 @@ if str(PROJECT_ROOT / "src") not in sys.path:
 
 from torch_geometric.data import HeteroData
 from ehfnet.models import EHFNet
+from ehfnet.encoders.feature_specs import (
+    LIGAND_ATOM_CAT_SCHEMA,
+    LIGAND_ATOM_CONT_SCHEMA,
+    LIGAND_MOLECULE_CONT_SCHEMA,
+    PROTEIN_ATOM_CAT_SCHEMA,
+    PROTEIN_ATOM_CONT_SCHEMA,
+    PROTEIN_RESIDUE_CAT_SCHEMA,
+    PROTEIN_RESIDUE_CONT_SCHEMA,
+)
+from ehfnet.graph.pocket_features import pocket_feature_dim
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -33,29 +43,30 @@ def create_dummy_batch(num_nodes: int, device: torch.device) -> HeteroData:
     
     # 填入 EHFNet 所需的节点特征形状
     # LIGAND
-    data["ligand_atom"].x_cat = torch.zeros((n_lig, 18), dtype=torch.long, device=device)
-    data["ligand_atom"].x_cont = torch.randn((n_lig, 9), dtype=torch.float32, device=device)
+    data["ligand_atom"].x_cat = torch.zeros((n_lig, len(LIGAND_ATOM_CAT_SCHEMA)), dtype=torch.long, device=device)
+    data["ligand_atom"].x_cont = torch.randn((n_lig, len(LIGAND_ATOM_CONT_SCHEMA)), dtype=torch.float32, device=device)
     data["ligand_atom"].pos = torch.randn((n_lig, 3), dtype=torch.float32, device=device)
     data["ligand_atom"].batch = torch.zeros(n_lig, dtype=torch.long, device=device)
     
-    data["ligand_molecule"].x_cont = torch.randn((1, 9), dtype=torch.float32, device=device)
+    data["ligand_molecule"].x_cont = torch.randn((1, len(LIGAND_MOLECULE_CONT_SCHEMA)), dtype=torch.float32, device=device)
     data["ligand_molecule"].batch = torch.zeros(1, dtype=torch.long, device=device)
     
     # PROTEIN
-    data["protein_atom"].x_cat = torch.zeros((n_prot, 1), dtype=torch.long, device=device)
-    data["protein_atom"].x_cont = torch.randn((n_prot, 5), dtype=torch.float32, device=device)
+    data["protein_atom"].x_cat = torch.zeros((n_prot, len(PROTEIN_ATOM_CAT_SCHEMA)), dtype=torch.long, device=device)
+    data["protein_atom"].x_cont = torch.randn((n_prot, len(PROTEIN_ATOM_CONT_SCHEMA)), dtype=torch.float32, device=device)
     data["protein_atom"].pos = torch.randn((n_prot, 3), dtype=torch.float32, device=device)
     data["protein_atom"].batch = torch.zeros(n_prot, dtype=torch.long, device=device)
     data["protein_atom"].residue_idx = torch.arange(n_prot, dtype=torch.long, device=device)
     
     # 假设每个 atom 对应一个 residue (最坏情况测试)
-    data["protein_residue"].x_cat = torch.zeros((n_prot, 2), dtype=torch.long, device=device)
-    data["protein_residue"].x_cont = torch.randn((n_prot, 14 + 960), dtype=torch.float32, device=device)
+    residue_cont_dim = len(PROTEIN_RESIDUE_CONT_SCHEMA) + 960
+    data["protein_residue"].x_cat = torch.zeros((n_prot, len(PROTEIN_RESIDUE_CAT_SCHEMA)), dtype=torch.long, device=device)
+    data["protein_residue"].x_cont = torch.randn((n_prot, residue_cont_dim), dtype=torch.float32, device=device)
     data["protein_residue"].pos = torch.randn((n_prot, 3), dtype=torch.float32, device=device)
     data["protein_residue"].batch = torch.zeros(n_prot, dtype=torch.long, device=device)
     data["protein_residue"].esm_missing_mask = torch.zeros(n_prot, dtype=torch.bool, device=device)
     
-    data["protein_pocket"].x_cont = torch.randn((1, 14+960), dtype=torch.float32, device=device)
+    data["protein_pocket"].x_cont = torch.randn((1, pocket_feature_dim(residue_cont_dim)), dtype=torch.float32, device=device)
     data["protein_pocket"].batch = torch.zeros(1, dtype=torch.long, device=device)
     data["protein_pocket"].num_nodes = 1
     
@@ -98,10 +109,10 @@ def main():
         hidden_dim=128,
         time_dim=128,
         num_gnn_blocks=4,
-        lig_atom_cont_count=9,
-        lig_mol_cont_count=9,
-        pro_atom_cont_count=5,
-        pro_res_cont_count=14+960,
+        lig_atom_cont_count=len(LIGAND_ATOM_CONT_SCHEMA),
+        lig_mol_cont_count=len(LIGAND_MOLECULE_CONT_SCHEMA),
+        pro_atom_cont_count=len(PROTEIN_ATOM_CONT_SCHEMA),
+        pro_res_cont_count=len(PROTEIN_RESIDUE_CONT_SCHEMA) + 960,
     ).to(device)
     
     model.train()

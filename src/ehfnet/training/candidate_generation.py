@@ -86,6 +86,7 @@ def generate_blind_candidates(
 
     model.eval()
     records: list[dict[str, Any]] = []
+    failed_samples = 0
 
     for sample_idx, sample in enumerate(samples):
         try:
@@ -220,9 +221,10 @@ def generate_blind_candidates(
                 {
                     "score": p["combined_score"],
                     "rmsd": p["rmsd"],
-                    "pose_logit": p.get("pose_rank_logit", p["pose_quality_logit"]),
+                    "ranking_logit": p.get("ranking_logit", p.get("pose_rank_logit", p["pose_quality_logit"])),
+                    "pose_logit": p.get("ranking_logit", p.get("pose_rank_logit", p["pose_quality_logit"])),
                     "pose_quality_logit": p["pose_quality_logit"],
-                    "pose_rank_logit": p.get("pose_rank_logit", p["pose_quality_logit"]),
+                    "pose_rank_logit": p.get("pose_rank_logit", p.get("ranking_logit", p["pose_quality_logit"])),
                     "center_logit": p["center_logit"],
                     "aff_logit": p["binding_affinity_teacher"],
                     "clash_value": p["steric_clash_teacher"],
@@ -262,15 +264,29 @@ def generate_blind_candidates(
 
             del batch
         except torch.cuda.OutOfMemoryError:
+            failed_samples += 1
             logger.warning("Candidate generation: OOM on sample %d, skipping.", sample_idx)
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except Exception as exc:
+            failed_samples += 1
             logger.warning("Candidate generation: sample %d failed: %s\n%s", sample_idx, exc, traceback.format_exc())
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    if not records and failed_samples > 0 and samples:
+        raise RuntimeError(
+            f"Blind candidate generation failed for all samples in batch. failed_samples={failed_samples}"
+        )
+
+    if failed_samples > 0:
+        logger.warning(
+            "Candidate generation skipped %d/%d samples.",
+            failed_samples,
+            len(samples),
+        )
 
     return records
 
@@ -329,7 +345,7 @@ def _generate_single_pose(
         score_batch["ligand_atom"].pos = final_pos
         score_out = model(score_batch, torch.ones(1, device=device, dtype=final_pos.dtype))
 
-        pose_logit = float(score_out["pose_quality"].detach().cpu().view(-1)[0].item())
+        pose_quality_logit = float(score_out["pose_quality"].detach().cpu().view(-1)[0].item())
         aff_raw = score_out.get("binding_affinity", torch.zeros(1))
         clash_raw = score_out.get("steric_clash_batch", None)
         force_atom = score_out.get("ligand_force", None)
@@ -341,10 +357,10 @@ def _generate_single_pose(
         if force_atom is not None and force_atom.numel() > 0:
             force_norm = float(force_atom.detach().norm(dim=-1).mean().cpu().item())
         rank_score = float(rank_score_raw.detach().cpu().view(-1)[0].item()) if rank_score_raw is not None else None
-        primary_pose_logit = rank_score if rank_score is not None else pose_logit
+        primary_ranking_logit = rank_score if rank_score is not None else pose_quality_logit
 
         center_logit_t = torch.tensor([center_logit], dtype=torch.float32)
-        pose_logit_t = torch.tensor([primary_pose_logit], dtype=torch.float32)
+        pose_logit_t = torch.tensor([primary_ranking_logit], dtype=torch.float32)
         combined_score = float(combine_center_pose_score(
             center_logit_t, pose_logit_t,
             aff_logit=torch.tensor([aff_val]),
@@ -364,8 +380,9 @@ def _generate_single_pose(
             "pose_xyz": pose_xyz,
             "rmsd": rmsd,
             "centroid_dist": centroid_dist,
-            "pose_quality_logit": pose_logit,
-            "pose_rank_logit": primary_pose_logit,
+            "ranking_logit": primary_ranking_logit,
+            "pose_quality_logit": pose_quality_logit,
+            "pose_rank_logit": primary_ranking_logit,
             "binding_affinity_teacher": aff_val,
             "steric_clash_teacher": clash_val,
             "force_norm_teacher": force_norm,
@@ -419,8 +436,11 @@ def generate_candidates_from_loader(
     """
     all_records: list[dict[str, Any]] = []
     total_complexes = 0
+    batches_seen = 0
+    failed_batches = 0
 
     for batch_idx, batch in enumerate(loader):
+        batches_seen += 1
         try:
             if edge_guard_limit is not None:
                 total_edges_cpu = 0
@@ -472,11 +492,13 @@ def generate_candidates_from_loader(
             del batch, data_list
 
         except torch.cuda.OutOfMemoryError:
+            failed_batches += 1
             logger.warning("Candidate gen batch %d: CUDA OOM, skipping.", batch_idx)
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
         except Exception as exc:
+            failed_batches += 1
             logger.warning("Candidate gen batch %d failed: %s\n%s", batch_idx, exc, traceback.format_exc())
             gc.collect()
             if torch.cuda.is_available():
@@ -484,5 +506,10 @@ def generate_candidates_from_loader(
 
         if max_complexes is not None and total_complexes >= max_complexes:
             break
+
+    if not all_records and failed_batches > 0 and batches_seen > 0:
+        raise RuntimeError(
+            f"Candidate generation failed for all processed batches. failed_batches={failed_batches}"
+        )
 
     return all_records

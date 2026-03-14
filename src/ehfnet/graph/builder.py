@@ -10,7 +10,7 @@ import numpy as np
 from typing import Any, cast
 from torch import Tensor
 from torch_geometric.data import HeteroData
-from torch_geometric.nn import knn_graph
+from torch_geometric.nn import knn_graph, radius_graph
 from ehfnet.encoders.ligand_encoder import LigandEncodingResult
 from ehfnet.encoders.protein_encoder import ProteinEncodingResult
 from ehfnet.encoders.feature_specs import (
@@ -132,9 +132,9 @@ class GraphBuilder:
     ) -> None:
         """
         Args:
-            r_cutoff_intra: 图内边的距离阈值（原子/残基内部）
+            r_cutoff_intra: 图内原子边的基础半径；残基图会自动使用更大的 typed radius
             r_cutoff_inter: 保留兼容参数；动态跨图边现由 encoder 侧控制
-            max_neighbors_intra: 图内最大邻居数（PyG radius_graph）
+            max_neighbors_intra: 图内邻居上限；builder 会按节点类型自动裁剪到更保守的上限
             max_neighbors_inter: 保留兼容参数；动态跨图边现由 encoder 侧控制
             esm_filler: ESM embedding 填充器（默认使用 ESMEmbeddingFiller）
             interaction_profile: 跨图交互配置，支持：
@@ -148,6 +148,28 @@ class GraphBuilder:
         self.max_neighbors_inter = max_neighbors_inter
         self.esm_filler = esm_filler or ESMEmbeddingFiller()
         self.interaction_profile = interaction_profile
+        self._residue_esm_feature_start = len(PROTEIN_RESIDUE_CONT_SCHEMA)
+        atom_neighbor_cap = max(1, min(int(max_neighbors_intra), 32))
+        residue_neighbor_cap = max(1, min(int(max_neighbors_intra), 32))
+        atom_radius = float(r_cutoff_intra)
+        residue_radius = max(atom_radius * 1.6, atom_radius + 3.0)
+        self._intra_edge_cfg: dict[str, dict[str, float | int]] = {
+            "ligand_atom": {
+                "radius": atom_radius,
+                "max_neighbors": atom_neighbor_cap,
+                "fallback_k": 1,
+            },
+            "protein_atom": {
+                "radius": atom_radius,
+                "max_neighbors": atom_neighbor_cap,
+                "fallback_k": 1,
+            },
+            "protein_residue": {
+                "radius": residue_radius,
+                "max_neighbors": residue_neighbor_cap,
+                "fallback_k": 4,
+            },
+        }
 
         if self.interaction_profile not in {"full", "atom_only"}:
             raise ValueError(
@@ -346,10 +368,32 @@ class GraphBuilder:
         data["protein_residue"].esm_missing_mask = esm_missing_mask
         data["protein_residue"].num_nodes = int(pos.size(0))
 
-        # 辅助 mask，用于后续 loss 计算或结构恢复
+        metadata = cast(dict[str, Any], protein_data.get("residue_metadata", {}))
+        for key in [
+            "source_residue_ix",
+            "source_resid",
+            "source_chain_index",
+            "source_icode_code",
+            "source_segment_id",
+            "source_segment_offset",
+            "source_segment_length",
+        ]:
+            if key in metadata:
+                data["protein_residue"][key] = torch.tensor(metadata[key], dtype=torch.long)
+
+        # 辅助 mask：区分 type prior 与 observed mask，供后续结构辅助任务使用
         auxiliary = cast(dict[str, Any], protein_data["auxiliary"])
 
-        for key in ["atom14_mask", "atom14_symmetry_mask", "torsion_angle_mask", "chi_pi_periodic_mask"]:
+        float_keys = [
+            "type_atom14_mask",
+            "observed_atom14_mask",
+            "atom14_ambiguity_group",
+            "type_torsion_mask",
+            "observed_torsion_mask",
+            "observed_backbone_mask",
+            "chi_pi_periodic_mask",
+        ]
+        for key in float_keys:
             data["protein_residue"][key] = torch.tensor(auxiliary[key], dtype=torch.float32)
 
         return data
@@ -373,6 +417,8 @@ class GraphBuilder:
             residue_x_cont=data["protein_residue"].x_cont,
             residue_pos=data["protein_residue"].pos,
             protein_atom_pos=data["protein_atom"].pos,
+            residue_esm_missing_mask=data["protein_residue"].esm_missing_mask,
+            esm_feature_start=self._residue_esm_feature_start,
         )
         data["protein_pocket"].x_cont = pocket_cont
         data["protein_pocket"].num_nodes = 1
@@ -401,7 +447,7 @@ class GraphBuilder:
 
     def _build_intra_edges(self, data: HeteroData) -> HeteroData:
         """
-        构建图内边（同类型节点内部的半径邻接）。
+        构建图内边（按节点类型采用 radius 主图 + 小 kNN 保底覆盖）。
 
         Args:
             data: HeteroData
@@ -411,24 +457,14 @@ class GraphBuilder:
         """
 
         for src, rel, dst in INTRA_EDGES:
-
             pos = data[src].pos
-            # [修复] KNN 图构建
-            # protein_residue 节点少但空间稀疏 -> 128 邻居汇聚全局上下文
-            # protein_atom / ligand_atom 节点多且密集 -> 32 邻居已足够捕获局部信息
-            # 旧逻辑 '"protein" in src' 误将 protein_atom 也匹配到 k=128，
-            # 导致大口袋产生 O(N_pro_atom * 128) 条边，是显存 OOM 的元凶之一
-            k = 128 if "residue" in src else 32
-            actual_k = min(k, pos.size(0) - 1)
-            
-            if actual_k > 0:
-                edge_index = knn_graph(
-                    pos,
-                    k=actual_k,
-                    loop=False,
-                )
-            else:
-                edge_index = torch.zeros((2, 0), dtype=torch.long, device=pos.device)
+            cfg = self._intra_edge_cfg[src]
+            edge_index = self._build_same_type_radius_or_knn_edges(
+                pos,
+                radius_cutoff=float(cfg["radius"]),
+                max_num_neighbors=int(cfg["max_neighbors"]),
+                knn_fallback_k=int(cfg["fallback_k"]),
+            )
 
             data[src, rel, dst].edge_index = edge_index
 
@@ -556,17 +592,84 @@ class GraphBuilder:
 
             device = data[dst].pos.device
             n_dst = int(data[dst].pos.size(0))
-            # 广播：全局节点（global node，索引 0）-> 全部局部节点
-            edge_index = torch.stack(
-                [
-                    torch.zeros(n_dst, dtype=torch.long, device=device),
-                    torch.arange(n_dst, dtype=torch.long, device=device),
-                ],
-                dim=0,
-            )
+
+            if src == "protein_residue" and dst == "protein_atom":
+                residue_idx = data["protein_atom"].residue_idx.long()
+                edge_index = torch.stack(
+                    [
+                        residue_idx,
+                        torch.arange(n_dst, dtype=torch.long, device=device),
+                    ],
+                    dim=0,
+                )
+            else:
+                # 广播：全局节点（global node，索引 0）-> 全部局部节点
+                edge_index = torch.stack(
+                    [
+                        torch.zeros(n_dst, dtype=torch.long, device=device),
+                        torch.arange(n_dst, dtype=torch.long, device=device),
+                    ],
+                    dim=0,
+                )
             data[src, rel, dst].edge_index = edge_index
 
         return data
+
+
+    @staticmethod
+    def _build_same_type_radius_or_knn_edges(
+        pos: Tensor,
+        *,
+        radius_cutoff: float,
+        max_num_neighbors: int,
+        knn_fallback_k: int,
+    ) -> Tensor:
+        """
+        构建同集合内边：优先使用 radius_graph 保留几何局部性，
+        对半径图遗漏的目标节点补少量 kNN，避免孤点断链。
+        """
+
+        num_nodes = int(pos.size(0))
+        device = pos.device
+
+        if num_nodes <= 1:
+            return torch.zeros((2, 0), dtype=torch.long, device=device)
+
+        edge_index = radius_graph(
+            pos,
+            r=float(radius_cutoff),
+            loop=False,
+            max_num_neighbors=max(1, int(max_num_neighbors)),
+        )
+
+        covered_dst = (
+            torch.unique(edge_index[1])
+            if edge_index.numel() > 0
+            else torch.zeros((0,), dtype=torch.long, device=device)
+        )
+        all_nodes = torch.arange(num_nodes, device=device)
+        uncovered_dst = all_nodes[~torch.isin(all_nodes, covered_dst)]
+
+        if uncovered_dst.numel() > 0:
+            knn_edges = knn_graph(
+                pos,
+                k=min(max(1, int(knn_fallback_k)), num_nodes - 1),
+                loop=False,
+            )
+            if knn_edges.numel() > 0:
+                uncovered_mask = torch.isin(knn_edges[1], uncovered_dst)
+                extra_edges = knn_edges[:, uncovered_mask]
+                if extra_edges.numel() > 0:
+                    edge_index = (
+                        torch.cat([edge_index, extra_edges], dim=1)
+                        if edge_index.numel() > 0
+                        else extra_edges
+                    )
+
+        if edge_index.numel() == 0:
+            return torch.zeros((2, 0), dtype=torch.long, device=device)
+
+        return torch.unique(edge_index, dim=1)
 
 
     def _add_torsion_constraints(self, data: HeteroData, ligand_data: LigandEncodingResult) -> HeteroData:
@@ -615,9 +718,9 @@ def create_graph_tools(
     创建 GraphBuilder 与 GraphCollator。
 
     Args:
-        r_cutoff_intra: 图内边构建半径阈值
+        r_cutoff_intra: 图内原子边基础半径；残基图会自动放宽
         r_cutoff_inter: 保留兼容参数；动态跨图边现由 encoder 侧控制
-        max_neighbors_intra: 图内最大邻居数
+        max_neighbors_intra: 图内邻居上限
         max_neighbors_inter: 保留兼容参数；动态跨图边现由 encoder 侧控制
         esm_fill_strategy: ESM embedding 缺失时的填充策略
         interaction_profile: 跨图交互配置（"full" 或 "atom_only"）

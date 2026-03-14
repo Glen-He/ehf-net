@@ -31,11 +31,16 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 from ehfnet.models import EHFNet
-from ehfnet.graph import create_graph_tools, GraphCollator
+from ehfnet.graph import GraphCollator
 from ehfnet.datasets.pdbbind import PDBBindDataset
 from ehfnet.training.flow_matcher import ConditionalFlowMatcher
-from ehfnet.training.blind_pool import save_blind_pool, get_pool_stats
+from ehfnet.training.blind_pool import (
+    build_blind_pool_compatibility,
+    save_blind_pool,
+    get_pool_stats,
+)
 from ehfnet.training.candidate_generation import generate_candidates_from_loader
+from ehfnet.training.checkpoint_schema import validate_checkpoint_compatibility
 from torch.utils.data import DataLoader
 
 logger = logging.getLogger(__name__)
@@ -64,40 +69,47 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
 
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    model_config = validate_checkpoint_compatibility(ckpt)
     model_state = ckpt.get("ema_model_state_dict", ckpt.get("model_state_dict"))
+    if model_state is None:
+        raise ValueError(f"Checkpoint {args.checkpoint} does not contain model weights.")
     normalization_stats = ckpt.get("normalization_stats")
 
-    hidden_dim = ckpt.get("hidden_dim", 128)
-    num_gnn_blocks = ckpt.get("num_gnn_blocks", 4)
-    esm_dim = ckpt.get("esm_dim", 960)
-
     model = EHFNet(
-        hidden_dim=hidden_dim,
-        time_dim=hidden_dim,
-        num_gnn_blocks=num_gnn_blocks,
-        lig_atom_cont_count=9,
-        lig_mol_cont_count=9,
-        pro_atom_cont_count=5,
-        pro_res_cont_count=14 + esm_dim,
+        hidden_dim=int(model_config["hidden_dim"]),
+        time_dim=int(model_config["time_dim"]),
+        num_gnn_blocks=int(model_config["num_gnn_blocks"]),
+        lig_atom_cont_count=int(model_config["lig_atom_cont_count"]),
+        lig_mol_cont_count=int(model_config["lig_mol_cont_count"]),
+        pro_atom_cont_count=int(model_config["pro_atom_cont_count"]),
+        pro_res_cont_count=int(model_config["pro_res_cont_count"]),
+        m_dim_scalar=int(model_config["m_dim_scalar"]),
+        dropout_rate=float(model_config["dropout_rate"]),
+        num_rbf=int(model_config["num_rbf"]),
+        r_cutoff=float(model_config["r_cutoff"]),
+        fix_protein=bool(model_config["fix_protein"]),
+        interaction_profile=str(model_config["interaction_profile"]),
         normalization_stats=normalization_stats,
     ).to(device)
 
     if model_state:
-        model.load_state_dict(model_state, strict=False)
+        model.load_state_dict(model_state, strict=True)
     model.eval()
     logger.info("Model loaded from %s", args.checkpoint)
 
-    graph_builder, _, _ = create_graph_tools()
-    collator = GraphCollator()
     matcher = ConditionalFlowMatcher(sigma_min=1e-3, warmup_epochs=20)
 
     dataset = PDBBindDataset(
         root=args.data_root,
         index_file=args.index_file,
-        graph_builder=graph_builder,
-        protein_context_mode="full",
-        esm_embedding_path=args.esm_path,
+        esm_root=args.esm_path,
+        esm="auto",
+        esm_dim=int(model_config["esm_dim"]),
+        interaction_profile=str(model_config["interaction_profile"]),
+        pocket_radius=None,
     )
+    graph_builder = dataset.graph_builder
+    collator = GraphCollator(follow_batch=["ligand_atom", "protein_atom"])
 
     loader = DataLoader(
         dataset,
@@ -133,7 +145,14 @@ def main():
     )
 
     os.makedirs(args.output_dir, exist_ok=True)
+    pool_compatibility = build_blind_pool_compatibility(
+        esm_dim=int(model_config["esm_dim"]),
+        processed_dir=dataset.processed_dir,
+        index_file=dataset.index_file,
+        interaction_profile=str(model_config["interaction_profile"]),
+    )
     save_blind_pool(records, args.output_dir, epoch=0, meta={
+        "compatibility": pool_compatibility,
         "checkpoint": args.checkpoint,
         "total_complexes": len(records),
         "mode": "offline_full",

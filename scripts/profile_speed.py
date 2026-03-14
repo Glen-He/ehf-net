@@ -11,6 +11,12 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__f
 from ehfnet.training.trainer import GraphCollator
 from ehfnet.datasets.pdbbind import PDBBindDataset
 from ehfnet.models.ehfnet import EHFNet
+from ehfnet.encoders.feature_specs import (
+    LIGAND_ATOM_CONT_SCHEMA,
+    LIGAND_MOLECULE_CONT_SCHEMA,
+    PROTEIN_ATOM_CONT_SCHEMA,
+    PROTEIN_RESIDUE_CONT_SCHEMA,
+)
 from ehfnet.training.flow_matcher import ConditionalFlowMatcher
 from ehfnet.training.losses import FlowMatchingLoss
 
@@ -32,8 +38,13 @@ def profile():
     
     print("Initializing Model...")
     model = EHFNet(
-        hidden_dim=128, time_dim=64, num_gnn_blocks=6, lig_atom_cont_count=9, lig_mol_cont_count=9,
-        pro_atom_cont_count=5, pro_res_cont_count=974,
+        hidden_dim=128,
+        time_dim=64,
+        num_gnn_blocks=6,
+        lig_atom_cont_count=len(LIGAND_ATOM_CONT_SCHEMA),
+        lig_mol_cont_count=len(LIGAND_MOLECULE_CONT_SCHEMA),
+        pro_atom_cont_count=len(PROTEIN_ATOM_CONT_SCHEMA),
+        pro_res_cont_count=len(PROTEIN_RESIDUE_CONT_SCHEMA) + 960,
     ).to(device)
     
     matcher = ConditionalFlowMatcher()

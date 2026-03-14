@@ -4,6 +4,7 @@
 包含元素和氨基酸残基的枚举定义
 """
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
@@ -340,3 +341,120 @@ class ResidueType(Enum):
         (),
         (0.0, 0.0, 0.0, 0.0),
     )
+
+
+@dataclass(frozen=True)
+class ResidueTypeResolution:
+    """
+    残基名解析结果。
+
+    `source` 取值：
+    - "canonical": 原始残基名已是标准残基
+    - "alias": 通过别名映射到了标准残基
+    - "unknown": 仍无法解析，最终会落到 UNK / X
+    """
+
+    original_resname: str
+    normalized_resname: str
+    residue_type: ResidueType
+    source: str
+
+
+_STRUCTURE_RESIDUE_ALIASES: dict[str, str] = {
+    # 常见质子化 / 力场命名差异，heavy-atom 拓扑与标准残基一致。
+    "ASH": "ASP",
+    "CYM": "CYS",
+    "CYX": "CYS",
+    "GLH": "GLU",
+    "HID": "HIS",
+    "HIE": "HIS",
+    "HIP": "HIS",
+    "HSD": "HIS",
+    "HSE": "HIS",
+    "HSP": "HIS",
+    "LYN": "LYS",
+}
+
+_ESM_SEQUENCE_RESIDUE_ALIASES: dict[str, str] = {
+    **_STRUCTURE_RESIDUE_ALIASES,
+    # 常见修饰残基，序列上退回到母体氨基酸，避免直接变成 X。
+    "ALY": "LYS",
+    "CME": "CYS",
+    "CSD": "CYS",
+    "CSO": "CYS",
+    "CSS": "CYS",
+    "CSX": "CYS",
+    "FME": "MET",
+    "HYP": "PRO",
+    "KCX": "LYS",
+    "LLP": "LYS",
+    "MLY": "LYS",
+    "MSE": "MET",
+    "OCS": "CYS",
+    "PTR": "TYR",
+    "PYL": "LYS",
+    "SEC": "CYS",
+    "SEP": "SER",
+    "TPO": "THR",
+}
+
+
+def _normalize_residue_name(value: Any) -> str:
+    if isinstance(value, ResidueType):
+        return value.three_letter.upper()
+    return str(value or "").strip().upper()
+
+
+def _resolve_residue_type(
+    value: Any,
+    *,
+    alias_map: dict[str, str],
+) -> ResidueTypeResolution:
+    original = _normalize_residue_name(value)
+
+    direct_match = ResidueType.safe_get(original)
+    if direct_match != ResidueType.UNK:
+        return ResidueTypeResolution(
+            original_resname=original,
+            normalized_resname=direct_match.three_letter,
+            residue_type=direct_match,
+            source="canonical",
+        )
+
+    alias_name = alias_map.get(original, "")
+    alias_match = ResidueType.safe_get(alias_name)
+    if alias_name and alias_match != ResidueType.UNK:
+        return ResidueTypeResolution(
+            original_resname=original,
+            normalized_resname=alias_match.three_letter,
+            residue_type=alias_match,
+            source="alias",
+        )
+
+    return ResidueTypeResolution(
+        original_resname=original,
+        normalized_resname=ResidueType.UNK.three_letter,
+        residue_type=ResidueType.UNK,
+        source="unknown",
+    )
+
+
+def resolve_protein_residue_type(value: Any) -> ResidueTypeResolution:
+    """
+    解析结构特征使用的残基类型。
+
+    这里只接受对 heavy-atom 拓扑基本兼容的命名别名，避免把修饰残基
+    强行当成标准残基后，扭转角 / atom14 掩码出现更隐蔽的错配。
+    """
+
+    return _resolve_residue_type(value, alias_map=_STRUCTURE_RESIDUE_ALIASES)
+
+
+def resolve_esm_residue_type(value: Any) -> ResidueTypeResolution:
+    """
+    解析 ESM 序列使用的残基类型。
+
+    对常见修饰残基先退回母体氨基酸，尽量避免直接生成 X。
+    """
+
+    return _resolve_residue_type(value, alias_map=_ESM_SEQUENCE_RESIDUE_ALIASES)

@@ -5,12 +5,16 @@
 直接在 SE(3) x T^m 切空间计算 Huber Loss。
 """
 
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from typing import Any
 from torch import Tensor
+
+
+logger = logging.getLogger(__name__)
 
 
 class FlowMatchingLoss(nn.Module):
@@ -81,6 +85,7 @@ class FlowMatchingLoss(nn.Module):
                 "pose_quality": 0.20,
             },
         }
+        self._energy_nan_warn_count = 0
 
     @staticmethod
     def _clamp_progress(value: float) -> float:
@@ -209,14 +214,21 @@ class FlowMatchingLoss(nn.Module):
 
         # 4. 物理亲和力损失 (带时间掩码)
         loss_energy = torch.tensor(0.0, device=device)
+        energy_nan_skipped = torch.tensor(0.0, device=device)
         pred_affinity = predictions.get("binding_affinity")
         gt_affinity = targets.get("binding_affinity_target")
 
         if pred_affinity is not None and gt_affinity is not None:
 
             # NaN 守卫：预测头在训练初期可能因权重随机而输出 NaN，直接跳过避免污染梯度
-            if torch.isnan(pred_affinity).any() or torch.isnan(gt_affinity).any():
-                pass
+            if not torch.isfinite(pred_affinity).all() or not torch.isfinite(gt_affinity).all():
+                energy_nan_skipped = torch.tensor(1.0, device=device)
+                self._energy_nan_warn_count += 1
+                if self._energy_nan_warn_count <= 3 or self._energy_nan_warn_count % 100 == 0:
+                    logger.warning(
+                        "Skipping energy loss due to non-finite affinity values (count=%d).",
+                        self._energy_nan_warn_count,
+                    )
 
             else:
                 t_val = getattr(data, "t", None)
@@ -244,6 +256,7 @@ class FlowMatchingLoss(nn.Module):
                     )
 
         loss_dict["loss_energy"] = loss_energy.detach()
+        loss_dict["energy_nan_skipped"] = energy_nan_skipped.detach()
 
         # 5. 位阻惩罚损失（时间感知动态惩罚 Time-Aware Dynamic Penalty）
         # 使用 t⁴ 平滑曲线取代硬阈值 t>0.8，让惩罚在后期（配体已进入口袋）时急剧上升，
@@ -276,11 +289,26 @@ class FlowMatchingLoss(nn.Module):
             gt_pose_quality = gt_pose_quality.view(-1).to(device=device, dtype=pred_pose_quality.dtype)
             if not torch.isnan(pred_pose_quality).any() and not torch.isnan(gt_pose_quality).any():
                 weight = 1.0 + 2.0 * gt_pose_quality
-                loss_pose_quality = F.binary_cross_entropy_with_logits(
+                per_sample_bce = F.binary_cross_entropy_with_logits(
                     pred_pose_quality,
                     gt_pose_quality.clamp(min=0.0, max=1.0),
-                    weight=weight,
+                    reduction="none",
                 )
+                t_val = getattr(data, "t", None)
+                if t_val is not None:
+                    pose_focus_gate = self._get_pose_focus_gate(
+                        data,
+                        t_val,
+                        device=device,
+                        dtype=pred_pose_quality.dtype,
+                    ).view(-1)
+                    gate_sum = pose_focus_gate.sum()
+                    if gate_sum > 1e-8:
+                        loss_pose_quality = (
+                            per_sample_bce * weight * pose_focus_gate
+                        ).sum() / gate_sum
+                else:
+                    loss_pose_quality = (per_sample_bce * weight).mean()
 
         loss_dict["loss_pose_quality"] = loss_pose_quality.detach()
         loss_dict["weight_trans"] = torch.tensor(schedule["trans"], device=device)
@@ -303,4 +331,3 @@ class FlowMatchingLoss(nn.Module):
         loss_dict["total"] = total_loss
 
         return loss_dict
-

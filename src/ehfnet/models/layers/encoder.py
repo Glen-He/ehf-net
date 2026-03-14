@@ -38,6 +38,7 @@ from ehfnet.graph.hetero_schema import (
 )
 from ehfnet.graph.inter_edges import build_batched_radius_or_knn_edges
 from ehfnet.graph.pocket_features import build_pocket_features, pocket_feature_dim
+from ehfnet.encoders.feature_specs import PROTEIN_RESIDUE_CONT_SCHEMA
 from ehfnet.models.layers.embeddings import (
     TimeEmbedding,
     LigandAtomEmbedding,
@@ -736,6 +737,8 @@ class EHFEncoder(nn.Module):
                 protein_atom_pos=pos_dict["protein_atom"].detach(),
                 residue_batch=residue_batch,
                 protein_atom_batch=protein_atom_batch,
+                residue_esm_missing_mask=getattr(data["protein_residue"], "esm_missing_mask", None),
+                esm_feature_start=len(PROTEIN_RESIDUE_CONT_SCHEMA),
                 center=pocket_pos.detach(),
             )
             refreshed_pocket = self.protein_pocket_embedder(pocket_x_cont)

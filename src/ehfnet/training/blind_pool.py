@@ -29,8 +29,57 @@ from ehfnet.training.rerank_losses import (
     compute_center_value_loss,
     rmsd_to_soft_target,
 )
+from ehfnet.training.checkpoint_schema import build_feature_signature
 
 logger = logging.getLogger(__name__)
+
+
+BLIND_POOL_SCHEMA_VERSION = "blind_pool_v2"
+
+
+def build_blind_pool_compatibility(
+    *,
+    esm_dim: int,
+    processed_dir: str,
+    index_file: str,
+    interaction_profile: str,
+) -> dict[str, Any]:
+    return {
+        "pool_schema_version": BLIND_POOL_SCHEMA_VERSION,
+        "feature_signature": build_feature_signature(esm_dim=esm_dim),
+        "processed_dir": os.path.abspath(processed_dir),
+        "index_file": os.path.abspath(index_file),
+        "interaction_profile": str(interaction_profile),
+    }
+
+
+def _load_pool_manifest(epoch_dir: str | Path) -> dict[str, Any] | None:
+    manifest_path = Path(epoch_dir) / "manifest.json"
+    if not manifest_path.exists():
+        return None
+
+    try:
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+    except Exception as exc:
+        logger.warning("Failed to read blind pool manifest %s: %s", manifest_path, exc)
+        return None
+
+    return loaded if isinstance(loaded, dict) else None
+
+
+def _pool_manifest_matches(
+    manifest: dict[str, Any] | None,
+    expected_compatibility: dict[str, Any] | None,
+) -> bool:
+    if expected_compatibility is None:
+        return True
+    if manifest is None:
+        return False
+    compatibility = manifest.get("compatibility")
+    if not isinstance(compatibility, dict):
+        return False
+    return compatibility == expected_compatibility
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -115,6 +164,7 @@ def save_blind_pool(
 
     manifest = {
         "epoch": epoch,
+        "pool_schema_version": BLIND_POOL_SCHEMA_VERSION,
         "n_complexes": len(records),
         "n_total_poses": total_poses,
         "n_total_centers": total_centers,
@@ -142,21 +192,40 @@ def save_blind_pool(
     return pool_path
 
 
-def load_blind_pool(cache_dir: str, epoch: int | None = None) -> list[dict[str, Any]]:
+def load_blind_pool(
+    cache_dir: str,
+    epoch: int | None = None,
+    *,
+    expected_compatibility: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Load most recent (or specified) pool from cache."""
     if not os.path.isdir(cache_dir):
         return []
 
+    def _try_load_epoch(epoch_dir: str | Path) -> list[dict[str, Any]] | None:
+        pool_path = Path(epoch_dir) / "pool.pt"
+        if not pool_path.exists():
+            return None
+        manifest = _load_pool_manifest(epoch_dir)
+        if not _pool_manifest_matches(manifest, expected_compatibility):
+            logger.info(
+                "Skipping incompatible blind pool cache at %s.",
+                epoch_dir,
+            )
+            return None
+        return torch.load(str(pool_path), weights_only=False)
+
     if epoch is not None:
-        pool_path = os.path.join(cache_dir, f"epoch_{epoch:04d}", "pool.pt")
-        if os.path.exists(pool_path):
-            return torch.load(pool_path, weights_only=False)
+        epoch_dir = os.path.join(cache_dir, f"epoch_{epoch:04d}")
+        pool = _try_load_epoch(epoch_dir)
+        if pool is not None:
+            return pool
 
     epoch_dirs = sorted(Path(cache_dir).glob("epoch_*"), reverse=True)
     for d in epoch_dirs:
-        pool_path = d / "pool.pt"
-        if pool_path.exists():
-            return torch.load(str(pool_path), weights_only=False)
+        pool = _try_load_epoch(d)
+        if pool is not None:
+            return pool
 
     return []
 
@@ -225,26 +294,30 @@ class BlindCandidateReplayDataset(Dataset):
         n = self.candidates_per_complex
         if positives:
             k = min(max(1, n // 3), len(positives))
-            selected.extend(random.sample(positives, k))
+            self._extend_unique(selected, positives, k)
 
         remaining = n - len(selected)
         if remaining > 0:
             for pool_list in [same_center_negs, wrong_center_negs, deceptive_negs]:
                 if pool_list and remaining > 0:
                     k = min(max(1, remaining // 2), len(pool_list))
-                    selected.extend(random.sample(pool_list, k))
+                    self._extend_unique(selected, pool_list, k)
                     remaining = n - len(selected)
 
         # 随机补齐
         if len(selected) < n:
-            others = [p for p in poses if p not in selected]
+            seen = {self._candidate_key(p) for p in selected}
+            others = [p for p in poses if self._candidate_key(p) not in seen]
             if others:
                 k = min(n - len(selected), len(others))
-                selected.extend(random.sample(others, k))
+                self._extend_unique(selected, others, k)
 
         # 构造回放数据
         candidates = []
         for p in selected:
+            center_xyz = self._get_center_xyz(p, centers)
+            if center_xyz is None:
+                continue
             candidate_role = "random"
             if p in positives:
                 candidate_role = "positive"
@@ -256,7 +329,7 @@ class BlindCandidateReplayDataset(Dataset):
                 candidate_role = "deceptive_negative"
             candidates.append({
                 "dataset_index": dataset_index,
-                "center_xyz": self._get_center_xyz(p, centers),
+                "center_xyz": center_xyz,
                 "pose_xyz": p["pose_xyz"],
                 "rmsd": p["rmsd"],
                 "soft_target": p.get("soft_target", rmsd_to_soft_target(torch.tensor(p["rmsd"])).item()),
@@ -290,12 +363,37 @@ class BlindCandidateReplayDataset(Dataset):
             "n_ligand_atoms": record.get("n_ligand_atoms", 0),
         }
 
-    def _get_center_xyz(self, pose: dict, centers: list[dict]) -> list[float]:
+    @staticmethod
+    def _candidate_key(pose: dict[str, Any]) -> tuple[Any, ...]:
+        pose_id = pose.get("pose_id")
+        if pose_id is not None:
+            return ("pose_id", int(pose_id))
+        return (
+            int(pose.get("center_id", -1)),
+            str(pose.get("stage_id", "")),
+            round(float(pose.get("rmsd", 999.0)), 4),
+        )
+
+    def _extend_unique(
+        self,
+        selected: list[dict[str, Any]],
+        pool_list: list[dict[str, Any]],
+        k: int,
+    ) -> None:
+        if k <= 0:
+            return
+        seen = {self._candidate_key(p) for p in selected}
+        available = [p for p in pool_list if self._candidate_key(p) not in seen]
+        if not available:
+            return
+        selected.extend(random.sample(available, min(k, len(available))))
+
+    def _get_center_xyz(self, pose: dict, centers: list[dict]) -> list[float] | None:
         cid = pose["center_id"]
         for c in centers:
             if c["center_id"] == cid:
                 return c["center_xyz"]
-        return [0.0, 0.0, 0.0]
+        return None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -340,6 +438,11 @@ def replay_and_compute_losses(
     total_pairs = 0
     all_center_logits: list[Tensor] = []
     all_center_targets: list[Tensor] = []
+    resolved_groups = 0
+    candidate_successes = 0
+    candidate_failures = 0
+    sample_failures = 0
+    center_value_failures = 0
 
     for item in replay_items:
         candidates = item["candidates"]
@@ -351,11 +454,19 @@ def replay_and_compute_losses(
 
         try:
             sample = _resolve_replay_sample(train_set, ds_idx)
-        except Exception:
+        except Exception as exc:
+            sample_failures += 1
+            if sample_failures <= 5:
+                logger.warning(
+                    "Replay sample resolution failed for dataset_index=%d: %s",
+                    ds_idx,
+                    exc,
+                )
             continue
 
         group_logits: list[Tensor] = []
         group_rmsd: list[Tensor] = []
+        valid_candidates: list[dict[str, Any]] = []
 
         for cand in candidates:
             try:
@@ -385,22 +496,34 @@ def replay_and_compute_losses(
 
                 group_logits.append(logit)
                 group_rmsd.append(torch.tensor([cand["rmsd"]], device=device, dtype=torch.float32))
+                valid_candidates.append(cand)
+                candidate_successes += 1
 
                 del infer_batch, out
 
             except torch.cuda.OutOfMemoryError:
+                candidate_failures += 1
                 logger.warning("Replay OOM on candidate, skipping.")
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 continue
-            except Exception:
+            except Exception as exc:
+                candidate_failures += 1
+                if candidate_failures <= 5:
+                    logger.warning(
+                        "Replay candidate failed for complex=%s center_id=%s: %s",
+                        item.get("complex_id", ""),
+                        cand.get("center_id", "?"),
+                        exc,
+                    )
                 continue
 
         if group_logits:
+            resolved_groups += 1
             logits_cat = torch.cat(group_logits)
             rmsd_cat = torch.cat(group_rmsd)
-            pair_indices = _build_group_pair_indices(candidates, device=device)
+            pair_indices = _build_group_pair_indices(valid_candidates, device=device)
             rerank_results = compute_rerank_losses(
                 logits_cat,
                 rmsd_cat,
@@ -442,8 +565,14 @@ def replay_and_compute_losses(
                     all_center_targets.append(torch.tensor([cv_target], device=device, dtype=torch.float32))
 
                 del sample_batch
-            except Exception:
-                    pass
+            except Exception as exc:
+                center_value_failures += 1
+                if center_value_failures <= 5:
+                    logger.warning(
+                        "Center-value replay failed for complex=%s: %s",
+                        item.get("complex_id", ""),
+                        exc,
+                    )
 
     result: dict[str, Tensor] = {}
 
@@ -466,6 +595,24 @@ def replay_and_compute_losses(
         result["center_value_loss"] = compute_center_value_loss(center_logits_cat, center_targets_cat)
     else:
         result["center_value_loss"] = torch.tensor(0.0, device=device)
+
+    if resolved_groups == 0 and (candidate_failures > 0 or sample_failures > 0):
+        raise RuntimeError(
+            "Replay supervision produced zero valid groups. "
+            f"sample_failures={sample_failures}, candidate_failures={candidate_failures}, "
+            f"center_value_failures={center_value_failures}"
+        )
+
+    if candidate_failures > 0 or sample_failures > 0 or center_value_failures > 0:
+        logger.warning(
+            "Replay supervision summary | valid_groups=%d | candidate_successes=%d | "
+            "sample_failures=%d | candidate_failures=%d | center_value_failures=%d",
+            resolved_groups,
+            candidate_successes,
+            sample_failures,
+            candidate_failures,
+            center_value_failures,
+        )
 
     return result
 

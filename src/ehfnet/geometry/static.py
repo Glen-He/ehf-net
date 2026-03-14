@@ -77,7 +77,23 @@ def calculate_dihedral(
     return float(np.arctan2(y, x))
 
 
-def get_moving_atoms(mol: Chem.Mol, bond_idx: int) -> tuple[list[int], int, int]:
+def _fragment_signature(
+    fragment: tuple[int, ...],
+    canonical_ranks: list[int],
+) -> tuple[tuple[int, int], ...]:
+    """
+    为断键后的片段构造稳定、与输入原子顺序弱相关的签名。
+    """
+
+    return tuple(sorted((canonical_ranks[idx], idx) for idx in fragment))
+
+
+def get_moving_atoms(
+    mol: Chem.Mol,
+    bond_idx: int,
+    *,
+    canonical_ranks: list[int] | None = None,
+) -> tuple[list[int], int, int]:
     """
     使用 RDKit 寻找旋转键断开后的移动片段。
 
@@ -124,13 +140,24 @@ def get_moving_atoms(mol: Chem.Mol, bond_idx: int) -> tuple[list[int], int, int]
 
     frag0, frag1 = frags[0], frags[1]
 
-    # 启发式规则：原子数较少的片段作为移动部分
+    if canonical_ranks is None:
+        canonical_ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=True))
+
+    # 启发式规则：原子数较少的片段作为移动部分；
+    # 若两侧大小相同，则按 canonical signature 稳定打破平局。
     if len(frag0) < len(frag1):
         moving_atoms = list(frag0)
         axis_moving, axis_fixed = (u, v) if u in moving_atoms else (v, u)
-        
-    else:
+
+    elif len(frag1) < len(frag0):
         moving_atoms = list(frag1)
+        axis_moving, axis_fixed = (u, v) if u in moving_atoms else (v, u)
+
+    else:
+        frag0_sig = _fragment_signature(frag0, canonical_ranks)
+        frag1_sig = _fragment_signature(frag1, canonical_ranks)
+        moving_fragment = frag0 if frag0_sig <= frag1_sig else frag1
+        moving_atoms = list(moving_fragment)
         axis_moving, axis_fixed = (u, v) if u in moving_atoms else (v, u)
 
     return moving_atoms, axis_fixed, axis_moving

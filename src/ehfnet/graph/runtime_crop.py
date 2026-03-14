@@ -12,6 +12,7 @@ import torch
 
 from torch import Tensor
 from torch_geometric.data import HeteroData
+from torch_scatter import scatter_min
 
 from ehfnet.graph.builder import GraphBuilder
 from ehfnet.graph.pocket_features import build_pocket_features
@@ -40,11 +41,32 @@ def crop_graph_to_center(
 
     residue_pos = data["protein_residue"].pos
     residue_dist = torch.norm(residue_pos - center.unsqueeze(0), dim=-1)
-    residue_mask = residue_dist <= float(radius)
+
+    atom_pos = data["protein_atom"].pos
+    atom_residue_idx = data["protein_atom"].residue_idx
+    atom_dist = torch.norm(atom_pos - center.unsqueeze(0), dim=-1)
+    residue_atom_min_dist = torch.full(
+        (int(data["protein_residue"].num_nodes),),
+        float("inf"),
+        dtype=atom_dist.dtype,
+        device=atom_dist.device,
+    )
+    if atom_dist.numel() > 0:
+        residue_atom_min_dist = scatter_min(
+            atom_dist,
+            atom_residue_idx.long(),
+            dim=0,
+            dim_size=int(data["protein_residue"].num_nodes),
+        )[0]
+
+    residue_score = torch.minimum(residue_dist, residue_atom_min_dist)
+    residue_mask = (residue_dist <= float(radius)) | (
+        residue_atom_min_dist <= float(radius + atom_margin)
+    )
 
     if int(residue_mask.sum().item()) < min_residues:
         k = min(max(min_residues, 1), residue_pos.size(0))
-        nearest = torch.topk(residue_dist, k=k, largest=False).indices
+        nearest = torch.topk(residue_score, k=k, largest=False).indices
         residue_mask = torch.zeros_like(residue_mask)
         residue_mask[nearest] = True
 
@@ -57,16 +79,25 @@ def crop_graph_to_center(
     )
     residue_old_to_new[residue_idx] = torch.arange(residue_idx.numel(), device=residue_pos.device)
 
-    atom_pos = data["protein_atom"].pos
-    atom_residue_idx = data["protein_atom"].residue_idx
-    atom_dist = torch.norm(atom_pos - center.unsqueeze(0), dim=-1)
-    atom_mask = residue_mask[atom_residue_idx] | (atom_dist <= float(radius + atom_margin))
+    atom_mask = residue_mask[atom_residue_idx]
 
-    if int(atom_mask.sum().item()) == 0:
+    if int(atom_mask.sum().item()) == 0 and atom_pos.size(0) > 0:
         k = min(max(8, min_residues), atom_pos.size(0))
         nearest_atom = torch.topk(atom_dist, k=k, largest=False).indices
         atom_mask = torch.zeros_like(atom_mask)
         atom_mask[nearest_atom] = True
+
+        residue_mask = torch.zeros_like(residue_mask)
+        residue_mask[atom_residue_idx[nearest_atom]] = True
+        residue_idx = residue_mask.nonzero(as_tuple=False).view(-1)
+        residue_old_to_new = torch.full(
+            (data["protein_residue"].num_nodes,),
+            -1,
+            dtype=torch.long,
+            device=residue_pos.device,
+        )
+        residue_old_to_new[residue_idx] = torch.arange(residue_idx.numel(), device=residue_pos.device)
+        atom_mask = residue_mask[atom_residue_idx]
 
     atom_idx = atom_mask.nonzero(as_tuple=False).view(-1)
 
@@ -111,6 +142,8 @@ def crop_graph_to_center(
         residue_x_cont=out["protein_residue"].x_cont,
         residue_pos=out["protein_residue"].pos,
         protein_atom_pos=out["protein_atom"].pos,
+        residue_esm_missing_mask=getattr(out["protein_residue"], "esm_missing_mask", None),
+        esm_feature_start=graph_builder._residue_esm_feature_start,
         center=center,
     )
     out["protein_pocket"].num_nodes = 1

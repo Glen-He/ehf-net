@@ -14,7 +14,7 @@ from MDAnalysis import Universe
 from esm.models.esmc import ESMC
 from esm.sdk.api import ESMProtein, LogitsConfig
 
-from ehfnet.encoders.chemistry import ResidueType
+from ehfnet.encoders.chemistry import resolve_esm_residue_type
 from ehfnet.encoders.protein_segments import segment_residues_by_continuity
 
 
@@ -46,15 +46,23 @@ def extract_protein_chain_sequences(universe: Universe) -> list[tuple[str, str, 
         residue_ixs: list[int] = []
 
         for res in segment.residues:
-            res_type = ResidueType.safe_get(res.resname)
+            resolution = resolve_esm_residue_type(res.resname)
 
-            if res_type == ResidueType.UNK:
+            if resolution.source == "unknown":
                 logger.warning(
                     f"Unknown residue '{res.resname}' at ix={res.ix} in segment {segment.key}, "
-                    f"mapped to UNK ('{res_type.one_letter}')"
+                    f"mapped to UNK ('{resolution.residue_type.one_letter}')"
+                )
+            elif resolution.source == "alias":
+                logger.debug(
+                    "Canonicalized residue '%s' at ix=%s in segment %s to %s for ESM sequence.",
+                    resolution.original_resname,
+                    res.ix,
+                    segment.key,
+                    resolution.normalized_resname,
                 )
 
-            seq_list.append(res_type.one_letter)
+            seq_list.append(resolution.residue_type.one_letter)
             residue_ixs.append(int(res.ix))
 
         out.append((segment.key, "".join(seq_list), residue_ixs))

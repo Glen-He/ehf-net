@@ -393,12 +393,14 @@ class ConditionalFlowMatcher:
         """
         辅助函数：运行模型一次，获取分解后的速度分量
         """
-
+        original_pos = data["ligand_atom"].pos
         data["ligand_atom"].pos = pos
-
         t_tensor = torch.full((B,), t_val, device=device, dtype=dtype)
 
-        out = model(data, t_tensor)
+        try:
+            out = model(data, t_tensor)
+        finally:
+            data["ligand_atom"].pos = original_pos
 
         v_trans = out["v_translation"]
         v_rot = out["v_rotation"]

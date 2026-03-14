@@ -119,18 +119,18 @@ def _compute_chiral_info(mol: Chem.Mol) -> tuple[set[int], np.ndarray]:
 
         if not chiral_indices:
             return set(), np.full(
-                mol.GetNumAtoms(), _LIGAND_CAT_MAX["distance_to_nearest_chiral"], dtype=int
+                mol.GetNumAtoms(), -1, dtype=int
             )
 
         dist_mat = rdmolops.GetDistanceMatrix(mol)
         chiral_cols = list(chiral_indices)
-        min_dist = dist_mat[:, chiral_cols].min(axis=1)
+        min_dist = dist_mat[:, chiral_cols].min(axis=1).astype(int)
 
         return chiral_indices, min_dist
 
     except Exception as e:
         logger.warning(f"Chiral info computation failed: {e}", exc_info=True)
-        return set(), np.zeros(mol.GetNumAtoms(), dtype=int)
+        return set(), np.full(mol.GetNumAtoms(), -1, dtype=int)
 
 
 def _compute_gasteiger_charges(mol_hs: Chem.Mol) -> list[float]:
@@ -235,7 +235,13 @@ def _compute_pharmacophore_mask(
     return mask
 
 
-def _get_dihedral_indices(mol: Chem.Mol, u: int, v: int) -> list[int]:
+def _get_dihedral_indices(
+    mol: Chem.Mol,
+    u: int,
+    v: int,
+    *,
+    canonical_ranks: list[int],
+) -> list[int]:
     """
     寻找定义二面角的四个原子 [p0, u, v, p3]
 
@@ -250,9 +256,26 @@ def _get_dihedral_indices(mol: Chem.Mol, u: int, v: int) -> list[int]:
 
     def get_neighbor(idx: int, exclude: int) -> int | None:
         neighbors = [
-            n.GetIdx() for n in mol.GetAtomWithIdx(idx).GetNeighbors() if n.GetIdx() != exclude
+            n.GetIdx()
+            for n in mol.GetAtomWithIdx(idx).GetNeighbors()
+            if n.GetIdx() != exclude
         ]
-        return neighbors[0] if neighbors else None
+        if not neighbors:
+            return None
+
+        def score(neighbor_idx: int) -> tuple[int, int, int, int, int]:
+            atom = mol.GetAtomWithIdx(neighbor_idx)
+            bond = mol.GetBondBetweenAtoms(idx, neighbor_idx)
+            bond_order = int(round(10 * bond.GetBondTypeAsDouble())) if bond is not None else 0
+            return (
+                0 if atom.GetAtomicNum() > 1 else 1,
+                -int(atom.GetIsAromatic()),
+                -bond_order,
+                canonical_ranks[neighbor_idx],
+                neighbor_idx,
+            )
+
+        return min(neighbors, key=score)
 
     p0 = get_neighbor(u, v)
     p3 = get_neighbor(v, u)
@@ -291,6 +314,7 @@ def _extract_torsion_info(
     moving_masks: list[list[bool]] = []
     num_atoms = mol.GetNumAtoms()
     seen_bonds = set()
+    canonical_ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=True))
 
     for match in matches:
         # SMARTS 匹配的两个原子即为键的两端
@@ -312,13 +336,22 @@ def _extract_torsion_info(
             continue
 
         # 寻找移动片段
-        moving_atoms, axis_fix, axis_rot = get_moving_atoms(mol, bid)
+        moving_atoms, axis_fix, axis_rot = get_moving_atoms(
+            mol,
+            bid,
+            canonical_ranks=canonical_ranks,
+        )
 
         if not moving_atoms:
             continue
 
         # 寻找二面角锚点
-        dihedral = _get_dihedral_indices(mol, axis_fix, axis_rot)
+        dihedral = _get_dihedral_indices(
+            mol,
+            axis_fix,
+            axis_rot,
+            canonical_ranks=canonical_ranks,
+        )
         if not dihedral:
             continue
 
@@ -333,8 +366,13 @@ def _extract_torsion_info(
     if torsion_indices:
         sorted_indices = sorted(
             range(len(moving_masks)),
-            key=lambda i: sum(moving_masks[i]),  # 移动原子数量
-            reverse=True  # 从大到小：肩膀 → 手肘 → 手指
+            key=lambda i: (
+                -sum(moving_masks[i]),
+                torsion_indices[i][1],
+                torsion_indices[i][2],
+                torsion_indices[i][0],
+                torsion_indices[i][3],
+            ),
         )
         torsion_indices = [torsion_indices[i] for i in sorted_indices]
         moving_masks = [moving_masks[i] for i in sorted_indices]
@@ -433,17 +471,22 @@ class LigandEncoder:
             atom_data["chirality"].append(int(atom.GetChiralTag()))
             atom_data["is_chiral_center"].append(1 if i in chiral_indices else 0)
             atom_data["distance_to_nearest_chiral"].append(
-                min(_LIGAND_CAT_MAX["distance_to_nearest_chiral"], int(dist_to_chiral[i]))
+                0
+                if int(dist_to_chiral[i]) < 0
+                else min(
+                    _LIGAND_CAT_MAX["distance_to_nearest_chiral"],
+                    int(dist_to_chiral[i]) + 1,
+                )
             )
 
             atom_data["is_aromatic"].append(1 if atom.GetIsAromatic() else 0)
             atom_data["is_in_ring"].append(1 if atom.IsInRing() else 0)
             atom_data["smallest_ring_size"].append(
-                min(
+                0
+                if not atom.IsInRing()
+                else min(
                     _LIGAND_CAT_MAX["smallest_ring_size"],
-                    ring_info.MinAtomRingSize(i)
-                    if atom.IsInRing()
-                    else _LIGAND_CAT_MAX["smallest_ring_size"],
+                    max(3, ring_info.MinAtomRingSize(i)),
                 )
             )
             atom_data["is_in_murcko_scaffold"].append(1 if i in murcko_indices else 0)

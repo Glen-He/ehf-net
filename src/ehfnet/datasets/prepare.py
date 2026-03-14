@@ -166,6 +166,22 @@ def prepare_graph(
 
     data = graph_builder.build(ligand_result, protein_result)
     data.pdb_id = pdb_id
+    data.ligand_sanitize_mode = (
+        mol.GetProp("_ehfnet_sanitize_mode")
+        if mol.HasProp("_ehfnet_sanitize_mode")
+        else "unknown"
+    )
+    data.ligand_partial_sanitize = bool(data.ligand_sanitize_mode == "partial")
+    data.ligand_full_sanitize_flag = (
+        int(mol.GetProp("_ehfnet_full_sanitize_flag"))
+        if mol.HasProp("_ehfnet_full_sanitize_flag")
+        else -1
+    )
+    data.ligand_partial_sanitize_flag = (
+        int(mol.GetProp("_ehfnet_partial_sanitize_flag"))
+        if mol.HasProp("_ehfnet_partial_sanitize_flag")
+        else -1
+    )
 
     if affinity is not None:
         data.y_energy = torch.tensor([affinity], dtype=torch.float32)

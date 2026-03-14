@@ -201,6 +201,59 @@ class TangentTargetProjector:
 
         self.eps = eps
 
+    @staticmethod
+    def _translation_velocity_basis(num_atoms: int, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+        return torch.eye(3, device=device, dtype=dtype).unsqueeze(0).expand(num_atoms, -1, -1)
+
+    @staticmethod
+    def _angular_velocity_basis(rel_pos: Tensor) -> Tensor:
+        basis = torch.zeros((rel_pos.size(0), 3, 3), device=rel_pos.device, dtype=rel_pos.dtype)
+        basis[:, 0, 1] = rel_pos[:, 2]
+        basis[:, 0, 2] = -rel_pos[:, 1]
+        basis[:, 1, 0] = -rel_pos[:, 2]
+        basis[:, 1, 2] = rel_pos[:, 0]
+        basis[:, 2, 0] = rel_pos[:, 1]
+        basis[:, 2, 1] = -rel_pos[:, 0]
+        return basis
+
+    def _solve_local_weighted_system(
+        self,
+        *,
+        basis_fields: list[Tensor],
+        target_velocity: Tensor,
+        masses: Tensor,
+    ) -> Tensor:
+        if not basis_fields:
+            return target_velocity.new_zeros((0,))
+
+        cols = torch.stack(
+            [torch.nan_to_num(field, nan=0.0, posinf=0.0, neginf=0.0).reshape(-1) for field in basis_fields],
+            dim=-1,
+        )
+        rhs = target_velocity.reshape(-1)
+        sqrt_w = masses.clamp(min=self.eps).sqrt().repeat_interleave(3)
+        cols_w = cols * sqrt_w.unsqueeze(-1)
+        rhs_w = rhs * sqrt_w
+
+        gram = cols_w.transpose(0, 1) @ cols_w
+        rhs_proj = cols_w.transpose(0, 1) @ rhs_w
+        damping = torch.eye(
+            gram.size(0),
+            device=gram.device,
+            dtype=gram.dtype,
+        ) * PhysicsConstants.DAMPING_FACTOR
+
+        try:
+            solution = torch.linalg.solve(gram + damping, rhs_proj)
+        except RuntimeError:
+            solution = torch.linalg.pinv(gram + damping) @ rhs_proj
+
+        if not torch.isfinite(solution).all():
+            return target_velocity.new_zeros((len(basis_fields),))
+
+        max_solution = 1000.0
+        return torch.clamp(solution, min=-max_solution, max=max_solution)
+
 
     def decompose(
         self,
@@ -209,8 +262,8 @@ class TangentTargetProjector:
         vel: Tensor,
         masses: Tensor,
         batch: Tensor,
-        torsion_indices: Tensor,
-        torsion_moving_mask: Tensor,
+        torsion_indices: Tensor | None,
+        torsion_moving_mask: Tensor | None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         """
         联合最小二乘法将笛卡尔导数投影为切空间目标。
@@ -242,126 +295,85 @@ class TangentTargetProjector:
 
         B = int(batch.max().item()) + 1
         T = torsion_indices.shape[0] if torsion_indices is not None else 0
-        total_dofs = 6 * B + T
 
-        # 1. 预计算质心（质量加权）
-        # 注意：在投影切空间目标时，我们将坐标视为常数，只对笛卡尔导数做线性投影
-        # 这可以极大地提高数值稳定性，避免 SVD/Solve 在反向传播时的梯度爆炸
+        if masses.dim() == 2:
+            masses = masses.squeeze(-1)
+        masses = masses.to(device=device, dtype=dtype)
+
         pos_const = pos.detach()
-        if masses.dim() == 1:
-            masses = masses.unsqueeze(-1)
-
         com = compute_center_of_mass(pos_const, batch, masses, dim_size=B)
-        r_rel = pos_const - com[batch]
+        torsion_batch = (
+            batch[torsion_indices[:, 1]]
+            if torsion_indices is not None and T > 0
+            else torch.zeros(0, device=device, dtype=batch.dtype)
+        )
 
-        # 2. 构建线性方程组 Ax = v_cartesian
-        A = torch.zeros((N * 3, total_dofs), device=device, dtype=dtype)
+        v_trans = torch.zeros(B, 3, device=device, dtype=dtype)
+        v_rot = torch.zeros(B, 3, device=device, dtype=dtype)
+        v_torsion = torch.zeros(T, device=device, dtype=dtype)
 
-        # 2.1 填充刚体基（平移+旋转）
+        if not torch.isfinite(pos_const).all() or not torch.isfinite(vel).all():
+            logger.debug("Numerical instability in decompose: non-finite coordinates or velocities.")
+            return v_trans, v_rot, v_torsion
+
         for b in range(B):
-            mask = batch == b
-            idx_rows = torch.nonzero(mask, as_tuple=False).squeeze(-1)
-            n_atoms_b = idx_rows.numel()
-
-            if n_atoms_b == 0:
+            atom_ids = torch.nonzero(batch == b, as_tuple=False).squeeze(-1)
+            if atom_ids.numel() == 0:
                 continue
 
-            # 平移：恒等矩阵块
-            for k in range(3):
-                A[idx_rows * 3 + k, 6 * b + k] = 1.0
+            pos_b = pos_const[atom_ids]
+            rel_pos_b = pos_b - com[b]
+            vel_b = vel[atom_ids]
+            masses_b = masses[atom_ids].clamp(min=self.eps)
 
-            # 旋转：只有当原子数 >= 2 时旋转才有意义
-            if n_atoms_b >= 2:
-                r = r_rel[idx_rows]
-                cross_mat = torch.zeros((n_atoms_b, 3, 3), device=device, dtype=dtype)
-                cross_mat[:, 0, 1] = r[:, 2]
-                cross_mat[:, 0, 2] = -r[:, 1]
-                cross_mat[:, 1, 0] = -r[:, 2]
-                cross_mat[:, 1, 2] = r[:, 0]
-                cross_mat[:, 2, 0] = r[:, 1]
-                cross_mat[:, 2, 1] = -r[:, 0]
+            basis_fields: list[Tensor] = []
+            trans_basis = self._translation_velocity_basis(
+                int(atom_ids.numel()),
+                device=device,
+                dtype=dtype,
+            )
+            rot_basis = self._angular_velocity_basis(rel_pos_b)
+            basis_fields.extend([trans_basis[:, :, k] for k in range(3)])
+            basis_fields.extend([rot_basis[:, :, k] for k in range(3)])
 
-                row_indices = (
-                    idx_rows.unsqueeze(1) * 3 + torch.arange(3, device=device).unsqueeze(0)
-                ).view(-1)
-                A[row_indices, 6 * b + 3 : 6 * b + 6] = cross_mat.view(-1, 3)
-
-        # 2.2 填充扭转基
-        if T > 0:
-            u = pos_const[torsion_indices[:, 1]]
-            v = pos_const[torsion_indices[:, 2]]
-            axis = F.normalize(v - u, dim=-1, eps=self.eps)
-
-            t_idx, n_idx = torsion_moving_mask.nonzero(as_tuple=True)
-
-            if t_idx.numel() > 0:
-                r_rot = pos_const[n_idx] - u[t_idx]
-                axis_vec = axis[t_idx]
-                vel_tor = torch.cross(axis_vec, r_rot, dim=-1)  # v = w x r
-
-                col_indices = 6 * B + t_idx
-                for k in range(3):
-                    A[n_idx * 3 + k, col_indices] = vel_tor[:, k]
-
-        # 3. 求解 Ax = b
-        b_vec = vel.view(-1)  # [3N]
-
-        if not torch.isfinite(A).all() or not torch.isfinite(b_vec).all():
-            nan_in_A = not torch.isfinite(A).all()
-            nan_in_b = not torch.isfinite(b_vec).all()
-            logger.debug(f"Numerical instability in decompose: NaN in A: {nan_in_A}, NaN in b: {nan_in_b}. Skipping batch.")
-            # 用 vel.sum()*0 锚定零张量，确保 grad_fn 不被切断
-            zero = b_vec.sum() * 0.0
-            return (
-                torch.zeros(B, 3, device=device, dtype=dtype) + zero,
-                torch.zeros(B, 3, device=device, dtype=dtype) + zero,
-                torch.zeros(T, device=device, dtype=dtype) + zero,
+            local_torsion_ids = (
+                torch.nonzero(torsion_batch == b, as_tuple=False).squeeze(-1)
+                if T > 0
+                else torch.zeros(0, device=device, dtype=torch.long)
             )
 
-        # 为了数值稳定性，将计算移至 CPU 并使用更高精度
-        # 采用正规方程 (ATA + damping)x = ATb 求解，这在 CPU 上非常稳定且快速
-        A_cpu = A.to("cpu", dtype=torch.float64)
-        b_cpu = b_vec.to("cpu", dtype=torch.float64)
+            if local_torsion_ids.numel() > 0 and torsion_moving_mask is not None and torsion_indices is not None:
+                local_masks = torsion_moving_mask[local_torsion_ids]
+                if local_masks.dtype != torch.bool:
+                    local_masks = local_masks > 0.5
+                local_masks = local_masks[:, atom_ids]
 
-        try:
-            ATA_cpu = A_cpu.T @ A_cpu
-            ATb_cpu = A_cpu.T @ b_cpu
-            
-            # 添加阻尼项
-            diag_indices = torch.arange(total_dofs, device="cpu")
-            ATA_cpu[diag_indices, diag_indices] += PhysicsConstants.DAMPING_FACTOR
-            
-            # 求解
-            solution_cpu = torch.linalg.solve(ATA_cpu, ATb_cpu)
-            
-            # 安全检查：对解进行幅值限制，防止病态矩阵导致的数值爆炸
-            # 物理上，如果一个旋转速度或扭转速度超过 1000 弧度/秒，通常是数学奇异点
-            max_solution = 1000.0
-            if torch.abs(solution_cpu).max() > max_solution:
-                solution_cpu = torch.clamp(solution_cpu, min=-max_solution, max=max_solution)
-                
-            solution = solution_cpu.to(device, dtype=dtype)
-            
-        except Exception as e:
-            logger.warning(
-                f"DECOMPOSE FAILED: B={B}, T={T}, N={N}. "
-                f"Error: {e}. Returning zeros."
+                u = pos_const[torsion_indices[local_torsion_ids, 1]]
+                v = pos_const[torsion_indices[local_torsion_ids, 2]]
+                axis = F.normalize(v - u, dim=-1, eps=self.eps)
+
+                for local_idx in range(int(local_torsion_ids.numel())):
+                    field = torch.zeros((atom_ids.numel(), 3), device=device, dtype=dtype)
+                    moving_mask = local_masks[local_idx]
+                    if bool(moving_mask.any()):
+                        rel_rot = pos_b[moving_mask] - u[local_idx]
+                        axis_vec = axis[local_idx].unsqueeze(0).expand_as(rel_rot)
+                        field[moving_mask] = torch.cross(axis_vec, rel_rot, dim=-1)
+                    basis_fields.append(field)
+
+            solution = self._solve_local_weighted_system(
+                basis_fields=basis_fields,
+                target_velocity=vel_b,
+                masses=masses_b,
             )
-            # 同样锚定到 b_vec，保持梯度通路
-            zero = b_vec.sum() * 0.0
-            solution = torch.zeros(total_dofs, device=device, dtype=dtype) + zero
+            if solution.numel() < 6:
+                continue
 
-        # 4. 拆解结果
-        rigid_sol = solution[: 6 * B].view(B, 6)
-        v_trans = rigid_sol[:, :3]
-        v_rot = rigid_sol[:, 3:]
+            v_trans[b] = solution[:3]
+            v_rot[b] = solution[3:6]
+            if local_torsion_ids.numel() > 0:
+                v_torsion[local_torsion_ids] = solution[6 : 6 + int(local_torsion_ids.numel())]
 
-        v_torsion = (
-            solution[6 * B :]
-            if T > 0
-            else torch.zeros(0, device=device, dtype=dtype)
-        )
-        
         return v_trans, v_rot, v_torsion
 
 
@@ -558,6 +570,20 @@ class PathInterpolator:
         self.eps = eps
         self.fd_dt = fd_dt
 
+    def _solve_single_kabsch(self, H: Tensor, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+        eye = torch.eye(3, device=device, dtype=dtype)
+        try:
+            H_cpu = H.to("cpu", dtype=torch.float64)
+            U_cpu, _, Vh_cpu = torch.linalg.svd(H_cpu, full_matrices=False)
+            R_cpu = Vh_cpu.T @ U_cpu.T
+            if torch.linalg.det(R_cpu) < 0:
+                Vh_cpu = Vh_cpu.clone()
+                Vh_cpu[-1, :] *= -1
+                R_cpu = Vh_cpu.T @ U_cpu.T
+            return R_cpu.to(device=device, dtype=dtype)
+        except Exception:
+            return eye
+
 
     def compute_path_parameters(
         self,
@@ -612,56 +638,48 @@ class PathInterpolator:
                 "torsion_moving_mask": torsion_moving_mask,
             }
 
-        # 2. 计算最佳旋转（Kabsch 算法）
-        R = torch.zeros(B, 3, 3, device=device, dtype=dtype)
+        # 2. 计算最佳旋转（批量质量加权 Kabsch）
+        eye = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
+        R = eye.clone()
+        atom_counts = scatter_sum(
+            torch.ones(pos_0.size(0), device=device, dtype=torch.long),
+            batch,
+            dim=0,
+            dim_size=B,
+        )
+        atom_cov = torch.bmm(
+            (pos_0_centered * masses).unsqueeze(-1),
+            pos_1_centered.unsqueeze(-2),
+        )
+        H = scatter_sum(atom_cov.reshape(-1, 9), batch, dim=0, dim_size=B).reshape(B, 3, 3)
+        valid_mask = (
+            (atom_counts >= 2)
+            & torch.isfinite(H).all(dim=-1).all(dim=-1)
+            & (torch.norm(H.reshape(B, -1), dim=-1) >= self.eps)
+        )
 
-        for b in range(B):
-            mask_b = batch == b
-
-            if not mask_b.any():
-                R[b] = torch.eye(3, device=device, dtype=dtype)
-                continue
-
-            # 质量加权的协方差矩阵
-            P = pos_0_centered[mask_b]      # [N_b, 3]
-            Q = pos_1_centered[mask_b]      # [N_b, 3]
-            w = masses[mask_b]              # [N_b, 1]
-            
-            # H = P^T @ W @ Q
-            H = torch.matmul(P.T, w * Q)    # [3, 3]
-            
-            # 检查 H 是否有效（防止 N_b=1 或坐标异常导致的 NaN/Zero）
-            if not torch.isfinite(H).all() or torch.norm(H) < self.eps:
-                R[b] = torch.eye(3, device=device, dtype=dtype)
-                continue
-
+        fallback_indices = torch.zeros(0, device=device, dtype=torch.long)
+        if bool(valid_mask.any()):
+            valid_indices = torch.nonzero(valid_mask, as_tuple=False).squeeze(-1)
+            H_valid = H[valid_indices]
             try:
-                # 在 CPU 上执行 SVD，CPU 驱动程序 (Lapack) 通常比 GPU (cuSolver) 更稳健
-                H_cpu = H.to("cpu", dtype=torch.float64)
-                U_cpu, S_cpu, Vh_cpu = torch.linalg.svd(H_cpu)
-                
-                U = U_cpu.to(device, dtype=dtype)
-                Vh = Vh_cpu.to(device, dtype=dtype)
-                
-                if not torch.isfinite(U).all() or not torch.isfinite(Vh).all():
-                    R[b] = torch.eye(3, device=device, dtype=dtype)
-                    continue
+                U, _, Vh = torch.linalg.svd(H_valid, full_matrices=False)
+                R_valid = torch.matmul(Vh.transpose(-2, -1), U.transpose(-2, -1))
+                det = torch.linalg.det(R_valid)
+                if bool((det < 0).any()):
+                    Vh = Vh.clone()
+                    Vh[det < 0, -1, :] *= -1
+                    R_valid = torch.matmul(Vh.transpose(-2, -1), U.transpose(-2, -1))
+                finite_rot = torch.isfinite(R_valid).all(dim=-1).all(dim=-1)
+                if bool(finite_rot.any()):
+                    R[valid_indices[finite_rot]] = R_valid[finite_rot].to(device=device, dtype=dtype)
+                fallback_indices = valid_indices[~finite_rot]
+            except RuntimeError as exc:
+                logger.warning("Batched Kabsch SVD failed: %s. Falling back to per-molecule solve.", exc)
+                fallback_indices = valid_indices
 
-                # 计算旋转矩阵：R = V @ U^T
-                R_b = torch.matmul(Vh.T, U.T)
-                
-                # 确保 det(R) = +1（右手系）
-                if torch.linalg.det(R_b) < 0:
-                    Vh_corrected = Vh.clone()
-                    Vh_corrected[-1, :] *= -1
-                    R_b = torch.matmul(Vh_corrected.T, U.T)
-                
-                R[b] = R_b
-
-            except Exception as e:
-                # SVD 失败时使用单位矩阵
-                logger.warning(f"SVD failed for batch {b}: {e}, using identity matrix")
-                R[b] = torch.eye(3, device=device, dtype=dtype)
+        for idx in fallback_indices.tolist():
+            R[idx] = self._solve_single_kabsch(H[idx], device=device, dtype=dtype)
 
         # 3. 计算扭转角差异
         R_expanded = R[batch]

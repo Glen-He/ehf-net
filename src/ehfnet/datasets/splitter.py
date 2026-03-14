@@ -182,16 +182,22 @@ class ScaffoldSplitter:
             mol = _read_ligand_safe(mol_path)
 
             if mol is None:
-                scaffold = "null_scaffold_error"
+                scaffold = f"invalid::{pdb_id}"
                 invalid_count += 1
 
             else:
                 scaffold = generate_scaffold(mol, self.include_chirality)
+                if not scaffold:
+                    scaffold = f"invalid::{pdb_id}"
+                    invalid_count += 1
 
             scaffold_map[scaffold].append(real_dataset_idx)
 
         if invalid_count > 0:
-            logger.warning(f"Failed to generate scaffolds for {invalid_count} ligands.")
+            logger.warning(
+                "Failed to generate valid scaffolds for %d ligands. Treating them as singleton invalid buckets.",
+                invalid_count,
+            )
 
         if missing_in_dataset_count > 0:
             logger.warning(f"Skipped {missing_in_dataset_count} entries present in CSV but missing in Dataset.")

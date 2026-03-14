@@ -7,6 +7,7 @@
 import os
 import math
 import json
+import hashlib
 import traceback
 import torch
 import logging
@@ -22,6 +23,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torch.optim.swa_utils import AveragedModel
 from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
+from torch_geometric.data import HeteroData
 
 from torch_scatter import scatter_mean
 
@@ -29,12 +31,19 @@ from ehfnet.models import EHFNet
 from ehfnet.graph import GraphCollator, crop_graph_to_center
 from ehfnet.datasets.pdbbind import PDBBindDataset
 from ehfnet.datasets.splitter import ScaffoldSplitter
+from ehfnet.encoders.feature_specs import (
+    LIGAND_ATOM_CONT_SCHEMA,
+    LIGAND_MOLECULE_CONT_SCHEMA,
+    PROTEIN_ATOM_CONT_SCHEMA,
+    PROTEIN_RESIDUE_CONT_SCHEMA,
+)
 from ehfnet.training.losses import FlowMatchingLoss
 from ehfnet.training.flow_matcher import ConditionalFlowMatcher
 from ehfnet.training.blind_pool import (
     refresh_blind_candidate_pool,
     save_blind_pool,
     load_blind_pool,
+    build_blind_pool_compatibility,
     BlindCandidateReplayDataset,
     replay_and_compute_losses,
     should_refresh_pool,
@@ -43,6 +52,10 @@ from ehfnet.training.blind_pool import (
 from ehfnet.training.candidate_generation import (
     generate_blind_candidates,
     generate_candidates_from_loader,
+)
+from ehfnet.training.checkpoint_schema import (
+    build_feature_signature,
+    build_model_config,
 )
 
 
@@ -62,6 +75,17 @@ def compute_pose_quality_target(current_pos: torch.Tensor, target_pos: torch.Ten
     sq_diff = ((current_pos - target_pos) ** 2).sum(dim=-1)
     rmsd = torch.sqrt(scatter_mean(sq_diff, batch_idx, dim=0) + 1e-8)
     return torch.sigmoid((4.0 - rmsd) / 0.75).unsqueeze(-1)
+
+
+def select_pose_ranking_logit(predictions: dict[str, torch.Tensor]) -> torch.Tensor:
+    rank_logit = predictions.get("pose_rank_score")
+    if rank_logit is not None:
+        return rank_logit
+
+    pose_quality = predictions.get("pose_quality")
+    if pose_quality is None:
+        raise KeyError("Predictions must contain either 'pose_rank_score' or 'pose_quality'.")
+    return pose_quality
 
 
 def apply_loss_context(
@@ -201,6 +225,156 @@ def resolve_ehfnet_model(model: torch.nn.Module) -> EHFNet:
     return base_model
 
 
+def _normalization_cache_path(
+    *,
+    split_cache_file: str,
+    processed_dir: str,
+    train_indices: list[int],
+) -> Path:
+    digest_src = ",".join(str(int(i)) for i in sorted(train_indices))
+    digest = hashlib.sha1(digest_src.encode("utf-8")).hexdigest()[:12]
+    processed_tag = Path(processed_dir).name
+    split_path = Path(split_cache_file)
+    return split_path.with_name(
+        f"{split_path.stem}_{processed_tag}_{digest}_train_norm.pt"
+    )
+
+
+def _empty_feature_stat(dim: int) -> dict[str, torch.Tensor]:
+    return {
+        "sum": torch.zeros(dim, dtype=torch.float64),
+        "sum_sq": torch.zeros(dim, dtype=torch.float64),
+        "count": torch.zeros(dim, dtype=torch.float64),
+    }
+
+
+def _accumulate_feature_block(
+    stat: dict[str, torch.Tensor],
+    x: torch.Tensor,
+    *,
+    missing_mask: torch.Tensor | None = None,
+    masked_feature_start: int | None = None,
+) -> None:
+    if x.numel() == 0:
+        return
+
+    x_cpu = x.detach().to(dtype=torch.float64, device="cpu")
+    if stat["sum"].numel() != x_cpu.size(1):
+        raise ValueError(
+            f"Feature dimension mismatch while accumulating stats: expected {stat['sum'].numel()}, got {x_cpu.size(1)}."
+        )
+
+    if (
+        missing_mask is not None
+        and masked_feature_start is not None
+        and 0 < int(masked_feature_start) < x_cpu.size(1)
+    ):
+        mask_cpu = missing_mask.detach().to(device="cpu", dtype=torch.bool)
+        split = int(masked_feature_start)
+        torsion = x_cpu[:, :split]
+        esm = x_cpu[:, split:]
+
+        stat["sum"][:split] += torsion.sum(dim=0)
+        stat["sum_sq"][:split] += torsion.pow(2).sum(dim=0)
+        stat["count"][:split] += float(x_cpu.size(0))
+
+        valid_mask = ~mask_cpu
+        if bool(valid_mask.any()):
+            valid_esm = esm[valid_mask]
+            stat["sum"][split:] += valid_esm.sum(dim=0)
+            stat["sum_sq"][split:] += valid_esm.pow(2).sum(dim=0)
+            stat["count"][split:] += float(valid_esm.size(0))
+        return
+
+    stat["sum"] += x_cpu.sum(dim=0)
+    stat["sum_sq"] += x_cpu.pow(2).sum(dim=0)
+    stat["count"] += float(x_cpu.size(0))
+
+
+def _finalize_feature_stats(
+    stat: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    count = stat["count"].clamp_min(1.0)
+    mean = stat["sum"] / count
+    mean_sq = stat["sum_sq"] / count
+    var = (mean_sq - mean.pow(2)).clamp(min=1e-6)
+
+    zero_mask = stat["count"] <= 0
+    if bool(zero_mask.any()):
+        mean[zero_mask] = 0.0
+        var[zero_mask] = 1.0
+
+    return {
+        "mean": mean.to(dtype=torch.float32),
+        "std": torch.sqrt(var).to(dtype=torch.float32),
+    }
+
+
+def _compute_train_split_normalization_stats(
+    dataset: PDBBindDataset,
+    train_indices: list[int],
+    *,
+    split_cache_file: str,
+) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, float]]:
+    cache_path = _normalization_cache_path(
+        split_cache_file=split_cache_file,
+        processed_dir=dataset.processed_dir,
+        train_indices=train_indices,
+    )
+    cache_meta = {
+        "processed_dir": os.path.abspath(dataset.processed_dir),
+        "index_file": os.path.abspath(dataset.index_file),
+        "train_size": int(len(train_indices)),
+    }
+
+    if cache_path.exists():
+        cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+        if isinstance(cached, dict) and cached.get("metadata") == cache_meta:
+            cached_stats = cached.get("stats")
+            cached_affinity = cached.get("affinity")
+            if isinstance(cached_stats, dict) and isinstance(cached_affinity, dict):
+                logger.info("Loaded train-only normalization stats from %s", cache_path)
+                return cast(dict[str, dict[str, torch.Tensor]], cached_stats), cast(dict[str, float], cached_affinity)
+
+    sample_dim = cast(HeteroData, torch.load(
+        os.path.join(dataset.processed_dir, f"data_{dataset._valid_pdb_ids[train_indices[0]]}.pt"),
+        map_location="cpu",
+        weights_only=False,
+    ))
+    feature_stats: dict[str, dict[str, torch.Tensor]] = {
+        "ligand_atom": _empty_feature_stat(int(sample_dim["ligand_atom"].x_cont.size(1))),
+        "protein_atom": _empty_feature_stat(int(sample_dim["protein_atom"].x_cont.size(1))),
+        "ligand_molecule": _empty_feature_stat(int(sample_dim["ligand_molecule"].x_cont.size(1))),
+    }
+
+    for dataset_idx in tqdm(train_indices, desc="Computing train normalization stats", leave=False):
+        pdb_id = dataset._valid_pdb_ids[int(dataset_idx)]
+        file_path = os.path.join(dataset.processed_dir, f"data_{pdb_id}.pt")
+        data = cast(HeteroData, torch.load(file_path, map_location="cpu", weights_only=False))
+
+        _accumulate_feature_block(feature_stats["ligand_atom"], data["ligand_atom"].x_cont)
+        _accumulate_feature_block(feature_stats["protein_atom"], data["protein_atom"].x_cont)
+        _accumulate_feature_block(feature_stats["ligand_molecule"], data["ligand_molecule"].x_cont)
+
+    final_stats = {
+        key: _finalize_feature_stats(stat)
+        for key, stat in feature_stats.items()
+    }
+    affinity_stats = dataset.compute_affinity_stats(train_indices)
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "metadata": cache_meta,
+            "stats": final_stats,
+            "affinity": affinity_stats,
+        },
+        cache_path,
+    )
+    logger.info("Saved train-only normalization stats to %s", cache_path)
+    return final_stats, affinity_stats
+
+
 def compute_proposal_loss(
     model: torch.nn.Module,
     batch_obj: Any,
@@ -266,7 +440,7 @@ def select_diverse_center_indices(
 
 def combine_center_pose_score(
     center_logit: torch.Tensor,
-    pose_quality_logit: torch.Tensor,
+    pose_logit: torch.Tensor,
     *,
     aff_logit: torch.Tensor | None = None,
     clash_value: torch.Tensor | None = None,
@@ -276,7 +450,7 @@ def combine_center_pose_score(
     if fusion_weights is not None:
         fusion.update(fusion_weights)
     center_score = torch.sigmoid(center_logit.view(-1))
-    pose_score = torch.sigmoid(pose_quality_logit.view(-1))
+    pose_score = torch.sigmoid(pose_logit.view(-1))
     result = (
         fusion["pose_weight"] * pose_score
         + fusion["center_weight"] * center_score
@@ -574,7 +748,7 @@ def summarize_blind_candidate_records(
             key=lambda item: float(
                 combine_center_pose_score(
                     torch.tensor([item["center_logit"]], dtype=torch.float32),
-                    torch.tensor([item["pose_logit"]], dtype=torch.float32),
+                    torch.tensor([item.get("ranking_logit", item["pose_logit"])], dtype=torch.float32),
                     aff_logit=torch.tensor([item.get("aff_logit", 0.0)], dtype=torch.float32),
                     clash_value=torch.tensor([item.get("clash_value", 0.0)], dtype=torch.float32),
                     fusion_weights=fusion_weights,
@@ -800,10 +974,10 @@ def train(
     clip_grad: float = 10.0,
     hidden_dim: int = 128,
     num_gnn_blocks: int = 6,
-    lig_atom_cont_count: int = 9,
-    lig_mol_cont_count: int = 9,
-    pro_atom_cont_count: int = 5,
-    pro_res_cont_count: int = 974,     # 14 (torsion) + 960 (ESM)
+    lig_atom_cont_count: int = len(LIGAND_ATOM_CONT_SCHEMA),
+    lig_mol_cont_count: int = len(LIGAND_MOLECULE_CONT_SCHEMA),
+    pro_atom_cont_count: int = len(PROTEIN_ATOM_CONT_SCHEMA),
+    pro_res_cont_count: int = len(PROTEIN_RESIDUE_CONT_SCHEMA) + 960,
     esm_dim: int = 960,
     device: str | torch.device = "auto",
     pocket_radius: float | None = 10.0,
@@ -893,7 +1067,7 @@ def train(
         device: 训练设备 ("cpu", "cuda", "cuda:0", "cuda:1" 等)，默认为 "auto" (自动检测)
         pocket_radius: 运行时局部 docking 半径 (Å)
         protein_context_mode: 蛋白上下文缓存模式，full 表示缓存全蛋白并在运行时裁剪
-        normalization_stats: 归一化统计数据
+        normalization_stats: 保留兼容参数；运行时会统一改用 train split 统计
         warmup_epochs: 空间课程学习预热轮数
         rmsd_check_ratio: 验证集中计算 RMSD 的样本比例 (0.0 ~ 1.0)
                           例如 0.1 表示随机抽取 10% 的 batch 进行耗时的 RMSD 推演
@@ -956,6 +1130,8 @@ def train(
     if protein_context_mode not in {"full", "pocket"}:
         raise ValueError("protein_context_mode must be 'full' or 'pocket'.")
 
+    interaction_profile = "atom_only" if ablation_mode == "inter_multiscale_off" else "full"
+
     dataset = PDBBindDataset(
         root=data_root,
         index_file=index_file,
@@ -963,18 +1139,9 @@ def train(
         esm="auto",
         esm_dim=esm_dim,
         pocket_radius=None if protein_context_mode == "full" else pocket_radius,
-        interaction_profile="atom_only" if ablation_mode == "inter_multiscale_off" else "full",
+        interaction_profile=interaction_profile,
     )
     graph_builder = dataset.graph_builder
-
-    # 统一亲和力统计来源：以当前 Dataset 统计为准，避免外部 stats 与训练集不一致
-    if normalization_stats is None:
-        normalization_stats = {}
-
-    normalization_stats["affinity"] = {
-        "mean": torch.tensor(dataset.affinity_stats["mean"], dtype=torch.float32),
-        "std": torch.tensor(dataset.affinity_stats["std"], dtype=torch.float32),
-    }
 
     if not math.isclose(split_train_frac + split_val_frac + split_test_frac, 1.0, rel_tol=1e-6, abs_tol=1e-6):
         raise ValueError(
@@ -1067,6 +1234,28 @@ def train(
         logger.info(f"Saved split indices to {split_cache_file}")
 
     train_set, val_set, test_set = ScaffoldSplitter.subsets_from_indices(dataset, split_indices)
+    train_indices = [int(i) for i in split_indices.get("train", [])]
+    if not train_indices:
+        raise ValueError("Train split is empty; cannot compute train-only normalization stats.")
+
+    if normalization_stats:
+        logger.warning("Ignoring externally supplied normalization_stats; using train-split-only statistics.")
+
+    normalization_stats, train_affinity_stats = _compute_train_split_normalization_stats(
+        dataset,
+        train_indices,
+        split_cache_file=split_cache_file,
+    )
+    normalization_stats["affinity"] = {
+        "mean": torch.tensor(train_affinity_stats["mean"], dtype=torch.float32),
+        "std": torch.tensor(train_affinity_stats["std"], dtype=torch.float32),
+    }
+    dataset.set_affinity_stats(train_affinity_stats)
+    logger.info(
+        "Using train-only affinity stats: mean=%.4f std=%.4f",
+        train_affinity_stats["mean"],
+        train_affinity_stats["std"],
+    )
 
     logger.info(
         f"Final Dataset Sizes: Train={len(train_set)}, Val={len(val_set)}, Test={len(test_set)}"
@@ -1233,10 +1422,23 @@ def train(
         val_metrics_obj: dict[str, Any],
         selection_metrics: dict[str, float],
     ) -> dict[str, Any]:
+        model_config = build_model_config(
+            hidden_dim=hidden_dim,
+            time_dim=hidden_dim,
+            num_gnn_blocks=num_gnn_blocks,
+            lig_atom_cont_count=lig_atom_cont_count,
+            lig_mol_cont_count=lig_mol_cont_count,
+            pro_atom_cont_count=pro_atom_cont_count,
+            pro_res_cont_count=pro_res_cont_count,
+            esm_dim=esm_dim,
+            interaction_profile=interaction_profile,
+        )
         return {
             "epoch": epoch_idx,
             "run_name": run_name,
             "run_log_file": run_log_file,
+            "model_config": model_config,
+            "feature_signature": build_feature_signature(esm_dim=esm_dim),
             "model_state_dict": model.state_dict(),
             "ema_model_state_dict": ema_model.module.state_dict() if ema_model is not None else model.state_dict(),
             "loss_state_dict": criterion.state_dict(),
@@ -1388,7 +1590,7 @@ def train(
         lig_mol_cont_count=lig_mol_cont_count,
         pro_atom_cont_count=pro_atom_cont_count,
         pro_res_cont_count=pro_res_cont_count,
-        interaction_profile="atom_only" if ablation_mode == "inter_multiscale_off" else "full",
+        interaction_profile=interaction_profile,
         normalization_stats=normalization_stats,
     ).to(device)
 
@@ -1447,7 +1649,16 @@ def train(
     selected_primary_key, selected_higher_is_better, selected_metric_label = _resolve_selection_rule()
     blind_pool_cache_dir = os.path.join(save_dir, "blind_pool_cache")
     os.makedirs(blind_pool_cache_dir, exist_ok=True)
-    cached_blind_pool: list[dict[str, Any]] = load_blind_pool(blind_pool_cache_dir)
+    blind_pool_compatibility = build_blind_pool_compatibility(
+        esm_dim=esm_dim,
+        processed_dir=dataset.processed_dir,
+        index_file=dataset.index_file,
+        interaction_profile=interaction_profile,
+    )
+    cached_blind_pool: list[dict[str, Any]] = load_blind_pool(
+        blind_pool_cache_dir,
+        expected_compatibility=blind_pool_compatibility,
+    )
     if cached_blind_pool:
         logger.info("Loaded existing blind pool: %d complexes.", len(cached_blind_pool))
     best_selected_updated_this_epoch = False
@@ -1501,7 +1712,9 @@ def train(
         accumulated_graphs = 0  # 当前累积周期内的总图数
         consecutive_oom = 0     # 连续 OOM 计数，用于级联熔断
         CIRCUIT_BREAKER_LIMIT = 10  # 连续 OOM 达到此值则熔断当前 epoch
+        ENERGY_NAN_FAILFAST_LIMIT = 8
         epoch_fused = False     # 本 epoch 是否被熔断
+        consecutive_energy_nan_skips = 0
         optimizer.zero_grad()   # 在循环外初始化梯度清零
         epoch_proposal_losses: list[float] = []
         epoch_local_losses: list[float] = []
@@ -1515,6 +1728,7 @@ def train(
         }
         epoch_rank_oom_skips = 0
         epoch_rank_peak_mem_mb = 0.0
+        epoch_energy_nan_skips = 0
 
         for batch_idx, batch in enumerate(train_loader):
             num_graphs = int(batch["ligand_atom"].batch.max().item()) + 1
@@ -1666,10 +1880,23 @@ def train(
 
                 loss_dict = criterion(predictions, targets, batch)
                 epoch_local_losses.append(float(loss_dict["total"].detach().item()))
+                energy_nan_this_batch = int(loss_dict.get("energy_nan_skipped", torch.tensor(0.0)).item())
+                epoch_energy_nan_skips += energy_nan_this_batch
+                if energy_nan_this_batch > 0:
+                    consecutive_energy_nan_skips += 1
+                    if consecutive_energy_nan_skips >= ENERGY_NAN_FAILFAST_LIMIT:
+                        raise RuntimeError(
+                            f"Energy head produced non-finite affinity values on "
+                            f"{consecutive_energy_nan_skips} consecutive batches "
+                            f"(epoch={epoch+1}, batch={batch_idx})."
+                        )
+                else:
+                    consecutive_energy_nan_skips = 0
                 loss_pose_rank = torch.tensor(0.0, device=device)
                 if pose_ranking_pair_weight > 0.0:
                     try:
                         rank_terms: list[torch.Tensor] = []
+                        current_rank_logit = select_pose_ranking_logit(predictions)
                         # same-center 好/坏 pose pair
                         same_center_batch = batch.clone()
                         with torch.no_grad():
@@ -1690,10 +1917,11 @@ def train(
                         same_center_batch.t = t_same
                         same_center_pred = model(same_center_batch, t_same)
                         pose_quality_same = compute_pose_quality_target(x_t_same, x_1, batch["ligand_atom"].batch)
+                        same_center_rank_logit = select_pose_ranking_logit(same_center_pred)
                         loss_same, count_same = compute_pairwise_pose_ranking_loss(
-                            predictions["pose_quality"],
+                            current_rank_logit,
                             targets["pose_quality_target"],
-                            same_center_pred["pose_quality"],
+                            same_center_rank_logit,
                             pose_quality_same,
                             margin=pose_ranking_margin,
                         )
@@ -1728,6 +1956,7 @@ def train(
                             wrong_local_batch["ligand_atom"].pos = x_t_wrong
                             wrong_local_batch.t = t_wrong
                             wrong_pred = model(wrong_local_batch, t_wrong)
+                            wrong_rank_logit = select_pose_ranking_logit(wrong_pred)
                             pose_quality_wrong = compute_pose_quality_target(
                                 x_t_wrong,
                                 x_1_wrong,
@@ -1743,9 +1972,9 @@ def train(
                                 wrong_clash.view(-1) <= (anchor_clash.view(-1) + 1.0)
                             )
                             loss_wrong, count_wrong = compute_pairwise_pose_ranking_loss(
-                                predictions["pose_quality"],
+                                current_rank_logit,
                                 targets["pose_quality_target"],
-                                wrong_pred["pose_quality"],
+                                wrong_rank_logit,
                                 pose_quality_wrong,
                                 margin=pose_ranking_margin,
                                 extra_mask=low_clash_mask,
@@ -1758,9 +1987,9 @@ def train(
                                 wrong_center_scores >= (proposal_top_scores - 0.25)
                             )
                             loss_center_hard, count_center_hard = compute_pairwise_pose_ranking_loss(
-                                predictions["pose_quality"],
+                                current_rank_logit,
                                 targets["pose_quality_target"],
-                                wrong_pred["pose_quality"],
+                                wrong_rank_logit,
                                 pose_quality_wrong,
                                 margin=pose_ranking_margin,
                                 extra_mask=misleading_center_mask,
@@ -1776,9 +2005,9 @@ def train(
                                     wrong_aff.view(-1) >= (anchor_aff.view(-1) - 0.25)
                                 )
                                 loss_aff_hard, count_aff_hard = compute_pairwise_pose_ranking_loss(
-                                    predictions["pose_quality"],
+                                    current_rank_logit,
                                     targets["pose_quality_target"],
-                                    wrong_pred["pose_quality"],
+                                    wrong_rank_logit,
                                     pose_quality_wrong,
                                     margin=pose_ranking_margin,
                                     extra_mask=misleading_aff_mask,
@@ -2043,6 +2272,11 @@ def train(
             epoch_rank_oom_skips,
             epoch_rank_peak_mem_mb,
         )
+        if epoch_energy_nan_skips > 0:
+            logger.warning(
+                "Energy loss skipped due to non-finite affinity values on %d training batches.",
+                epoch_energy_nan_skips,
+            )
 
         if epoch_oom_batches > 0:
             logger.warning(
@@ -2429,6 +2663,7 @@ def train(
                     save_blind_pool(
                         new_pool, blind_pool_cache_dir, epoch=epoch,
                         meta={
+                            "compatibility": blind_pool_compatibility,
                             "center_proposal_topk": center_proposal_topk,
                             "center_refine_topk": center_refine_topk,
                             "stage1_pose_samples": stage1_pose_samples,

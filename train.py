@@ -25,6 +25,12 @@ if str(PROJECT_ROOT / "src") not in sys.path:
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 
 from ehfnet.training.trainer import train
+from ehfnet.encoders.feature_specs import (
+    LIGAND_ATOM_CONT_SCHEMA,
+    LIGAND_MOLECULE_CONT_SCHEMA,
+    PROTEIN_ATOM_CONT_SCHEMA,
+    PROTEIN_RESIDUE_CONT_SCHEMA,
+)
 import torch
 
 # [新增] 全局开启 TF32 (提速神器)
@@ -96,9 +102,9 @@ def main():
     parser.add_argument("--num_gnn_blocks", type=int, default=4, help="Number of GNN blocks")
     
     # 特征相关参数（通常固定，但为灵活性暴露）
-    parser.add_argument("--lig_atom_cont_count", type=int, default=9, help="Ligand atom continuous feature count")
-    parser.add_argument("--lig_mol_cont_count", type=int, default=9, help="Ligand molecule continuous feature count")
-    parser.add_argument("--pro_atom_cont_count", type=int, default=5, help="Protein atom continuous feature count")
+    parser.add_argument("--lig_atom_cont_count", type=int, default=len(LIGAND_ATOM_CONT_SCHEMA), help="Ligand atom continuous feature count")
+    parser.add_argument("--lig_mol_cont_count", type=int, default=len(LIGAND_MOLECULE_CONT_SCHEMA), help="Ligand molecule continuous feature count")
+    parser.add_argument("--pro_atom_cont_count", type=int, default=len(PROTEIN_ATOM_CONT_SCHEMA), help="Protein atom continuous feature count")
     parser.add_argument("--esm_dim", type=int, default=960, help="ESM embedding dimension (default: 960 for ESMC-300M)")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use for training (e.g., 'cuda:0', 'cuda:1', 'cpu')")
     parser.add_argument("--pocket_radius", type=float, default=10.0, help="Runtime local docking radius in angstroms (default: 10.0)")
@@ -204,8 +210,8 @@ def main():
     except Exception as e:
         raise ValueError(f"Invalid fusion search weights: {e}") from e
     
-    # 动态计算 pro_res_cont_count: 14 (扭转角) + esm_dim
-    args.pro_res_cont_count = 14 + args.esm_dim
+    # 动态计算 pro_res_cont_count: residue continuous schema + esm_dim
+    args.pro_res_cont_count = len(PROTEIN_RESIDUE_CONT_SCHEMA) + args.esm_dim
 
     # 配置 logging
     # 将日志保存在 logs/train 目录下，并使用时间戳防止覆盖
@@ -236,31 +242,14 @@ def main():
     logger.info(f"Run artifacts will be saved to {args.save_dir}")
     logger.info(f"Starting training with arguments: {args}")
 
-    # 加载归一化统计数据
+    # 归一化统计在 trainer 中按 train split 计算并缓存。
     stats_file = os.path.join(args.data_root, "normalization_stats.pt")
-    if not os.path.exists(stats_file):
-        logger.warning(f"Normalization stats not found at {stats_file}. Computing now...")
-        processed_dir = os.path.join(args.data_root, "processed")
-        
-        try:
-            # 确保 processed 目录存在
-            if not os.path.exists(processed_dir):
-                 logger.warning(f"Processed data dir {processed_dir} not found. Stats will be computed next time.")
-                 normalization_stats = None
-
-            else:
-                # 调用脚本计算
-                from scripts.compute_dataset_stats import compute_stats
-                compute_stats(processed_dir, stats_file)
-                normalization_stats = torch.load(stats_file, weights_only=False)
-                logger.info("Stats computed and loaded.")
-
-        except Exception as e:
-            logger.error(f"Failed to compute stats: {e}")
-            normalization_stats = None
-    else:
-        normalization_stats = torch.load(stats_file, weights_only=False)
-        logger.info(f"Loaded normalization stats from {stats_file}")
+    if os.path.exists(stats_file):
+        logger.info(
+            "Ignoring legacy global normalization stats at %s; trainer now computes train-split-only stats.",
+            stats_file,
+        )
+    normalization_stats = None
 
     try:
         train(

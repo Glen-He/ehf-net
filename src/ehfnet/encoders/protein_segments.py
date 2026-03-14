@@ -62,6 +62,40 @@ def _get_atom_position(res: MDAResidue, atom_name: str) -> np.ndarray | None:
     return None
 
 
+def continuity_break_reason(
+    prev_res: MDAResidue,
+    next_res: MDAResidue,
+    *,
+    max_cn_distance: float = PEPTIDE_CONTINUITY_CN_DISTANCE,
+) -> str | None:
+    """
+    给出两相邻 residue 不能视为同一条连续肽链的原因。
+    """
+
+    prev_segid, prev_chain = _residue_chain_tags(prev_res)
+    next_segid, next_chain = _residue_chain_tags(next_res)
+
+    if prev_chain and next_chain and prev_chain != next_chain:
+        return f"chain mismatch: {prev_chain} != {next_chain}"
+
+    if prev_segid and next_segid and prev_segid != next_segid:
+        return f"segid mismatch: {prev_segid} != {next_segid}"
+
+    c_prev = _get_atom_position(prev_res, "C")
+    if c_prev is None:
+        return "previous residue missing backbone atom C"
+
+    n_next = _get_atom_position(next_res, "N")
+    if n_next is None:
+        return "next residue missing backbone atom N"
+
+    cn_distance = float(np.linalg.norm(c_prev - n_next))
+    if cn_distance > max_cn_distance:
+        return f"C-N distance {cn_distance:.3f}A exceeds {max_cn_distance:.3f}A"
+
+    return None
+
+
 def is_peptide_continuous(
     prev_res: MDAResidue,
     next_res: MDAResidue,
@@ -77,22 +111,14 @@ def is_peptide_continuous(
     3. ||C_prev - N_next|| 必须小于阈值
     """
 
-    prev_segid, prev_chain = _residue_chain_tags(prev_res)
-    next_segid, next_chain = _residue_chain_tags(next_res)
-
-    if prev_chain and next_chain and prev_chain != next_chain:
-        return False
-
-    if prev_segid and next_segid and prev_segid != next_segid:
-        return False
-
-    c_prev = _get_atom_position(prev_res, "C")
-    n_next = _get_atom_position(next_res, "N")
-
-    if c_prev is None or n_next is None:
-        return False
-
-    return float(np.linalg.norm(c_prev - n_next)) <= max_cn_distance
+    return (
+        continuity_break_reason(
+            prev_res,
+            next_res,
+            max_cn_distance=max_cn_distance,
+        )
+        is None
+    )
 
 
 def segment_residues_by_continuity(

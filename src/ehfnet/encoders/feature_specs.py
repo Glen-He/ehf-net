@@ -6,6 +6,8 @@
 
 from typing import NamedTuple
 
+from ehfnet.encoders.chemistry import ResidueType
+
 
 class CatFeature(NamedTuple):
     """
@@ -42,12 +44,12 @@ LIGAND_ATOM_CAT_SCHEMA = [
     # 手性与立体化学
     CatFeature("chirality",                 4,  4,  "手性标签 (None, R, S, Other)"),
     CatFeature("is_chiral_center",          2,  2,  "是否为手性中心 [0, 1]"),
-    CatFeature("distance_to_nearest_chiral",10, 8,  "距离最近手性中心的拓扑距离 [0-9]"),
+    CatFeature("distance_to_nearest_chiral",11, 8,  "距离最近手性中心的拓扑距离桶：0=分子内无手性中心，1=自身为手性中心，2-10 表示距离 1-9+]"),
 
     # 环与拓扑结构
     CatFeature("is_aromatic",               2,  2,  "是否具有芳香性 [0, 1]"),
     CatFeature("is_in_ring",                2,  2,  "是否在环上 [0, 1]"),
-    CatFeature("smallest_ring_size",        10, 8,  "所属最小环的大小 [0-9]"),
+    CatFeature("smallest_ring_size",        11, 8,  "所属最小环大小桶：0=非环原子，3-10 表示环大小 3-10+]"),
     CatFeature("is_in_murcko_scaffold",     2,  2,  "是否属于 Murcko 骨架 [0, 1]"),
 
     # 键连接性统计
@@ -101,9 +103,45 @@ LIGAND_MOLECULE_CONT_SCHEMA = [
 ]
 
 
+# --- 蛋白质特征辅助常量 ---
+def _build_protein_atom_name_vocab() -> tuple[str, ...]:
+    names = {"UNK", "OXT"}
+
+    for res_type in ResidueType:
+        for atom_name in res_type.atom14:
+            if atom_name:
+                names.add(atom_name)
+
+    backbone_first = [
+        "N", "CA", "C", "O", "OXT",
+        "CB", "CG", "CG1", "CG2",
+        "CD", "CD1", "CD2",
+        "CE", "CE1", "CE2", "CE3",
+        "CZ", "CZ2", "CZ3", "CH2",
+        "ND1", "ND2", "NE", "NE1", "NE2", "NH1", "NH2", "NZ",
+        "OD1", "OD2", "OE1", "OE2", "OG", "OG1", "OH",
+        "SD", "SG",
+    ]
+    ordered = [name for name in backbone_first if name in names]
+    ordered.extend(sorted(name for name in names if name not in ordered))
+    return tuple(ordered)
+
+
+PROTEIN_ATOM_NAME_VOCAB = _build_protein_atom_name_vocab()
+PROTEIN_ATOM_NAME_TO_CLASS = {
+    name: idx for idx, name in enumerate(PROTEIN_ATOM_NAME_VOCAB)
+}
+
+PROTEIN_RESIDUE_TORSION_NAMES = (
+    "phi", "psi", "omega", "chi1", "chi2", "chi3", "chi4",
+)
+PROTEIN_RESIDUE_BACKBONE_ATOM_NAMES = ("N", "CA", "C", "O")
+
+
 # --- 蛋白质特征 Schema ---
 PROTEIN_ATOM_CAT_SCHEMA = [
     CatFeature("atomic_idx",                24, 16, "原子类型索引 (Element 枚举)"),
+    CatFeature("atom_name_class",           len(PROTEIN_ATOM_NAME_VOCAB), 12, "蛋白原子名类别"),
 ]
 
 
@@ -113,32 +151,62 @@ PROTEIN_ATOM_CONT_SCHEMA = [
     ContFeature("en_pauling",               "鲍林电负性"),
     ContFeature("electron_affinity",        "电子亲和能"),
     ContFeature("first_ionization_energy",  "第一电离能"),
+    ContFeature("is_backbone",              "是否为主链原子"),
+    ContFeature("is_sidechain",             "是否为侧链原子"),
+    ContFeature("is_alpha_carbon",          "是否为 CA 原子"),
+    ContFeature("is_donor_like",            "是否具有供体倾向"),
+    ContFeature("is_acceptor_like",         "是否具有受体倾向"),
+    ContFeature("is_aromatic_like",         "是否属于芳香体系"),
 ]
+PROTEIN_ATOM_SCALAR_DIM = 5
 
 
 PROTEIN_RESIDUE_CAT_SCHEMA = [
     CatFeature("residue_type",              21,   64, "残基类型 (20种氨基酸 + UNK)"),
-    CatFeature("residue_id",                4096, 32, "残基序列号 (截断到 4096 或相对位置)"),
 ]
 
+
+PROTEIN_RESIDUE_TORSION_CONT_SCHEMA = [
+    item
+    for name in PROTEIN_RESIDUE_TORSION_NAMES
+    for item in (
+        ContFeature(f"{name}_sin", f"{name.upper()} 角的正弦值"),
+        ContFeature(f"{name}_cos", f"{name.upper()} 角的余弦值"),
+    )
+]
+
+PROTEIN_RESIDUE_CONTEXT_CONT_SCHEMA = [
+    *[
+        ContFeature(f"{name}_valid", f"{name.upper()} 角是否可观测")
+        for name in PROTEIN_RESIDUE_TORSION_NAMES
+    ],
+    *[
+        ContFeature(
+            f"backbone_{name.lower()}_observed",
+            f"主链原子 {name} 是否被观测到",
+        )
+        for name in PROTEIN_RESIDUE_BACKBONE_ATOM_NAMES
+    ],
+    ContFeature("has_prev_contiguous",      "是否存在连续的前驱残基"),
+    ContFeature("has_next_contiguous",      "是否存在连续的后继残基"),
+    ContFeature("segment_rel_pos",          "在连续 segment 内的相对位置 [0, 1]"),
+    ContFeature("segment_centrality",       "在连续 segment 内的中心化位置 [-1, 1]"),
+    ContFeature("segment_length_norm",      "连续 segment 长度的归一化值"),
+]
 
 PROTEIN_RESIDUE_CONT_SCHEMA = [
-
-    # 骨架扭转角 (正弦/余弦编码)
-    ContFeature("phi_sin",                  "Phi 角的正弦值"),
-    ContFeature("phi_cos",                  "Phi 角的余弦值"),
-    ContFeature("psi_sin",                  "Psi 角的正弦值"),
-    ContFeature("psi_cos",                  "Psi 角的余弦值"),
-    ContFeature("omega_sin",                "Omega 角的正弦值"),
-    ContFeature("omega_cos",                "Omega 角的余弦值"),
-    
-    # 侧链扭转角
-    ContFeature("chi1_sin",                 "Chi1 角的正弦值"),
-    ContFeature("chi1_cos",                 "Chi1 角的余弦值"),
-    ContFeature("chi2_sin",                 "Chi2 角的正弦值"),
-    ContFeature("chi2_cos",                 "Chi2 角的余弦值"),
-    ContFeature("chi3_sin",                 "Chi3 角的正弦值"),
-    ContFeature("chi3_cos",                 "Chi3 角的余弦值"),
-    ContFeature("chi4_sin",                 "Chi4 角的正弦值"),
-    ContFeature("chi4_cos",                 "Chi4 角的余弦值"),
+    *PROTEIN_RESIDUE_TORSION_CONT_SCHEMA,
+    *PROTEIN_RESIDUE_CONTEXT_CONT_SCHEMA,
 ]
+
+PROTEIN_RESIDUE_TORSION_DIM = len(PROTEIN_RESIDUE_TORSION_CONT_SCHEMA)
+PROTEIN_RESIDUE_CONTEXT_DIM = len(PROTEIN_RESIDUE_CONTEXT_CONT_SCHEMA)
+PROTEIN_RESIDUE_TORSION_VALID_START = PROTEIN_RESIDUE_TORSION_DIM
+PROTEIN_RESIDUE_TORSION_VALID_DIM = len(PROTEIN_RESIDUE_TORSION_NAMES)
+PROTEIN_RESIDUE_BACKBONE_OBSERVED_START = (
+    PROTEIN_RESIDUE_TORSION_VALID_START + PROTEIN_RESIDUE_TORSION_VALID_DIM
+)
+PROTEIN_RESIDUE_BACKBONE_OBSERVED_DIM = len(PROTEIN_RESIDUE_BACKBONE_ATOM_NAMES)
+PROTEIN_RESIDUE_STRUCTURE_START = (
+    PROTEIN_RESIDUE_BACKBONE_OBSERVED_START + PROTEIN_RESIDUE_BACKBONE_OBSERVED_DIM
+)

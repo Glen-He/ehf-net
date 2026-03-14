@@ -316,6 +316,12 @@ class PredictionHead(nn.Module):
         B = lig_mol_feat.size(0)
         N_lig = lig_atom_feat.size(0)
         N_pro = pro_atom_feat.size(0)
+        atom_counts = scatter_add(
+            torch.ones(N_lig, device=device, dtype=torch.float32),
+            lig_batch,
+            dim=0,
+            dim_size=B,
+        ).clamp(min=1.0)
 
         # 边界情况
         if N_lig == 0 or N_pro == 0:
@@ -408,10 +414,29 @@ class PredictionHead(nn.Module):
         # ReLU 保证只有小于阈值的距离才产生惩罚；平方保证梯度平滑无跳跃
         _clash_threshold = 2.0
         clash_edge = torch.nn.functional.relu(_clash_threshold - dist).pow(2)   # [E]
-        # 映射边 → 配体原子 → 分子，得到每分子的总体碰撞量 [B]
-        steric_clash_batch = scatter_add(
-            clash_edge, lig_batch[i_idx], dim=0, dim_size=B
+        edge_count_per_atom = scatter_add(
+            torch.ones_like(dist, dtype=torch.float32),
+            i_idx,
+            dim=0,
+            dim_size=N_lig,
+        ).clamp(min=1.0)
+        clash_per_atom = scatter_add(
+            clash_edge.float(),
+            i_idx,
+            dim=0,
+            dim_size=N_lig,
+        ) / edge_count_per_atom
+        steric_clash_batch = (
+            scatter_add(clash_per_atom, lig_batch, dim=0, dim_size=B) / atom_counts
         ).float()
+        clash_hotspot_batch = torch.zeros(B, device=device, dtype=torch.float32)
+        clash_hotspot_batch.scatter_reduce_(
+            0,
+            lig_batch,
+            clash_per_atom,
+            reduce="amax",
+            include_self=True,
+        )
         cutoff_weights = self.cutoff_fn(dist)
 
         # 当全部边都落在 cutoff 外时，启用长程衰减权重，避免“有边无信号”
@@ -441,9 +466,6 @@ class PredictionHead(nn.Module):
         E_lig_atom = scatter_add(E_ij.float(), i_idx, dim=0, dim_size=N_lig) / edge_mass_per_atom
 
         E_physical_sum = scatter_add(E_lig_atom, lig_batch, dim=0, dim_size=B)
-        atom_counts = scatter_add(
-            torch.ones(N_lig, device=device, dtype=torch.float32), lig_batch, dim=0, dim_size=B
-        )
         E_physical = E_physical_sum / atom_counts.clamp(min=1.0)
 
         # 交叉注意力
@@ -525,9 +547,12 @@ class PredictionHead(nn.Module):
             min_dist_per_lig, lig_batch, dim=0, dim_size=B
         ) / atom_counts.clamp(min=1)
 
-        dist_mean_edge = scatter_add(dist.float(), lig_batch[i_idx], dim=0, dim_size=B) / atom_counts.clamp(min=1)
-        dist_sq_edge = scatter_add(dist.float().pow(2), lig_batch[i_idx], dim=0, dim_size=B) / atom_counts.clamp(min=1)
-        dist_std_edge = (dist_sq_edge - dist_mean_edge.pow(2)).clamp(min=0).sqrt()
+        dist_per_atom = scatter_add(dist.float(), i_idx, dim=0, dim_size=N_lig) / edge_count_per_atom
+        dist_sq_per_atom = scatter_add(dist.float().pow(2), i_idx, dim=0, dim_size=N_lig) / edge_count_per_atom
+        dist_std_per_atom = (dist_sq_per_atom - dist_per_atom.pow(2)).clamp(min=0).sqrt()
+
+        dist_mean_edge = scatter_add(dist_per_atom, lig_batch, dim=0, dim_size=B) / atom_counts
+        dist_std_edge = scatter_add(dist_std_per_atom, lig_batch, dim=0, dim_size=B) / atom_counts
 
         geo_features = torch.cat([
             centroid_dist,
@@ -535,7 +560,7 @@ class PredictionHead(nn.Module):
             dist_mean_edge.unsqueeze(-1),
             dist_std_edge.unsqueeze(-1),
             (atom_counts / 50.0).unsqueeze(-1),
-            (steric_clash_batch / atom_counts.clamp(min=1)).unsqueeze(-1),
+            clash_hotspot_batch.unsqueeze(-1),
         ], dim=-1)
 
         pose_quality_input = torch.cat(

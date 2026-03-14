@@ -66,7 +66,7 @@ def clean_esm_cache(data_root: str, dry_run: bool = False) -> tuple[int, float]:
 
 def clean_processed_folder(data_root: str, dry_run: bool = False) -> tuple[bool, float]:
     """
-    Clean the entire 'processed' folder.
+    Clean all versioned processed folders.
     
     Args:
         data_root: Path to data/processed/pdbbind
@@ -77,30 +77,39 @@ def clean_processed_folder(data_root: str, dry_run: bool = False) -> tuple[bool,
     """
 
     root = Path(data_root)
-    processed_dir = root / "processed"
-    
-    if not processed_dir.exists():
+    processed_dirs = sorted(
+        path for path in root.glob("processed*")
+        if path.is_dir()
+    )
+
+    if not processed_dirs:
         return True, 0.0
-        
-    # 计算大小
-    files = list(processed_dir.rglob("*"))
+
+    files = [file for directory in processed_dirs for file in directory.rglob("*")]
     size_bytes = sum(f.stat().st_size for f in files if f.is_file())
     size_mb = size_bytes / (1024 * 1024)
-    
-    logger.info(f"Found processed folder: {len(files)} files ({size_mb:.2f} MB)")
-    
+
+    logger.info(
+        "Found %d processed folders: %s (%d files, %.2f MB)",
+        len(processed_dirs),
+        ", ".join(str(path.name) for path in processed_dirs),
+        len(files),
+        size_mb,
+    )
+
     if dry_run:
-        logger.info(f"[DRY RUN] Would delete: {processed_dir}")
+        for directory in processed_dirs:
+            logger.info(f"[DRY RUN] Would delete: {directory}")
         return False, size_mb
-        
-    logger.info(f"Deleting processed folder: {processed_dir}")
-    
+
     try:
-        shutil.rmtree(processed_dir)
-        logger.info("✓ Processed folder deleted successfully")
+        for directory in processed_dirs:
+            logger.info(f"Deleting processed folder: {directory}")
+            shutil.rmtree(directory)
+        logger.info("✓ Processed folders deleted successfully")
         return True, size_mb
     except Exception as e:
-        logger.error(f"Failed to delete {processed_dir}: {e}")
+        logger.error(f"Failed to delete processed folders: {e}")
         return False, 0.0
 
 

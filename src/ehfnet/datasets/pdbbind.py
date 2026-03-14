@@ -8,12 +8,14 @@ import os
 import os.path as osp
 import logging
 import zlib
+import json
 import torch
 import pandas as pd
 
 from torch import Tensor
 from tqdm import tqdm
 from collections.abc import Callable
+from collections import Counter
 from typing import Any, cast, overload
 
 from rdkit.Chem import ChemicalFeatures, RDConfig
@@ -24,11 +26,30 @@ from ehfnet.graph import GraphBuilder, ESMEmbeddingFiller
 from ehfnet.graph.pocket_features import build_pocket_features, pocket_feature_dim
 from ehfnet.datasets.prepare import prepare_graph, get_esm_model
 from ehfnet.datasets.pose_initialization import generate_decoupled_ligand_positions
+from ehfnet.datasets.ligand_sanitize import LigandSanitizationError
 
 
 logger = logging.getLogger(__name__)
 
-ESM_CACHE_VERSION_TAG = "chainseg_v2"
+ESM_CACHE_VERSION_TAG = "chainseg_v3"
+GRAPH_CACHE_VERSION_TAG = "feature_v2"
+PREPROCESS_SUMMARY_FILENAME = "preprocess_summary.json"
+PREPROCESS_METADATA_DIRNAME = "_preprocess_meta"
+
+
+def _normalize_ligand_sanitize_mode(mode: Any) -> str:
+    value = str(mode).strip().lower() if mode is not None else "unknown"
+    return value if value in {"full", "partial", "rejected", "unknown"} else "unknown"
+
+
+def _extract_ligand_sanitize_metadata(data: HeteroData) -> dict[str, Any]:
+    mode = _normalize_ligand_sanitize_mode(getattr(data, "ligand_sanitize_mode", "unknown"))
+    return {
+        "ligand_sanitize_mode": mode,
+        "ligand_partial_sanitize": bool(getattr(data, "ligand_partial_sanitize", mode == "partial")),
+        "ligand_full_sanitize_flag": int(getattr(data, "ligand_full_sanitize_flag", -1)),
+        "ligand_partial_sanitize_flag": int(getattr(data, "ligand_partial_sanitize_flag", -1)),
+    }
 
 
 def load_index(index_file: str) -> pd.DataFrame:
@@ -226,28 +247,48 @@ class PDBBindDataset(Dataset):
         )
 
         self._esm_model = None
-        
-        # [新增] 计算亲和力统计数据用于归一化
-        self.affinity_stats = self._compute_affinity_stats()
 
         super().__init__(root, transform, pre_transform, pre_filter)
         self._build_valid_index()
+        self.affinity_stats = self.compute_affinity_stats()
 
 
-    def _compute_affinity_stats(self) -> dict[str, float]:
+    def compute_affinity_stats(self, indices: list[int] | None = None) -> dict[str, float]:
         """
         计算亲和力标签的均值和标准差。
+
+        Args:
+            indices: Dataset 索引子集；为空时使用全部有效样本
         """
         if self.index_df.empty:
             return {"mean": 0.0, "std": 1.0}
-            
-        affinities = self.index_df["affinity"].to_numpy(dtype=float)
+
+        if indices is None:
+            pdb_ids = self._valid_pdb_ids
+        else:
+            if not indices:
+                return {"mean": 0.0, "std": 1.0}
+            pdb_ids = [self._valid_pdb_ids[int(i)] for i in indices]
+
+        affinities = self.index_df[self.index_df["pdb_id"].isin(pdb_ids)]["affinity"].to_numpy(dtype=float)
+        if affinities.size == 0:
+            return {"mean": 0.0, "std": 1.0}
         mean = float(affinities.mean())
         std = float(affinities.std())
         std = max(std, 1e-3)
-        
-        logger.info(f"Affinity stats: mean={mean:.4f}, std={std:.4f}")
+
         return {"mean": mean, "std": std}
+
+
+    def set_affinity_stats(self, stats: dict[str, float]) -> None:
+        """
+        更新运行期使用的 affinity 归一化统计。
+        """
+
+        self.affinity_stats = {
+            "mean": float(stats.get("mean", 0.0)),
+            "std": max(float(stats.get("std", 1.0)), 1e-3),
+        }
 
     @overload
     def denormalize_affinity(self, val: Tensor) -> Tensor: ...
@@ -267,8 +308,8 @@ class PDBBindDataset(Dataset):
     @property
     def processed_dir(self) -> str:
         if self.pocket_radius is None:
-            return osp.join(self.root, "processed_full")
-        return osp.join(self.root, "processed")
+            return osp.join(self.root, f"processed_full_{GRAPH_CACHE_VERSION_TAG}")
+        return osp.join(self.root, f"processed_{GRAPH_CACHE_VERSION_TAG}")
 
     @property
     def raw_file_names(self) -> list[str]:
@@ -288,6 +329,56 @@ class PDBBindDataset(Dataset):
 
         return [f"data_{pdb_id}.pt" for pdb_id in self.index_df["pdb_id"]]
 
+    @property
+    def preprocess_metadata_dir(self) -> str:
+        return osp.join(self.processed_dir, PREPROCESS_METADATA_DIRNAME)
+
+    @property
+    def preprocess_summary_path(self) -> str:
+        return osp.join(self.processed_dir, PREPROCESS_SUMMARY_FILENAME)
+
+    def _preprocess_metadata_path(self, pdb_id: str) -> str:
+        return osp.join(self.preprocess_metadata_dir, f"{pdb_id}.json")
+
+    def _write_preprocess_metadata(self, pdb_id: str, metadata: dict[str, Any]) -> None:
+        os.makedirs(self.preprocess_metadata_dir, exist_ok=True)
+        with open(self._preprocess_metadata_path(pdb_id), "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=True, indent=2, sort_keys=True)
+
+    def _load_cached_preprocess_metadata(self, pdb_id: str) -> dict[str, Any] | None:
+        metadata_path = self._preprocess_metadata_path(pdb_id)
+        if not osp.exists(metadata_path):
+            return None
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+        except Exception as exc:
+            logger.warning("Failed to read preprocess metadata for %s: %s", pdb_id, exc)
+            return None
+
+        payload["ligand_sanitize_mode"] = _normalize_ligand_sanitize_mode(
+            payload.get("ligand_sanitize_mode")
+        )
+        return payload
+
+    def _load_or_recover_preprocess_metadata(self, pdb_id: str, graph_path: str) -> dict[str, Any]:
+        cached = self._load_cached_preprocess_metadata(pdb_id)
+        if cached is not None:
+            return cached
+
+        data = cast(
+            HeteroData,
+            torch.load(graph_path, map_location="cpu", weights_only=False),
+        )
+        metadata = _extract_ligand_sanitize_metadata(data)
+        self._write_preprocess_metadata(pdb_id, metadata)
+        return metadata
+
+    def _write_preprocess_summary(self, summary: dict[str, Any]) -> None:
+        os.makedirs(self.processed_dir, exist_ok=True)
+        with open(self.preprocess_summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=True, indent=2, sort_keys=True)
+
     def download(self) -> None:
         return None
 
@@ -304,7 +395,17 @@ class PDBBindDataset(Dataset):
 
         success_count = 0
         skip_count = 0
+        filtered_count = 0
         error_count = 0
+        other_failure_count = 0
+        sanitize_counts: Counter[str] = Counter(
+            {
+                "full": 0,
+                "partial": 0,
+                "rejected": 0,
+                "unknown": 0,
+            }
+        )
 
         for _, row in tqdm(self.index_df.iterrows(), total=total, desc="Processing"):
             pdb_id = row["pdb_id"]
@@ -312,6 +413,12 @@ class PDBBindDataset(Dataset):
             out_path = osp.join(self.processed_dir, f"data_{pdb_id}.pt")
 
             if not self.force_reprocess and osp.exists(out_path):
+                try:
+                    metadata = self._load_or_recover_preprocess_metadata(pdb_id, out_path)
+                    sanitize_counts[_normalize_ligand_sanitize_mode(metadata.get("ligand_sanitize_mode"))] += 1
+                except Exception as exc:
+                    logger.warning("Failed to recover sanitize metadata for cached sample %s: %s", pdb_id, exc)
+                    sanitize_counts["unknown"] += 1
                 skip_count += 1
                 continue
 
@@ -319,25 +426,84 @@ class PDBBindDataset(Dataset):
                 data = self._process_one(pdb_id, affinity)
 
                 if data is None:
+                    sanitize_counts["unknown"] += 1
                     error_count += 1
+                    other_failure_count += 1
                     continue
 
+                metadata = _extract_ligand_sanitize_metadata(data)
+                sanitize_counts[metadata["ligand_sanitize_mode"]] += 1
+
                 if self.pre_filter is not None and not self.pre_filter(data):
+                    filtered_count += 1
                     continue
 
                 if self.pre_transform is not None:
                     data = self.pre_transform(data)
 
                 torch.save(data, out_path)
+                self._write_preprocess_metadata(pdb_id, metadata)
                 success_count += 1
 
+            except LigandSanitizationError as exc:
+                self._write_preprocess_metadata(
+                    pdb_id,
+                    {
+                        "ligand_sanitize_mode": "rejected",
+                        "ligand_partial_sanitize": False,
+                        "ligand_full_sanitize_flag": exc.full_flag,
+                        "ligand_partial_sanitize_flag": (
+                            -1 if exc.partial_flag is None else exc.partial_flag
+                        ),
+                    },
+                )
+                logger.warning("Ligand sanitize rejected %s: %s", pdb_id, exc)
+                sanitize_counts["rejected"] += 1
+                error_count += 1
             except Exception as e:
                 logger.warning(f"Error processing {pdb_id}: {e}")
+                sanitize_counts["unknown"] += 1
                 error_count += 1
+                other_failure_count += 1
+
+        summary = {
+            "graph_cache_version": GRAPH_CACHE_VERSION_TAG,
+            "esm_cache_version": ESM_CACHE_VERSION_TAG,
+            "processed_dir": osp.abspath(self.processed_dir),
+            "index_file": osp.abspath(self.index_file),
+            "force_reprocess": bool(self.force_reprocess),
+            "totals": {
+                "indexed": total,
+                "success": success_count,
+                "cached": skip_count,
+                "filtered": filtered_count,
+                "errors": error_count,
+                "other_failures": other_failure_count,
+            },
+            "ligand_sanitize": {
+                "full": int(sanitize_counts["full"]),
+                "partial": int(sanitize_counts["partial"]),
+                "rejected": int(sanitize_counts["rejected"]),
+                "unknown": int(sanitize_counts["unknown"]),
+            },
+        }
+        self._write_preprocess_summary(summary)
 
         logger.info(
-            f"Processing complete: {success_count} success, {skip_count} cached, {error_count} errors"
+            "Processing complete: %d success, %d cached, %d filtered, %d errors",
+            success_count,
+            skip_count,
+            filtered_count,
+            error_count,
         )
+        logger.info(
+            "Ligand sanitize summary: full=%d partial=%d rejected=%d unknown=%d",
+            sanitize_counts["full"],
+            sanitize_counts["partial"],
+            sanitize_counts["rejected"],
+            sanitize_counts["unknown"],
+        )
+        logger.info("Preprocess summary written to %s", self.preprocess_summary_path)
 
         # 释放 ESM 模型显存，因为它在训练阶段不再需要
         if self._esm_model is not None:
@@ -523,6 +689,8 @@ class PDBBindDataset(Dataset):
                 residue_x_cont=data["protein_residue"].x_cont,
                 residue_pos=data["protein_residue"].pos,
                 protein_atom_pos=data["protein_atom"].pos,
+                residue_esm_missing_mask=getattr(data["protein_residue"], "esm_missing_mask", None),
+                esm_feature_start=self.graph_builder._residue_esm_feature_start,
             )
             data["protein_pocket"].num_nodes = int(data["protein_pocket"].x_cont.size(0))
 
