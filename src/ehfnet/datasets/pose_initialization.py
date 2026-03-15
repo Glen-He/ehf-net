@@ -15,10 +15,6 @@ from rdkit.Chem import AllChem
 
 from ehfnet.datasets.ligand_sanitize import load_ligand_mol
 
-def load_ligand_for_initialization(ligand_path: str):
-    return load_ligand_mol(ligand_path, remove_hs=False, require_conformer=False)
-
-
 def remove_all_hs_safe(mol: Chem.Mol) -> Chem.Mol:
     mol_no_h = Chem.RemoveHs(mol, sanitize=True)
     return AllChem.RemoveAllHs(mol_no_h)
@@ -41,7 +37,7 @@ def generate_decoupled_ligand_positions(
     这里不使用真实 pose 做插值起点，只从分子拓扑重新嵌入 3D 构象。
     """
 
-    mol_file = load_ligand_for_initialization(ligand_path)
+    mol_file = load_ligand_mol(ligand_path, remove_hs=False, require_conformer=False)
     start_mol = copy.deepcopy(mol_file)
     start_mol.RemoveAllConformers()
     start_mol = AllChem.AddHs(start_mol, addCoords=True)

@@ -1,18 +1,18 @@
 # EHFNet default training config
-# Code keeps built-in defaults; this file overrides the high-frequency knobs.
+# 模型内部参数（RBF、几何、碰撞、边、预测头）在 model.toml 中配置
 
 [data]
-data_root = "data/processed/pdbbind"
-index_file = "data/processed/pdbbind/index.csv"
+# 本地自定义：改成你的预处理输出目录（该目录内必须包含 index.csv，不允许自定义 index 路径）
+data_root = "data/processed/hiqbind"
+model_config = "configs/model.toml"
 save_dir = "./checkpoints"
 device = "cuda:0"
-protein_context_mode = "full"
 
 [model]
 hidden_dim = 128
 num_gnn_blocks = 4
 esm_dim = 960
-pocket_radius = 10.0
+crop_radius = 10.0
 
 [training]
 epochs = 100

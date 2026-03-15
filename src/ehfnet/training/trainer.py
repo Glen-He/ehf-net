@@ -29,7 +29,7 @@ from torch_scatter import scatter_mean
 
 from ehfnet.models import EHFNet
 from ehfnet.graph import GraphCollator, crop_graph_to_center
-from ehfnet.datasets.pdbbind import PDBBindDataset
+from ehfnet.datasets.protein_ligand import GRAPH_CACHE_DIRNAME, ProteinLigandDataset
 from ehfnet.datasets.splitter import ScaffoldSplitter
 from ehfnet.encoders.feature_specs import (
     LIGAND_ATOM_CONT_SCHEMA,
@@ -57,6 +57,7 @@ from ehfnet.training.checkpoint_schema import (
     build_feature_signature,
     build_model_config,
 )
+from ehfnet.training.rerank_losses import pairwise_ranking_loss_from_pairs
 
 
 logger = logging.getLogger(__name__)
@@ -311,7 +312,7 @@ def _finalize_feature_stats(
 
 
 def _compute_train_split_normalization_stats(
-    dataset: PDBBindDataset,
+    dataset: ProteinLigandDataset,
     train_indices: list[int],
     *,
     split_cache_file: str,
@@ -561,28 +562,6 @@ def select_training_crop_centers(
     return torch.stack(chosen_centers, dim=0), chosen_modes
 
 
-def compute_pairwise_pose_ranking_loss(
-    pose_logit_a: torch.Tensor,
-    pose_target_a: torch.Tensor,
-    pose_logit_b: torch.Tensor,
-    pose_target_b: torch.Tensor,
-    *,
-    margin: float,
-    min_delta: float = 0.05,
-    extra_mask: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, int]:
-    qa = pose_target_a.view(-1)
-    qb = pose_target_b.view(-1)
-    sa = pose_logit_a.view(-1)
-    sb = pose_logit_b.view(-1)
-    delta = qa - qb
-    valid = delta.abs() >= min_delta
-    if extra_mask is not None:
-        valid = valid & extra_mask.view(-1).to(device=valid.device, dtype=torch.bool)
-    if not bool(valid.any()):
-        return sa.new_zeros(()), 0
-    direction = torch.sign(delta[valid])
-    return F.relu(margin - direction * (sa[valid] - sb[valid])).mean(), int(valid.sum().item())
 
 
 def select_wrong_center_candidates(
@@ -688,17 +667,6 @@ def sample_hard_ranking_time_and_centers(
     sigma = 1e-3
     t_hard = t_hard.clamp(min=sigma, max=1.0 - sigma)
     return t_hard, hard_centers, strategy_id
-
-
-def clone_shares_tensor_storage(batch_obj: Any, node_type: str = "ligand_atom", attr: str = "pos") -> bool:
-    cloned = batch_obj.clone()
-    original_tensor = batch_obj[node_type][attr]
-    cloned_tensor = cloned[node_type][attr]
-    return bool(
-        torch.is_tensor(original_tensor)
-        and torch.is_tensor(cloned_tensor)
-        and original_tensor.data_ptr() == cloned_tensor.data_ptr()
-    )
 
 
 def summarize_blind_candidate_records(
@@ -979,9 +947,15 @@ def train(
     pro_atom_cont_count: int = len(PROTEIN_ATOM_CONT_SCHEMA),
     pro_res_cont_count: int = len(PROTEIN_RESIDUE_CONT_SCHEMA) + 960,
     esm_dim: int = 960,
+    num_rbf: int = 50,
+    r_cutoff: float = 10.0,
+    force_cutoff: float = 6.0,
+    dynamic_inter_cutoff: float = 10.0,
+    dynamic_inter_knn_k: int = 8,
+    dynamic_residue_cutoff: float = 14.0,
+    dynamic_residue_knn_k: int = 6,
     device: str | torch.device = "auto",
-    pocket_radius: float | None = 10.0,
-    protein_context_mode: str = "full",
+    crop_radius: float = 10.0,
     normalization_stats: dict | None = None,
     warmup_epochs: int = 20,
     rmsd_check_ratio: float = 0.2,
@@ -1048,7 +1022,7 @@ def train(
     训练 EHFNet 模型
 
     Args:
-        data_root: PDBBind 数据根目录
+        data_root: 蛋白-配体数据集根目录（含 cleaned/ 与 index.csv）
         index_file: 索引 CSV 文件路径
         save_dir: 模型保存目录
         esm_path: 预计算的 ESM 嵌入路径
@@ -1065,8 +1039,7 @@ def train(
         pro_res_cont_count: 蛋白残基连续特征数量
         esm_dim: ESM embedding 维度
         device: 训练设备 ("cpu", "cuda", "cuda:0", "cuda:1" 等)，默认为 "auto" (自动检测)
-        pocket_radius: 运行时局部 docking 半径 (Å)
-        protein_context_mode: 蛋白上下文缓存模式，full 表示缓存全蛋白并在运行时裁剪
+        crop_radius: 运行时局部裁剪半径 (Å)
         normalization_stats: 保留兼容参数；运行时会统一改用 train split 统计
         warmup_epochs: 空间课程学习预热轮数
         rmsd_check_ratio: 验证集中计算 RMSD 的样本比例 (0.0 ~ 1.0)
@@ -1127,18 +1100,15 @@ def train(
     # 2. 准备数据
     logger.info("Initializing Dataset...")
     collator = GraphCollator(follow_batch=["ligand_atom", "protein_atom"])
-    if protein_context_mode not in {"full", "pocket"}:
-        raise ValueError("protein_context_mode must be 'full' or 'pocket'.")
 
     interaction_profile = "atom_only" if ablation_mode == "inter_multiscale_off" else "full"
 
-    dataset = PDBBindDataset(
+    dataset = ProteinLigandDataset(
         root=data_root,
         index_file=index_file,
         esm_root=esm_path,
         esm="auto",
         esm_dim=esm_dim,
-        pocket_radius=None if protein_context_mode == "full" else pocket_radius,
         interaction_profile=interaction_profile,
     )
     graph_builder = dataset.graph_builder
@@ -1432,6 +1402,13 @@ def train(
             pro_res_cont_count=pro_res_cont_count,
             esm_dim=esm_dim,
             interaction_profile=interaction_profile,
+            num_rbf=num_rbf,
+            r_cutoff=r_cutoff,
+            force_cutoff=force_cutoff,
+            dynamic_inter_cutoff=dynamic_inter_cutoff,
+            dynamic_inter_knn_k=dynamic_inter_knn_k,
+            dynamic_residue_cutoff=dynamic_residue_cutoff,
+            dynamic_residue_knn_k=dynamic_residue_knn_k,
         )
         return {
             "epoch": epoch_idx,
@@ -1450,6 +1427,7 @@ def train(
             "val_metrics": dict(val_metrics_obj),
             "selection_metrics": dict(selection_metrics),
             "fusion_weights": dict(current_fusion_weights),
+            "normalization_stats": normalization_stats,
         }
 
     effective_min_train_nodes_per_batch = max(1, int(min_max_nodes_per_batch))
@@ -1592,6 +1570,13 @@ def train(
         pro_res_cont_count=pro_res_cont_count,
         interaction_profile=interaction_profile,
         normalization_stats=normalization_stats,
+        num_rbf=num_rbf,
+        r_cutoff=r_cutoff,
+        force_cutoff=force_cutoff,
+        dynamic_inter_cutoff=dynamic_inter_cutoff,
+        dynamic_inter_knn_k=dynamic_inter_knn_k,
+        dynamic_residue_cutoff=dynamic_residue_cutoff,
+        dynamic_residue_knn_k=dynamic_residue_knn_k,
     ).to(device)
 
     matcher = ConditionalFlowMatcher(
@@ -1709,7 +1694,8 @@ def train(
         actual_batches = 0
         epoch_oom_batches = 0
         epoch_edge_guard_skips = 0
-        accumulated_graphs = 0  # 当前累积周期内的总图数
+        accumulated_graphs = 0   # 当前累积周期内的总图数
+        accumulated_batches = 0  # 当前累积周期内成功处理的 batch 数（跳过的 batch 不计入）
         consecutive_oom = 0     # 连续 OOM 计数，用于级联熔断
         CIRCUIT_BREAKER_LIMIT = 10  # 连续 OOM 达到此值则熔断当前 epoch
         ENERGY_NAN_FAILFAST_LIMIT = 8
@@ -1763,10 +1749,6 @@ def train(
                 source_batch = batch
                 if not clone_safety_checked:
                     clone_safety_checked = True
-                    logger.info(
-                        "HeteroData.clone() tensor storage check | shared_ligand_pos=%s",
-                        clone_shares_tensor_storage(source_batch),
-                    )
                 ligand_centers = scatter_mean(
                     source_batch["ligand_atom"].pos,
                     source_batch["ligand_atom"].batch,
@@ -1811,26 +1793,22 @@ def train(
                     graph_logits = proposal_logits_cpu[graph_mask]
                     if graph_logits.numel() > 0:
                         proposal_top_scores_cpu[graph_idx] = graph_logits.max()
-                if ablation_mode == "gt_only_crop":
-                    crop_centers_cpu = ligand_centers.detach().cpu()
-                    crop_modes = ["gt_forced"] * num_graphs
-                else:
-                    crop_centers_cpu, crop_modes = select_training_crop_centers(
-                        ligand_centers.detach().cpu(),
-                        proposal_logits_cpu,
-                        residue_pos_cpu,
-                        residue_batch_cpu,
-                        progress=train_progress,
-                        positive_radius=center_positive_radius,
-                        bucket_topk=crop_candidate_topk,
-                        weighted_sampling=True,
-                        disable_jitter=disable_jitter_crop,
-                        disable_hard_negative=disable_hard_negative_crop,
-                    )
+                crop_centers_cpu, crop_modes = select_training_crop_centers(
+                    ligand_centers.detach().cpu(),
+                    proposal_logits_cpu,
+                    residue_pos_cpu,
+                    residue_batch_cpu,
+                    progress=train_progress,
+                    positive_radius=center_positive_radius,
+                    bucket_topk=crop_candidate_topk,
+                    weighted_sampling=True,
+                    disable_jitter=disable_jitter_crop,
+                    disable_hard_negative=disable_hard_negative_crop,
+                )
                 local_batch = build_local_batch_from_centers(
                     source_batch,
                     centers=crop_centers_cpu,
-                    crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+                    crop_radius=float(crop_radius),
                     graph_builder=graph_builder,
                     collator=collator,
                 )
@@ -1918,7 +1896,7 @@ def train(
                         same_center_pred = model(same_center_batch, t_same)
                         pose_quality_same = compute_pose_quality_target(x_t_same, x_1, batch["ligand_atom"].batch)
                         same_center_rank_logit = select_pose_ranking_logit(same_center_pred)
-                        loss_same, count_same = compute_pairwise_pose_ranking_loss(
+                        loss_same, count_same = pairwise_ranking_loss_from_pairs(
                             current_rank_logit,
                             targets["pose_quality_target"],
                             same_center_rank_logit,
@@ -1934,7 +1912,7 @@ def train(
                             wrong_local_batch = build_local_batch_from_centers(
                                 source_batch,
                                 centers=wrong_centers_cpu,
-                                crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+                                crop_radius=float(crop_radius),
                                 graph_builder=graph_builder,
                                 collator=collator,
                             ).to(device)
@@ -1971,7 +1949,7 @@ def train(
                             low_clash_mask = wrong_center_valid & (
                                 wrong_clash.view(-1) <= (anchor_clash.view(-1) + 1.0)
                             )
-                            loss_wrong, count_wrong = compute_pairwise_pose_ranking_loss(
+                            loss_wrong, count_wrong = pairwise_ranking_loss_from_pairs(
                                 current_rank_logit,
                                 targets["pose_quality_target"],
                                 wrong_rank_logit,
@@ -1986,7 +1964,7 @@ def train(
                             misleading_center_mask = low_clash_mask & (
                                 wrong_center_scores >= (proposal_top_scores - 0.25)
                             )
-                            loss_center_hard, count_center_hard = compute_pairwise_pose_ranking_loss(
+                            loss_center_hard, count_center_hard = pairwise_ranking_loss_from_pairs(
                                 current_rank_logit,
                                 targets["pose_quality_target"],
                                 wrong_rank_logit,
@@ -2004,7 +1982,7 @@ def train(
                                 misleading_aff_mask = low_clash_mask & (
                                     wrong_aff.view(-1) >= (anchor_aff.view(-1) - 0.25)
                                 )
-                                loss_aff_hard, count_aff_hard = compute_pairwise_pose_ranking_loss(
+                                loss_aff_hard, count_aff_hard = pairwise_ranking_loss_from_pairs(
                                     current_rank_logit,
                                     targets["pose_quality_target"],
                                     wrong_rank_logit,
@@ -2059,7 +2037,7 @@ def train(
                         ode_steps=pose_bootstrap_ode_steps,
                         graph_builder=graph_builder,
                         collator=collator,
-                        crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+                        crop_radius=float(crop_radius),
                     )
                     loss_dict["loss_pose_bootstrap"] = loss_pose_bootstrap.detach()
 
@@ -2164,11 +2142,12 @@ def train(
             consecutive_oom = 0
             actual_batches += 1
             accumulated_graphs += num_graphs
+            accumulated_batches += 1
 
-            # 仅在完成一个完整累积周期后才更新参数
-            is_last_in_cycle = (batch_idx + 1) % accumulation_steps == 0
+            # 仅在完成一个完整累积周期后才更新参数（基于实际成功处理的 batch 数，跳过的 batch 不计入）
+            is_last_in_cycle = accumulated_batches >= accumulation_steps and accumulated_graphs > 0
 
-            if is_last_in_cycle and accumulated_graphs > 0:
+            if is_last_in_cycle:
                 
                 # 将累积梯度除以真实图总数，得到无偏的样本级平均梯度
                 for param in model.parameters():
@@ -2196,6 +2175,7 @@ def train(
                 # 清零梯度和计数器，开始新的累积周期
                 optimizer.zero_grad()
                 accumulated_graphs = 0
+                accumulated_batches = 0
 
             # 记录日志
             train_loss_meter += loss.item()
@@ -2389,7 +2369,7 @@ def train(
             warmup_epochs=warmup_epochs,
             graph_builder=graph_builder,
             collator=collator,
-            crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+            crop_radius=float(crop_radius),
             center_proposal_weight=center_proposal_weight,
             center_positive_radius=center_positive_radius,
             # [修复] edge_guard 应基于实际的 val_edge_budget 并预留动态边余量
@@ -2416,7 +2396,7 @@ def train(
             center_nms_radius=center_nms_radius,
             stage1_pose_samples=stage1_pose_samples,
             stage2_pose_samples=stage2_pose_samples,
-            crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+            crop_radius=float(crop_radius),
             ode_steps=val_ode_steps,
             warmup_epochs=warmup_epochs,
             edge_guard_limit=max(1, int(
@@ -2649,7 +2629,7 @@ def train(
                     center_nms_radius=center_nms_radius,
                     stage1_pose_samples=stage1_pose_samples,
                     stage2_pose_samples=stage2_pose_samples,
-                    crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+                    crop_radius=float(crop_radius),
                     ode_steps=val_ode_steps,
                     warmup_epochs=warmup_epochs,
                     center_hit_radius=center_positive_radius,
@@ -2669,7 +2649,7 @@ def train(
                             "stage1_pose_samples": stage1_pose_samples,
                             "stage2_pose_samples": stage2_pose_samples,
                             "ode_steps": val_ode_steps,
-                            "crop_radius": float(pocket_radius if pocket_radius is not None else 10.0),
+                            "crop_radius": float(crop_radius),
                         },
                     )
                     pool_stats = get_pool_stats(cached_blind_pool)
@@ -2704,7 +2684,7 @@ def train(
                         graph_builder=graph_builder,
                         collator=collator,
                         device=device,
-                        crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+                        crop_radius=float(crop_radius),
                         margin=pose_ranking_margin,
                         lambda_bce=blind_pool_cache_bce_weight,
                         lambda_pair=blind_pool_cache_rank_weight,
@@ -2778,7 +2758,7 @@ def train(
                 warmup_epochs=warmup_epochs,
                 graph_builder=graph_builder,
                 collator=collator,
-                crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+                crop_radius=float(crop_radius),
                 center_proposal_weight=center_proposal_weight,
                 center_positive_radius=center_positive_radius,
                 edge_guard_limit=max(1, int(
@@ -2808,7 +2788,7 @@ def train(
                 center_nms_radius=center_nms_radius,
                 stage1_pose_samples=stage1_pose_samples,
                 stage2_pose_samples=stage2_pose_samples,
-                crop_radius=float(pocket_radius if pocket_radius is not None else 10.0),
+                crop_radius=float(crop_radius),
                 ode_steps=val_ode_steps,
                 warmup_epochs=warmup_epochs,
                 edge_guard_limit=max(1, int(
@@ -2854,7 +2834,7 @@ def compute_validation_loss(
     epoch: int | None = None,
     total_epochs: int = 1,
     max_rmsd_batches: int = 10,
-    dataset: PDBBindDataset | None = None,
+    dataset: ProteinLigandDataset | None = None,
     warmup_epochs: int = 20,
     graph_builder: Any | None = None,
     collator: GraphCollator | None = None,

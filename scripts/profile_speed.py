@@ -8,8 +8,8 @@ from torch.utils.data import DataLoader
 
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
-from ehfnet.training.trainer import GraphCollator
-from ehfnet.datasets.pdbbind import PDBBindDataset
+from ehfnet.graph import GraphCollator
+from ehfnet.datasets.protein_ligand import ProteinLigandDataset
 from ehfnet.models.ehfnet import EHFNet
 from ehfnet.encoders.feature_specs import (
     LIGAND_ATOM_CONT_SCHEMA,
@@ -20,16 +20,14 @@ from ehfnet.encoders.feature_specs import (
 from ehfnet.training.flow_matcher import ConditionalFlowMatcher
 from ehfnet.training.losses import FlowMatchingLoss
 
-def profile():
-    data_root = "data/processed/pdbbind"
-    index_file = "data/processed/pdbbind/index.csv"
+def profile(data_root: str):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
+    index_file = os.path.join(data_root, "index.csv")
     print("Initializing Dataset...")
     collator = GraphCollator(follow_batch=["ligand_atom", "protein_atom"])
-    dataset = PDBBindDataset(
+    dataset = ProteinLigandDataset(
         root=data_root, index_file=index_file, esm_root=None,
-        esm="auto",  pocket_radius=20.0,
+        esm="auto",
     )
     
     train_loader = DataLoader(
@@ -133,4 +131,7 @@ def profile():
     print(f"Total time for 10 batches: {total_time:.3f}s")
 
 if __name__ == "__main__":
-    profile()
+    parser = argparse.ArgumentParser(description="Profile training speed")
+    parser.add_argument("--data-root", type=str, required=True, help="数据根目录，须含 index.csv，如 data/processed/hiqbind")
+    args = parser.parse_args()
+    profile(args.data_root)

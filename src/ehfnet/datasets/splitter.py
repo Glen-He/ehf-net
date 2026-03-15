@@ -32,9 +32,9 @@ class SizedDataset(Protocol):
     def __getitem__(self, idx: int) -> object: ...
 
 
-class PDBBindLikeDataset(SizedDataset, Protocol):
+class ProteinLigandLikeDataset(SizedDataset, Protocol):
     """
-    定义带 index_df 和 raw_dir 属性的 Dataset 协议
+    带 index_df 与 raw_dir 的 Dataset 协议（与 ProteinLigandDataset 兼容）。
     """
 
     index_df: pd.DataFrame
@@ -109,7 +109,7 @@ class ScaffoldSplitter:
         执行划分。
 
         Args:
-            dataset: PDBBindDataset 实例
+            dataset: ProteinLigandDataset 或满足本协议的实例
             frac_train: 训练集比例
             frac_val: 验证集比例
             frac_test: 测试集比例

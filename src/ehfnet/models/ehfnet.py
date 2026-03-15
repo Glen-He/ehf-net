@@ -53,9 +53,14 @@ class EHFNet(nn.Module):
         dropout_rate: float = 0.0,
         num_rbf: int = 50,
         r_cutoff: float = 10.0,
+        force_cutoff: float = 6.0,
         fix_protein: bool = True,
         interaction_profile: str = "full",
         normalization_stats: dict | None = None,
+        dynamic_inter_cutoff: float = 10.0,
+        dynamic_inter_knn_k: int = 8,
+        dynamic_residue_cutoff: float = 14.0,
+        dynamic_residue_knn_k: int = 6,
     ) -> None:
         """
         Args:
@@ -90,12 +95,18 @@ class EHFNet(nn.Module):
             fix_protein=fix_protein,
             interaction_profile=interaction_profile,
             stats=normalization_stats,
+            num_rbf=num_rbf,
+            dynamic_inter_cutoff=dynamic_inter_cutoff,
+            dynamic_inter_knn_k=dynamic_inter_knn_k,
+            dynamic_residue_cutoff=dynamic_residue_cutoff,
+            dynamic_residue_knn_k=dynamic_residue_knn_k,
         )
 
         self.prediction_head = PredictionHead(
             hidden_dim=hidden_dim,
             num_rbf=num_rbf,
             r_cutoff=r_cutoff,
+            force_cutoff=force_cutoff,
             dropout_rate=dropout_rate,
             affinity_stats=normalization_stats.get("affinity") if normalization_stats else None,
         )

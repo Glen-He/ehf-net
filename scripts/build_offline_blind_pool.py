@@ -7,8 +7,7 @@
 Usage:
     python scripts/build_offline_blind_pool.py \
         --checkpoint checkpoints/best_model.pt \
-        --data_root data/processed/pdbbind \
-        --index_file data/processed/pdbbind/index.csv \
+        --data_root data/processed/hiqbind \
         --output_dir cache/offline_pool \
         --max_complexes 0 \
         --ode_steps 50
@@ -32,7 +31,7 @@ torch.backends.cudnn.allow_tf32 = True
 
 from ehfnet.models import EHFNet
 from ehfnet.graph import GraphCollator
-from ehfnet.datasets.pdbbind import PDBBindDataset
+from ehfnet.datasets.protein_ligand import ProteinLigandDataset
 from ehfnet.training.flow_matcher import ConditionalFlowMatcher
 from ehfnet.training.blind_pool import (
     build_blind_pool_compatibility,
@@ -49,8 +48,7 @@ logger = logging.getLogger(__name__)
 def main():
     parser = argparse.ArgumentParser(description="Build offline blind candidate pool")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--data_root", type=str, required=True)
-    parser.add_argument("--index_file", type=str, required=True)
+    parser.add_argument("--data_root", type=str, required=True, help="数据根目录，须含 index.csv")
     parser.add_argument("--output_dir", type=str, default="cache/offline_pool")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--max_complexes", type=int, default=0, help="0 = all")
@@ -63,6 +61,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--esm_path", type=str, default=None)
     args = parser.parse_args()
+    index_file = os.path.join(args.data_root, "index.csv")
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
@@ -83,13 +82,18 @@ def main():
         lig_mol_cont_count=int(model_config["lig_mol_cont_count"]),
         pro_atom_cont_count=int(model_config["pro_atom_cont_count"]),
         pro_res_cont_count=int(model_config["pro_res_cont_count"]),
-        m_dim_scalar=int(model_config["m_dim_scalar"]),
-        dropout_rate=float(model_config["dropout_rate"]),
-        num_rbf=int(model_config["num_rbf"]),
-        r_cutoff=float(model_config["r_cutoff"]),
-        fix_protein=bool(model_config["fix_protein"]),
+        m_dim_scalar=int(model_config.get("m_dim_scalar", 16)),
+        dropout_rate=float(model_config.get("dropout_rate", 0.0)),
+        num_rbf=int(model_config.get("num_rbf", 50)),
+        r_cutoff=float(model_config.get("r_cutoff", 10.0)),
+        force_cutoff=float(model_config.get("force_cutoff", 6.0)),
+        fix_protein=bool(model_config.get("fix_protein", True)),
         interaction_profile=str(model_config["interaction_profile"]),
         normalization_stats=normalization_stats,
+        dynamic_inter_cutoff=float(model_config.get("dynamic_inter_cutoff", 10.0)),
+        dynamic_inter_knn_k=int(model_config.get("dynamic_inter_knn_k", 8)),
+        dynamic_residue_cutoff=float(model_config.get("dynamic_residue_cutoff", 14.0)),
+        dynamic_residue_knn_k=int(model_config.get("dynamic_residue_knn_k", 6)),
     ).to(device)
 
     if model_state:
@@ -99,14 +103,13 @@ def main():
 
     matcher = ConditionalFlowMatcher(sigma_min=1e-3, warmup_epochs=20)
 
-    dataset = PDBBindDataset(
+    dataset = ProteinLigandDataset(
         root=args.data_root,
-        index_file=args.index_file,
+        index_file=index_file,
         esm_root=args.esm_path,
         esm="auto",
         esm_dim=int(model_config["esm_dim"]),
         interaction_profile=str(model_config["interaction_profile"]),
-        pocket_radius=None,
     )
     graph_builder = dataset.graph_builder
     collator = GraphCollator(follow_batch=["ligand_atom", "protein_atom"])
@@ -155,7 +158,7 @@ def main():
         "compatibility": pool_compatibility,
         "checkpoint": args.checkpoint,
         "total_complexes": len(records),
-        "mode": "offline_full",
+        "mode": "offline_blind",
     })
 
     stats = get_pool_stats(records)

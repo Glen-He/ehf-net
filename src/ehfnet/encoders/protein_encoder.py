@@ -351,41 +351,11 @@ class ProteinEncoder:
         universe: mda.Universe,
         *,
         esm_embeddings: dict[int, np.ndarray] | None = None,
-        pocket_radius: float | None = None,
-        ligand_positions: np.ndarray | None = None,
     ) -> ProteinEncodingResult:
         protein_atoms = universe.select_atoms("protein")
 
         if len(protein_atoms) == 0:
             raise ValueError("Universe contains no protein atoms")
-
-        if pocket_radius is not None and ligand_positions is not None:
-            dist_sq = np.min(
-                np.sum(
-                    (
-                        protein_atoms.positions[:, None, :]
-                        - np.array(ligand_positions)[None, :, :]
-                    ) ** 2,
-                    axis=-1,
-                ),
-                axis=1,
-            )
-            mask = dist_sq <= (pocket_radius ** 2)
-            valid_residues = protein_atoms[mask].residues
-
-            if len(valid_residues) == 0:
-                raise ValueError(
-                    f"No valid residues found within {pocket_radius}A of the ligand! "
-                    "This complex's structural coordinates are likely severely corrupted (massive drift). "
-                    "Refusing to fall back to the full protein."
-                )
-
-            protein_atoms = valid_residues.atoms
-            logger.info(
-                "Extracted pocket with %d residues within %.1fA.",
-                len(valid_residues),
-                pocket_radius,
-            )
 
         all_atoms = sorted(protein_atoms.atoms, key=lambda atom: atom.ix)
         all_residues = sorted(list(protein_atoms.residues), key=lambda residue: residue.ix)

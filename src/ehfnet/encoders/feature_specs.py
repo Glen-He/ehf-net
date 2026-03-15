@@ -158,7 +158,18 @@ PROTEIN_ATOM_CONT_SCHEMA = [
     ContFeature("is_acceptor_like",         "是否具有受体倾向"),
     ContFeature("is_aromatic_like",         "是否属于芳香体系"),
 ]
-PROTEIN_ATOM_SCALAR_DIM = 5
+
+# 从 Schema 自动推导标量特征维度（物理化学标量：vdw、质量、电负性等）
+PROTEIN_ATOM_SCALAR_FIELDS = {
+    "vdw_radius_mm3",
+    "atomic_weight",
+    "en_pauling",
+    "electron_affinity",
+    "first_ionization_energy",
+}
+PROTEIN_ATOM_SCALAR_DIM = sum(
+    1 for f in PROTEIN_ATOM_CONT_SCHEMA if f.name in PROTEIN_ATOM_SCALAR_FIELDS
+)
 
 
 PROTEIN_RESIDUE_CAT_SCHEMA = [
@@ -207,6 +218,3 @@ PROTEIN_RESIDUE_BACKBONE_OBSERVED_START = (
     PROTEIN_RESIDUE_TORSION_VALID_START + PROTEIN_RESIDUE_TORSION_VALID_DIM
 )
 PROTEIN_RESIDUE_BACKBONE_OBSERVED_DIM = len(PROTEIN_RESIDUE_BACKBONE_ATOM_NAMES)
-PROTEIN_RESIDUE_STRUCTURE_START = (
-    PROTEIN_RESIDUE_BACKBONE_OBSERVED_START + PROTEIN_RESIDUE_BACKBONE_OBSERVED_DIM
-)

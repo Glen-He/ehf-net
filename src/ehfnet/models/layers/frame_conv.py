@@ -46,48 +46,7 @@ from torch import Tensor
 from torch_scatter import scatter_mean
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 高斯 RBF 编码
-# ─────────────────────────────────────────────────────────────────────────────
-
-class GaussianRBF(nn.Module):
-    """
-    高斯径向基函数距离编码。
-
-    将标量距离 d 扩展为高维特征向量：
-        rbf_k(d) = exp(-0.5 · ((d - μ_k) / σ)²)
-
-    μ_k 均匀分布在 [start, stop]，σ = 相邻中心间距。
-
-    输出范围 (0, 1]，在 d = μ_k 处取最大值 1。
-    """
-
-    def __init__(
-        self,
-        start: float = 0.0,
-        stop: float = 20.0,
-        num_gaussians: int = 32,
-    ) -> None:
-        super().__init__()
-        assert stop > start, f"stop ({stop}) must be > start ({start})"
-        assert num_gaussians >= 4, f"num_gaussians must be >= 4, got {num_gaussians}"
-
-        offset = torch.linspace(start, stop, num_gaussians)
-        self.register_buffer("offset", offset)
-        sigma = (stop - start) / (num_gaussians - 1)
-        self.coeff = -0.5 / (sigma ** 2)
-
-    def forward(self, dist: Tensor) -> Tensor:
-        """
-        Args:
-            dist: 距离标量 [...] 或 [..., 1]
-
-        Returns:
-            RBF 特征 [..., num_gaussians]
-        """
-        dist = dist.clamp(min=0.0)
-        diff = dist.unsqueeze(-1) - self.offset          # type: ignore[arg-type]
-        return torch.exp(self.coeff * diff.pow(2))
+from ehfnet.models.layers.rbf import GaussianRBF
 
 
 # ─────────────────────────────────────────────────────────────────────────────

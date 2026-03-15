@@ -124,18 +124,14 @@ class GraphBuilder:
         self,
         *,
         r_cutoff_intra: float = 5.0,
-        r_cutoff_inter: float = 6.0,
         max_neighbors_intra: int = 64,
-        max_neighbors_inter: int = 32,
         esm_filler: ESMEmbeddingFiller | None = None,
         interaction_profile: str = "full",
     ) -> None:
         """
         Args:
             r_cutoff_intra: 图内原子边的基础半径；残基图会自动使用更大的 typed radius
-            r_cutoff_inter: 保留兼容参数；动态跨图边现由 encoder 侧控制
             max_neighbors_intra: 图内邻居上限；builder 会按节点类型自动裁剪到更保守的上限
-            max_neighbors_inter: 保留兼容参数；动态跨图边现由 encoder 侧控制
             esm_filler: ESM embedding 填充器（默认使用 ESMEmbeddingFiller）
             interaction_profile: 跨图交互配置，支持：
                 - "full": 保留全部跨图边（默认）
@@ -143,9 +139,7 @@ class GraphBuilder:
         """
 
         self.r_cutoff_intra = r_cutoff_intra
-        self.r_cutoff_inter = r_cutoff_inter
         self.max_neighbors_intra = max_neighbors_intra
-        self.max_neighbors_inter = max_neighbors_inter
         self.esm_filler = esm_filler or ESMEmbeddingFiller()
         self.interaction_profile = interaction_profile
         self._residue_esm_feature_start = len(PROTEIN_RESIDUE_CONT_SCHEMA)
@@ -708,9 +702,7 @@ class GraphBuilder:
 def create_graph_tools(
     *,
     r_cutoff_intra: float = 5.0,
-    r_cutoff_inter: float = 6.0,
     max_neighbors_intra: int = 64,
-    max_neighbors_inter: int = 32,
     esm_fill_strategy: str = "zeros",
     interaction_profile: str = "full",
 ) -> tuple[GraphBuilder, GraphCollator]:
@@ -718,10 +710,8 @@ def create_graph_tools(
     创建 GraphBuilder 与 GraphCollator。
 
     Args:
-        r_cutoff_intra: 图内原子边基础半径；残基图会自动放宽
-        r_cutoff_inter: 保留兼容参数；动态跨图边现由 encoder 侧控制
-        max_neighbors_intra: 图内邻居上限
-        max_neighbors_inter: 保留兼容参数；动态跨图边现由 encoder 侧控制
+            r_cutoff_intra: 图内原子边基础半径；残基图会自动放宽
+            max_neighbors_intra: 图内邻居上限
         esm_fill_strategy: ESM embedding 缺失时的填充策略
         interaction_profile: 跨图交互配置（"full" 或 "atom_only"）
 
@@ -732,9 +722,7 @@ def create_graph_tools(
     esm_filler = ESMEmbeddingFiller(embed_dim=960, fill_strategy=esm_fill_strategy)
     builder = GraphBuilder(
         r_cutoff_intra=r_cutoff_intra,
-        r_cutoff_inter=r_cutoff_inter,
         max_neighbors_intra=max_neighbors_intra,
-        max_neighbors_inter=max_neighbors_inter,
         esm_filler=esm_filler,
         interaction_profile=interaction_profile,
     )

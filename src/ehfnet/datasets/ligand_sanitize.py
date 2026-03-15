@@ -85,13 +85,6 @@ def read_ligand_file(
     return supplier[0] if len(supplier) > 0 else None
 
 
-def sanitize_ligand_mol(mol: Chem.Mol, ligand_path: str | Path) -> Chem.Mol:
-    """
-    默认策略：只接受 full sanitize 成功的分子。
-    """
-    return sanitize_ligand_mol_with_mode(mol, ligand_path)
-
-
 def sanitize_ligand_mol_with_mode(
     mol: Chem.Mol,
     ligand_path: str | Path,

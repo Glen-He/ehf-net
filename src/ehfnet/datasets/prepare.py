@@ -4,8 +4,6 @@
 提供从原始文件（配体/蛋白）读取、ESM embedding 获取，以及构建 HeteroData 的工具函数。
 """
 
-import numpy as np
-
 from typing import Any, cast
 
 import torch
@@ -18,20 +16,6 @@ from ehfnet.encoders import LigandEncoder, ProteinEncoder
 from ehfnet.datasets.ligand_sanitize import load_ligand_mol
 from ehfnet.encoders.esm_embedding import load_or_compute_esm_embeddings
 from ehfnet.graph import GraphBuilder
-
-
-def load_ligand(ligand_path: str):
-    """
-    读取配体分子，并确保包含 3D conformer。
-
-    Args:
-        ligand_path: 配体文件路径（支持 .sdf/.mol2）
-
-    Returns:
-        RDKit Mol 对象（去氢后）
-    """
-
-    return load_ligand_mol(ligand_path, remove_hs=True, require_conformer=True)
 
 
 def load_protein(protein_path: str) -> mda.Universe:
@@ -77,7 +61,6 @@ def prepare_graph(
     esm: str,
     esm_model: ESMC | None = None,
     esm_model_name: str = "esmc_300m",
-    pocket_radius: float | None = None,
 ) -> HeteroData:
     """
     从原始文件构建单个复合物的图数据。
@@ -94,13 +77,12 @@ def prepare_graph(
         esm: ESM 模式（如 "off"/"file"/"auto"）
         esm_model: 已加载的 ESM 模型实例（可选，用于 auto 推理）
         esm_model_name: ESM 模型名称（esm_model 为空时使用）
-        pocket_radius: 口袋提取半径 (Å)。如果提供，则仅保留该半径内的残基。
 
     Returns:
         构建完成的 HeteroData
     """
 
-    mol = load_ligand(ligand_path)
+    mol = load_ligand_mol(ligand_path, remove_hs=True, require_conformer=True)
     universe = load_protein(protein_path)
 
     ligand_encoder = LigandEncoder(feature_factory=feature_factory)
@@ -149,19 +131,10 @@ def prepare_graph(
             )
 
     ligand_result = ligand_encoder.encode(mol, strict_torsion=True)
-    
-    # 如果指定了 pocket_radius，获取配体坐标用于裁剪
-    # 将 list 转换为 np.ndarray 以匹配 ProteinEncoder 的类型要求
-    ligand_positions = None
-    
-    if pocket_radius is not None:
-        ligand_positions = np.array(ligand_result["positions"], dtype=np.float32)
 
     protein_result = protein_encoder.encode(
         universe,
         esm_embeddings=esm_embeddings,
-        pocket_radius=pocket_radius,
-        ligand_positions=ligand_positions,
     )
 
     data = graph_builder.build(ligand_result, protein_result)

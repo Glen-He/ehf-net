@@ -187,14 +187,20 @@ class EHFEncoder(nn.Module):
                 block["1_intra_gnn"] = self._build_frame_conv_block(
                     self.intra_feat_edges, hidden_dim, num_rbf
                 )
-                block["1_intra_update"] = self._build_update_mlp(hidden_dim, dropout_rate)
+                block["1_intra_update"] = self._build_update_mlp(
+                    ["protein_residue"], hidden_dim, dropout_rate
+                )
 
             # 阶段 2：自下而上聚合
             if self.agg_edges:
                 block["2_agg_gnn"] = self._build_frame_conv_block(
                     self.agg_edges, hidden_dim, num_rbf
                 )
-                block["2_agg_update"] = self._build_update_mlp(hidden_dim, dropout_rate)
+                block["2_agg_update"] = self._build_update_mlp(
+                    ["ligand_molecule", "protein_residue", "protein_pocket"],
+                    hidden_dim,
+                    dropout_rate,
+                )
 
             # 阶段 3：层间交互
             if self.inter_atom_edges:
@@ -206,17 +212,23 @@ class EHFEncoder(nn.Module):
                 block["3_inter_gnn"] = self._build_frame_conv_block(
                     self.inter_feat_edges, hidden_dim, num_rbf
                 )
-                block["3_inter_update"] = self._build_update_mlp(hidden_dim, dropout_rate)
+                block["3_inter_update"] = self._build_update_mlp(
+                    NODE_TYPES, hidden_dim, dropout_rate
+                )
 
             # 阶段 4：自上而下广播
             if self.bcast_edges:
                 block["4_bcast_gnn"] = self._build_frame_conv_block(
                     self.bcast_edges, hidden_dim, num_rbf
                 )
-                block["4_bcast_update"] = self._build_update_mlp(hidden_dim, dropout_rate)
+                block["4_bcast_update"] = self._build_update_mlp(
+                    ["ligand_atom", "protein_residue", "protein_atom"],
+                    hidden_dim,
+                    dropout_rate,
+                )
 
             # 模块末端的全局特征细化
-            block["post_mlp"] = self._build_update_mlp(hidden_dim, dropout_rate)
+            block["post_mlp"] = self._build_update_mlp(NODE_TYPES, hidden_dim, dropout_rate)
 
             self.gnn_blocks.append(block)
 
@@ -277,18 +289,20 @@ class EHFEncoder(nn.Module):
 
 
     @staticmethod
-    def _build_update_mlp(hidden_dim: int, dropout_rate: float) -> nn.ModuleDict:
+    def _build_update_mlp(
+        node_types: list[str], hidden_dim: int, dropout_rate: float
+    ) -> nn.ModuleDict:
         """
-        构建残差更新 MLP
+        构建残差更新 MLP，仅针对实际需要更新的节点类型。
 
         Args:
+            node_types: 需要 MLP 的节点类型列表
             hidden_dim: 隐藏层维度
             dropout_rate: Dropout 比例
 
         Returns:
-            包含各节点类型 MLP 的字典
+            包含指定节点类型 MLP 的字典
         """
-
         return nn.ModuleDict(
             {
                 nt: nn.Sequential(
@@ -298,7 +312,7 @@ class EHFEncoder(nn.Module):
                     nn.Linear(hidden_dim, hidden_dim),
                     nn.Dropout(dropout_rate),
                 )
-                for nt in NODE_TYPES
+                for nt in node_types
             }
         )
 
@@ -810,6 +824,10 @@ class EHFEncoder(nn.Module):
         B         = int(lig_batch.max().item()) + 1
 
         for block in self.gnn_blocks:
+            # fix_protein=True 时，每 block 开始前恢复蛋白坐标，确保动态边始终基于刚性蛋白构建
+            if self.fix_protein and "protein_atom" in pos_dict:
+                pos_dict["protein_atom"] = pos_input["protein_atom"].clone()
+
             residue_pos, _, full_pos_dict = self._refresh_protein_context(
                 data=data,
                 x_dict=x_dict,

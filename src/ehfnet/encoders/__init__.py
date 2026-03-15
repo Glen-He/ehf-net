@@ -26,7 +26,6 @@ from ehfnet.encoders.esm_embedding import (
     compute_esm_embeddings,
     save_esm_embeddings,
     load_esm_embeddings,
-    cache_esm_embeddings,
     load_or_compute_esm_embeddings,
 )
 from ehfnet.encoders.ligand_encoder import LigandEncoder
@@ -62,7 +61,6 @@ __all__ = [
     "compute_esm_embeddings",
     "save_esm_embeddings",
     "load_esm_embeddings",
-    "cache_esm_embeddings",
     "load_or_compute_esm_embeddings",
 
     # 编码器

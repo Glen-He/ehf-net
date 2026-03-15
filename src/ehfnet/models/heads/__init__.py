@@ -3,13 +3,13 @@
 """
 
 from ehfnet.models.heads.prediction import (
-    GaussianSmearing,
+    GaussianRBF,
     CosineCutoff,
     PredictionHead,
 )
 
 __all__ = [
-    "GaussianSmearing",
+    "GaussianRBF",
     "CosineCutoff",
     "PredictionHead",
 ]

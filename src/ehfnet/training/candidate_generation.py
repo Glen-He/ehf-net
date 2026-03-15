@@ -70,7 +70,7 @@ def generate_blind_candidates(
     Both validation metrics and blind pool refresh call this function.
 
     Args:
-        samples: list of HeteroData (full-protein) samples.
+        samples: list of cached HeteroData samples.
         dataset_indices: optional parallel list of indices into the original dataset,
             stored in records so replay can look up the original sample.
 

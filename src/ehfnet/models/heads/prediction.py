@@ -36,76 +36,13 @@ class PredictionConstants:
     EPSILON = 1e-4                  # 通用数值保护（提升 FP16 兼容性）
 
     # 物理参数
-    MIN_MASS_INV = 0.01             # 保留兼容（当前不使用）
     BASELINE_BINDING_ENERGY = -7.0  # kcal/mol, 典型结合能
     FORCE_CUTOFF = 6.0              # Å, 力场局部相互作用半径
     FORCE_LIMIT = 20.0              # 力幅值软饱和上限
 
 
-class GaussianSmearing(nn.Module):
-    """
-    RBF (径向基函数) 编码层
-
-    将标量距离扩展为高维特征，采用高斯函数：exp(-0.5 * ((d - μ_i) / σ)^2)
-    """
-
-    def __init__(
-        self,
-        start: float = PredictionConstants.RBF_START,
-        stop: float = PredictionConstants.RBF_STOP,
-        num_gaussians: int = PredictionConstants.NUM_RBF,
-    ) -> None:
-        """
-        Args:
-            start: RBF 起始距离（单位：Å）
-            stop: RBF 截断距离（单位：Å）
-            num_gaussians: 高斯基函数数量
-        """
-
-        super().__init__()
-
-        if num_gaussians < 10:
-            raise ValueError(
-                f"num_gaussians is too small; expected >= 10, got {num_gaussians}."
-            )
-
-        if stop <= start:
-            raise ValueError(f"stop ({stop}) must be greater than start ({start}).")
-
-        offset = torch.linspace(start, stop, num_gaussians)
-        self.register_buffer("offset", offset)
-
-        # 高斯宽度：相邻中心间距
-        sigma = (stop - start) / (num_gaussians - 1)
-        self.coeff = -0.5 / (sigma**2)
-        self.offset: Tensor
-
-
-    def forward(self, dist: Tensor) -> Tensor:
-        """
-        前向传播
-
-        Args:
-            dist: 距离标量 [N] 或 [..., 1]（单位：Å），应为非负值
-
-        Returns:
-            RBF 特征 [..., num_gaussians]，范围 [0, 1]
-        """
-
-        # 确保距离非负（数值稳定性）
-        dist = torch.clamp(dist, min=0.0)
-
-        # 扩展维度以广播
-        if dist.ndim == 1:
-            dist_exp = dist.unsqueeze(-1)
-
-        else:
-            dist_exp = dist
-
-        diff = dist_exp - self.offset
-        rbf = torch.exp(self.coeff * diff.pow(2))
-
-        return rbf
+# 与 frame_conv 共享同一 RBF 实现
+from ehfnet.models.layers.rbf import GaussianRBF
 
 
 class CosineCutoff(nn.Module):
@@ -213,7 +150,7 @@ class PredictionHead(nn.Module):
         self.cutoff_fn = CosineCutoff(cutoff=self.r_cutoff)
 
         # 距离 RBF 编码 + 边特征 MLP
-        self.distance_expansion = GaussianSmearing(0.0, self.r_cutoff, num_rbf)
+        self.distance_expansion = GaussianRBF(0.0, self.r_cutoff, num_rbf)
         self.edge_mlp = nn.Sequential(
             nn.Linear(num_rbf, hidden_dim),
             nn.SiLU(),
@@ -456,7 +393,20 @@ class PredictionHead(nn.Module):
         E_ij_raw = self.pairwise_energy_mlp(pair_input).squeeze(-1)
         E_ij = E_ij_raw * cutoff_weights
 
-        learned_force_mag = torch.tanh(self.force_mlp(pair_input).squeeze(-1)) * self.force_limit
+        # force_mlp 仅在 dist < force_cutoff 的近程边上运行，远程边不贡献学习力
+        force_mask = dist < self.force_cutoff
+        if force_mask.any():
+            force_edge_raw = self.force_mlp(pair_input[force_mask]).squeeze(-1)
+            learned_force_mag = torch.zeros(
+                edge_index.size(1), device=device, dtype=pair_input.dtype
+            )
+            learned_force_mag[force_mask] = (
+                torch.tanh(force_edge_raw) * self.force_limit
+            )
+        else:
+            learned_force_mag = torch.zeros(
+                edge_index.size(1), device=device, dtype=pair_input.dtype
+            )
         clash_push = torch.nn.functional.relu(2.2 - dist) * 6.0
         force_edge = (learned_force_mag.unsqueeze(-1) * rel_dir) - (clash_push.unsqueeze(-1) * rel_dir)
 

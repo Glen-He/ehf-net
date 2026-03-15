@@ -238,7 +238,7 @@ class BlindCandidateReplayDataset(Dataset):
     """从 blind pool 中按 complex 采样可回放候选组。
 
     每个 item 返回一个 complex 的多个候选，每个候选包含：
-    - dataset_index: 用于从 train_set 取 full-protein sample
+    - dataset_index: 用于从 train_set 取缓存样本
     - center_xyz: 用于 crop_graph_to_center
     - pose_xyz: 用于覆盖 ligand_atom.pos
     - rmsd, soft_target: 用于计算损失
@@ -421,7 +421,7 @@ def replay_and_compute_losses(
     This is the core function that makes blind pool training *actually*
     train the current model. Instead of operating on cached teacher logits,
     it:
-    1. Loads full-protein sample by dataset_index
+    1. Loads cached sample by dataset_index
     2. Crops to center_xyz
     3. Overrides ligand_atom.pos with pose_xyz
     4. Forwards through current model
@@ -539,7 +539,7 @@ def replay_and_compute_losses(
             per_group_list.append(rerank_results["rerank_listwise"])
             total_pairs += int(rerank_results["rerank_n_pairs"].item())
 
-        # center-value: run proposal on the full-protein sample once per complex
+        # center-value: run proposal on the cached source sample once per complex
         if lambda_center_value > 0 and center_values:
             try:
                 sample_batch = cast(Any, collator.collate([sample])).to(device)

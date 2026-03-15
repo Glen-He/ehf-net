@@ -18,7 +18,6 @@ from ehfnet.graph.hetero_schema import (
     STATIC_INTER_EDGES,
     INTER_EDGES,
     BROADCAST_EDGES,
-    ALL_EDGES,
 )
 
 __all__ = [
@@ -43,5 +42,4 @@ __all__ = [
     "STATIC_INTER_EDGES",
     "INTER_EDGES",
     "BROADCAST_EDGES",
-    "ALL_EDGES",
 ]

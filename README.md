@@ -106,40 +106,85 @@ data_root/
 │   ├── 1a2b/
 │   │   ├── 1a2b_ligand.sdf       # 配体（支持 .sdf / .mol2）
 │   │   ├── 1a2b_protein.pdb      # 蛋白（建议去水去离子）
-│   │   └── 1a2b_esm.npz          # （可选）预计算 ESM Embeddings
+│   │   └── 1a2b_esm_chainseg.npz # （可选）预计算 ESM Embeddings
 │   └── ...
 ├── index.csv                     # 训练索引
 └── processed/                    # 自动生成的预处理缓存
 ```
 
-`index.csv` 格式：
+原始目录中的 **`index.csv`** 表头必须为：
 
 ```csv
-pdb_id,affinity
+Concatenated ID,Log Binding Affinity
 1a2b,6.5
 3c4d,7.2
 ```
 
+processed 下会生成供训练使用的 `index.csv`。
+
 ### 数据处理流程
 
+**约定：** 把原始数据放在 `data/raw/` 下，按**数据集名称**建一个文件夹（如 `hiqbind`、`pdbbind`）。该文件夹内**必须**包含：
+
+- 目录 `ligand/`（配体文件，如 `{id}_ligand.sdf` 或 `.mol2`）
+- 目录 `protein/`（蛋白文件，如 `{id}_protein.pdb`）
+- 文件 **`index.csv`**（固定文件名；表头必须为 **`Concatenated ID`** 与 **`Log Binding Affinity`**）
+
+运行脚本时传入数据集名称（与上述文件夹名一致）。脚本**不删除、不修改 raw 下任何内容**，仅在 `data/processed/<数据集名>/` 下生成 `cleaned/<id>/` 与 `index.csv`。后续预处理与训练均使用 **processed** 目录。
+
+**示例目录：**
+
+```text
+data/raw/hiqbind/
+├── ligand/
+│   ├── 1a2b_ligand.sdf
+│   └── ...
+├── protein/
+│   ├── 1a2b_protein.pdb
+│   └── ...
+└── index.csv
+```
+
+**命令示例：**
+
 ```bash
-# 1. 从原始 PDBBind 索引提取亲和力标签
-uv run python scripts/extract_affinity.py \
-    --input  data/raw/pdbbind/hiqbind_info.csv \
-    --output data/raw/pdbbind/hiqbind_labels.csv
+uv run python scripts/prepare_data.py hiqbind
 
-# 2. 文件完整性校验与过滤
-uv run python scripts/validate_and_filter.py \
-    --ligand_dir  data/raw/pdbbind/ligand \
-    --protein_dir data/raw/pdbbind/protein \
-    --input_csv   data/raw/pdbbind/hiqbind_labels.csv \
-    --output_csv  data/raw/pdbbind/hiqbind_filtered.csv
+# 使用 pdbbind
+uv run python scripts/prepare_data.py pdbbind
+```
 
-# 3. 重组为嵌套目录结构
-uv run python scripts/organize_data.py \
-    --raw_root    data/raw/pdbbind \
-    --target_root data/processed/pdbbind \
-    --index_file  data/raw/pdbbind/hiqbind_filtered.csv
+步骤含义：脚本**不删除、不修改 raw 下任何内容**，仅读取并生成新文件到 processed。`organize` 从 raw 读 `index.csv`，将「配体/蛋白文件都存在且亲和力有效」的条目复制到 `data/processed/<dataset>/cleaned/<id>/`（目标文件名与 SDF 第一行为小写），并写出仅含这些条目的 `index.csv`；缺文件或无效亲和力的行跳过并打日志。后续预处理与训练均使用 **processed** 目录。
+
+### 预处理（图缓存 + ESM）
+
+所有预处理命令都**必须**指定 `--data-root`（数据根目录，与 prepare_data 输出一致，目录内须含 `index.csv`），例如：`data/processed/hiqbind`。
+
+预处理会直接缓存完整蛋白图；局部口袋的定位与裁剪放在训练/推理阶段通过 runtime crop 完成。预处理阶段不使用真实配体去截 pocket。
+
+- **`build`**：构建图缓存（HeteroData）和 ESM 嵌入（npz），并做几何检查。图缓存统一写到 `<data-root>/cache/`，ESM 写到各 `cleaned/<id>/` 下。
+- **`stats`**：基于 `cache/` 里的图缓存计算特征统计和距离分布，输出 `dataset_profile.json`。
+- **`clean`**：清理图缓存、ESM 缓存或两者。`graph` 会同时移除当前 `cache/` 和旧的遗留目录，便于迁移。
+
+首次运行：
+
+```bash
+uv run python scripts/preprocess.py build --data-root data/processed/hiqbind
+uv run python scripts/preprocess.py stats --data-root data/processed/hiqbind
+```
+
+如果你改了 `cleaned/` 下的蛋白、配体、`index.csv`，或改了图/ESM 逻辑，先清理再重建：
+
+```bash
+uv run python scripts/preprocess.py clean --data-root data/processed/hiqbind --target all
+uv run python scripts/preprocess.py build --data-root data/processed/hiqbind
+uv run python scripts/preprocess.py stats --data-root data/processed/hiqbind
+```
+
+仅查看会删掉哪些文件（不实际删除）：加 `--dry-run`，例如：
+
+```bash
+uv run python scripts/preprocess.py clean --data-root data/processed/hiqbind --target all --dry-run
 ```
 
 ## Training
@@ -150,24 +195,30 @@ uv run python scripts/organize_data.py \
 `--accumulation_steps` 用于在不增加峰值显存的情况下提升等效 batch。
 训练入口已自动设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:128`。
 
-当前默认训练流程不再在预处理阶段依赖真实配体裁 pocket，而是缓存 full protein，然后在运行时执行：
+训练流程为 blind docking，并在运行时执行：
 1. residue-level center proposal
 2. 10A local crop
 3. local flow docking
 4. pose confidence reranking
 
-推荐优先使用配置文件：
+**请务必指定数据目录**：训练不会使用任何默认数据路径。方式二选一即可：
+
+- 在 **`configs/train.toml`** 的 `[data]` 里设置 `data_root = "data/processed/你的数据集名"`（该文件为本地自定义配置，可按自己当前文件夹填写）；
+- 或命令行传入：`--data_root data/processed/hiqbind`。
+
+**规范**：只接受**一个文件夹**（预处理输出目录，内含 `cleaned/` 与 **`index.csv`**）。不允许自定义 index 路径，程序固定使用该目录下的 `index.csv`。
 
 ```bash
 uv run python train.py --config configs/train.toml
+# 或直接指定数据目录
+uv run python train.py --data_root data/processed/hiqbind
 ```
 
-常改参数已整理到 `configs/train.toml`，代码仍然保留默认值；命令行参数会覆盖配置文件，适合临时实验。
+常改参数已整理到 `configs/train.toml`；命令行参数会覆盖配置文件。
 
 ```bash
 uv run python train.py \
-    --data_root  ./data/processed/pdbbind \
-    --index_file ./data/processed/pdbbind/index.csv \
+    --data_root data/processed/hiqbind \
     --epochs 100 \
     --max_nodes_per_batch 20000 \
     --val_max_nodes_per_batch 6000 \
@@ -177,8 +228,7 @@ uv run python train.py \
     --lr 1e-4 \
     --hidden_dim 128 \
     --num_gnn_blocks 4 \
-    --protein_context_mode full \
-    --pocket_radius 10 \
+    --crop_radius 10 \
     --warmup_epochs 20 \
     --ema_decay 0.999 \
     --rmsd_ratio 0.2 \
@@ -211,8 +261,7 @@ uv run python train.py \
 
 ```bash
 nohup uv run python train.py \
-    --data_root  ./data/processed/pdbbind \
-    --index_file ./data/processed/pdbbind/index.csv \
+    --data_root data/processed/hiqbind \
     --epochs 100 \
     --max_nodes_per_batch 20000 \
     --val_max_nodes_per_batch 6000 \
@@ -222,8 +271,7 @@ nohup uv run python train.py \
     --lr 1e-4 \
     --hidden_dim 128 \
     --num_gnn_blocks 4 \
-    --protein_context_mode full \
-    --pocket_radius 10 \
+    --crop_radius 10 \
     --warmup_epochs 20 \
     --ema_decay 0.999 \
     --rmsd_ratio 0.2 \
@@ -246,8 +294,7 @@ tail -f logs/nohup.log
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--data_root` | str | — | 数据根目录路径 |
-| `--index_file` | str | — | 索引 CSV 文件路径 |
+| `--data_root` | str | 见下 | **必填**（config 或 CLI）。数据根目录（一个文件夹），**必须**内含 `index.csv`，如 `data/processed/hiqbind`。不允许自定义 index 路径。 |
 | `--save_dir` | str | `./checkpoints` | 运行产物根目录。每次训练会自动创建与日志同名的子目录，如 `checkpoints/train_20260307_153000/`。 |
 | `--device` | str | `cuda:0` | 训练设备（`cuda:0`、`cuda:1`、`cpu` 等） |
 | `--epochs` | int | 100 | 训练轮数 |
@@ -264,8 +311,7 @@ tail -f logs/nohup.log
 | `--rmsd_ratio` | float | 0.2 | 验证集中执行 RMSD 推演的样本比例 |
 | `--hidden_dim` | int | 128 | 隐藏层维度 |
 | `--num_gnn_blocks` | int | 4 | GNN Block 数量（显存不足时可降至 3） |
-| `--protein_context_mode` | str | `full` | `full` 为缓存全蛋白并在运行时局部裁剪；`pocket` 为旧的预裁 pocket 模式 |
-| `--pocket_radius` | float | 10.0 | 运行时 local docking 裁剪半径（Å） |
+| `--crop_radius` | float | 10.0 | 运行时 local crop 半径（Å） |
 | `--esm_dim` | int | 960 | ESM Embedding 维度（ESMC-300M 为 960） |
 | `--split_train_frac` | float | 0.7 | 训练集比例（Scaffold Split） |
 | `--split_val_frac` | float | 0.1 | 验证集比例（Scaffold Split） |
@@ -273,7 +319,7 @@ tail -f logs/nohup.log
 | `--split_seed` | int | 42 | 划分随机种子 |
 | `--split_cache_file` | str | 自动路径 | 划分索引 JSON 路径；用于严格复现 |
 | `--force_resplit` | flag | 关闭 | 强制重建划分索引 |
-| `--ablation_mode` | str | `none` | 消融模式：`none` / `inter_multiscale_off` / `gt_only_crop` |
+| `--ablation_mode` | str | `none` | 消融模式：`none` / `inter_multiscale_off` |
 | `--run_test_after_training` | flag | 启用 | 训练后自动运行独立 test 评估 |
 | `--test_topk` | str | `1,5,10` | Top-N 成功率统计阈值列表 |
 | `--test_pose_samples` | int | 10 | 每个复合物生成的候选 pose 数 |
@@ -351,9 +397,8 @@ tail -f logs/nohup.log
 
 ### 核心 ablation（4 组）
 
-1. **GT-only training vs Proposal-aware training**
-    - `--ablation_mode gt_only_crop`（baseline：仅用 GT center 裁 pocket）
-    - `--ablation_mode none`（主方案：5 类 proposal-aware crop）
+1. **Proposal-aware crop 组件对比**
+    - `--ablation_mode none`（主方案：proposal-aware crop）
     - 可进一步叠加 `--disable_jitter_crop` / `--disable_hard_negative_crop` 做细粒度 crop ablation
 2. **BCE only vs BCE + Pairwise ranking**
     - `--pose_ranking_pair_weight 0`（baseline）

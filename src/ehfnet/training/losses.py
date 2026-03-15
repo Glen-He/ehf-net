@@ -114,21 +114,23 @@ class FlowMatchingLoss(nn.Module):
 
         if progress <= warmup_end:
             alpha = 1.0 if warmup_end <= 1e-8 else progress / max(warmup_end, 1e-8)
-            return self._lerp_dict(
+            schedule = self._lerp_dict(
                 self.curriculum_weights["coarse"],
                 self.curriculum_weights["transition"],
                 alpha,
             )
+        elif progress <= refine_start:
+            schedule = dict(self.curriculum_weights["transition"])
+        else:
+            alpha = (progress - refine_start) / max(1.0 - refine_start, 1e-8)
+            schedule = self._lerp_dict(
+                self.curriculum_weights["transition"],
+                self.curriculum_weights["refine"],
+                alpha,
+            )
 
-        if progress <= refine_start:
-            return dict(self.curriculum_weights["transition"])
-
-        alpha = (progress - refine_start) / max(1.0 - refine_start, 1e-8)
-        return self._lerp_dict(
-            self.curriculum_weights["transition"],
-            self.curriculum_weights["refine"],
-            alpha,
-        )
+        # 用户传入的 self.weights 作为 curriculum 的全局倍率
+        return {k: schedule[k] * self.weights.get(k, 1.0) for k in schedule}
 
     def _get_pose_focus_gate(self, data: Any, t_val: Tensor | None, *, device: torch.device, dtype: torch.dtype) -> Tensor:
         progress = self._clamp_progress(getattr(data, "loss_progress", 0.0))

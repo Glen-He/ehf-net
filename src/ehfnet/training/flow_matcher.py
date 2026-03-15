@@ -515,26 +515,3 @@ class ConditionalFlowMatcher:
         angle = torch.rand(B, device=device, dtype=dtype) * max_angle
         # Rodrigues 公式生成旋转矩阵
         return PoseUpdater._axis_angle_to_matrix_batched(axis, angle)
-
-
-    @staticmethod
-    def _random_rotation_matrix(
-        B: int, device: torch.device, dtype: torch.dtype
-    ) -> Tensor:
-        """
-        使用 Haar Measure 在 SO(3) 上均匀采样随机旋转矩阵（保留以兼容其他调用）
-        """
-
-        m = torch.randn(B, 3, 3, device=device, dtype=dtype)
-        q, r = torch.linalg.qr(m)
-
-        d = torch.diagonal(r, dim1=-2, dim2=-1)
-        q *= torch.sign(d).unsqueeze(-2)
-
-        det = torch.linalg.det(q)
-        mask = det < 0
-
-        if mask.any():
-            q[mask, :, 0] *= -1
-
-        return q

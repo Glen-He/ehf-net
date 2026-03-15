@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
-from ehfnet.datasets.pdbbind import GRAPH_CACHE_VERSION_TAG
+from ehfnet.datasets.protein_ligand import GRAPH_CACHE_VERSION_TAG
 from ehfnet.encoders.feature_specs import (
     CatFeature,
     ContFeature,
@@ -79,7 +79,12 @@ def build_model_config(
     dropout_rate: float = 0.0,
     num_rbf: int = 50,
     r_cutoff: float = 10.0,
+    force_cutoff: float = 6.0,
     fix_protein: bool = True,
+    dynamic_inter_cutoff: float = 10.0,
+    dynamic_inter_knn_k: int = 8,
+    dynamic_residue_cutoff: float = 14.0,
+    dynamic_residue_knn_k: int = 6,
 ) -> dict[str, Any]:
     return {
         "hidden_dim": int(hidden_dim),
@@ -95,7 +100,12 @@ def build_model_config(
         "dropout_rate": float(dropout_rate),
         "num_rbf": int(num_rbf),
         "r_cutoff": float(r_cutoff),
+        "force_cutoff": float(force_cutoff),
         "fix_protein": bool(fix_protein),
+        "dynamic_inter_cutoff": float(dynamic_inter_cutoff),
+        "dynamic_inter_knn_k": int(dynamic_inter_knn_k),
+        "dynamic_residue_cutoff": float(dynamic_residue_cutoff),
+        "dynamic_residue_knn_k": int(dynamic_residue_knn_k),
     }
 
 

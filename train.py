@@ -68,25 +68,70 @@ def load_train_config(config_path: str | None) -> dict[str, object]:
     return _config_to_arg_defaults(raw)
 
 
+def load_model_config(model_config_path: str | None, project_root: Path) -> dict[str, object]:
+    """加载 model.toml，返回扁平化的参数字典。"""
+    if not model_config_path:
+        return {}
+    path = Path(model_config_path)
+    if not path.is_absolute():
+        path = project_root / path
+    if not path.exists():
+        return {}
+    with path.open("rb") as f:
+        raw = tomllib.load(f)
+    return _config_to_arg_defaults(raw)
+
+
+def _resolve_auto_cutoffs(
+    config: dict[str, object],
+    data_root: str,
+    project_root: Path,
+) -> None:
+    """将 config 中值为 'auto' 的 cutoff 解析为 dataset_profile.json 中的建议值。"""
+    profile_path = Path(data_root) / "dataset_profile.json"
+    if not profile_path.exists():
+        return
+    try:
+        with open(profile_path, encoding="utf-8") as f:
+            import json
+            profile = json.load(f)
+    except Exception:
+        return
+    suggested = profile.get("suggested_cutoffs", {})
+    # 映射 config 键到 profile 键
+    key_map = {
+        "dynamic_inter_cutoff": "ligand_atom-protein_atom",
+        "force_cutoff": "ligand_atom-protein_atom",
+    }
+    for cfg_key, profile_key in key_map.items():
+        if cfg_key in config and config[cfg_key] == "auto":
+            val = suggested.get(profile_key)
+            if val is not None:
+                config[cfg_key] = float(val)
+
+
 def main():
     default_config_path = PROJECT_ROOT / "configs" / "train.toml"
     pre_parser = argparse.ArgumentParser(add_help=False)
     pre_parser.add_argument("--config", type=str, default=str(default_config_path), help="Path to TOML config file")
     pre_args, _ = pre_parser.parse_known_args()
     config_defaults = load_train_config(pre_args.config)
+    model_config_path = config_defaults.get("model_config")
+    model_defaults = load_model_config(model_config_path, PROJECT_ROOT)
+    config_defaults.update(model_defaults)
+    # 解析 "auto" cutoff：从 dataset_profile.json 读取建议值
+    data_root_for_auto = config_defaults.get("data_root") or None
+    if data_root_for_auto:
+        _resolve_auto_cutoffs(model_defaults, str(data_root_for_auto), PROJECT_ROOT)
+    config_defaults.update(model_defaults)
 
     parser = argparse.ArgumentParser(
         description="Train EHFNet for molecular docking prediction",
         parents=[pre_parser],
     )
     
-    # 数据相关参数
-    # 使用动态路径作为默认值
-    default_data_root = PROJECT_ROOT / "data/processed/pdbbind"
-    default_index_file = default_data_root / "index.csv"
-    
-    parser.add_argument("--data_root", type=str, default=str(default_data_root), help="Path to PDBBind dataset root directory")
-    parser.add_argument("--index_file", type=str, default=str(default_index_file), help="Path to index CSV or PDBBind index file")
+    # 数据相关参数：只接受一个文件夹，该文件夹内必须包含 index.csv（不允许自定义 index 路径）
+    parser.add_argument("--data_root", type=str, default=None, help="数据根目录，须含 index.csv，如 data/processed/hiqbind（必填）")
     parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--esm_path", type=str, default=None, help="Path to precomputed ESM embeddings (optional)")
     
@@ -106,9 +151,15 @@ def main():
     parser.add_argument("--lig_mol_cont_count", type=int, default=len(LIGAND_MOLECULE_CONT_SCHEMA), help="Ligand molecule continuous feature count")
     parser.add_argument("--pro_atom_cont_count", type=int, default=len(PROTEIN_ATOM_CONT_SCHEMA), help="Protein atom continuous feature count")
     parser.add_argument("--esm_dim", type=int, default=960, help="ESM embedding dimension (default: 960 for ESMC-300M)")
+    parser.add_argument("--num_rbf", type=int, default=50, help="RBF basis count (from model.toml)")
+    parser.add_argument("--r_cutoff", type=float, default=10.0, help="Distance cutoff in Å (from model.toml)")
+    parser.add_argument("--force_cutoff", type=float, default=6.0, help="Force branch local radius in Å (from model.toml)")
+    parser.add_argument("--dynamic_inter_cutoff", type=float, default=10.0, help="Dynamic inter-atom edge radius (from model.toml)")
+    parser.add_argument("--dynamic_inter_knn_k", type=int, default=8, help="kNN fallback for inter-atom edges (from model.toml)")
+    parser.add_argument("--dynamic_residue_cutoff", type=float, default=14.0, help="Dynamic ligand-residue edge radius (from model.toml)")
+    parser.add_argument("--dynamic_residue_knn_k", type=int, default=6, help="kNN fallback for ligand-residue edges (from model.toml)")
     parser.add_argument("--device", type=str, default="cuda:0", help="Device to use for training (e.g., 'cuda:0', 'cuda:1', 'cpu')")
-    parser.add_argument("--pocket_radius", type=float, default=10.0, help="Runtime local docking radius in angstroms (default: 10.0)")
-    parser.add_argument("--protein_context_mode", type=str, default="full", choices=["full", "pocket"], help="Protein caching mode: full keeps whole protein and crops local pockets at runtime")
+    parser.add_argument("--crop_radius", type=float, default=10.0, help="Runtime local crop radius in angstroms (default: 10.0)")
     parser.add_argument("--warmup_epochs", type=int, default=20, help="Number of warmup epochs for spatial curriculum learning (default: 20)")
     parser.add_argument("--rmsd_ratio", type=float, default=0.2, help="Ratio of validation set to compute RMSD (0.0-1.0)")
     parser.add_argument("--accumulation_steps", type=int, default=8, help="Gradient accumulation steps")
@@ -144,8 +195,8 @@ def main():
         "--ablation_mode",
         type=str,
         default="none",
-        choices=["none", "inter_multiscale_off", "gt_only_crop"],
-        help="Ablation mode: none (full model), inter_multiscale_off (atom-atom only), gt_only_crop (GT center only training)",
+        choices=["none", "inter_multiscale_off"],
+        help="Ablation mode: none (full model), inter_multiscale_off (atom-atom only)",
     )
     parser.add_argument("--run_test_after_training", action="store_true", default=True, help="Run final test-set evaluation after training")
     parser.add_argument("--skip_test_after_training", dest="run_test_after_training", action="store_false", help="Skip final test-set evaluation")
@@ -194,6 +245,11 @@ def main():
     parser.set_defaults(**config_defaults)
 
     args = parser.parse_args()
+
+    if not (args.data_root and str(args.data_root).strip()):
+        parser.error("必须指定 --data_root 或在 config 中设置 data_root，例如: data/processed/hiqbind")
+    args.data_root = str(args.data_root).strip()
+    args.index_file = os.path.join(args.data_root, "index.csv")
 
     try:
         parsed_topk = tuple(int(x.strip()) for x in args.test_topk.split(",") if x.strip())
@@ -269,9 +325,15 @@ def main():
             pro_atom_cont_count=args.pro_atom_cont_count,
             pro_res_cont_count=args.pro_res_cont_count,
             esm_dim=args.esm_dim,
+            num_rbf=args.num_rbf,
+            r_cutoff=args.r_cutoff,
+            force_cutoff=args.force_cutoff,
+            dynamic_inter_cutoff=args.dynamic_inter_cutoff,
+            dynamic_inter_knn_k=args.dynamic_inter_knn_k,
+            dynamic_residue_cutoff=args.dynamic_residue_cutoff,
+            dynamic_residue_knn_k=args.dynamic_residue_knn_k,
             device=args.device,
-            pocket_radius=args.pocket_radius,
-            protein_context_mode=args.protein_context_mode,
+            crop_radius=args.crop_radius,
             normalization_stats=normalization_stats,
             warmup_epochs=args.warmup_epochs,
             rmsd_check_ratio=args.rmsd_ratio,

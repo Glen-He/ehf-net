@@ -1,7 +1,9 @@
 """
-PDBBind 数据集
+蛋白-配体复合物数据集
 
-提供基于 PDBBind 目录结构的 Dataset 实现，并将原始复合物处理为 HeteroData 缓存。
+通用目录结构：根目录下 cleaned/<complex_id>/ 存放配体、蛋白及可选 ESM 缓存，
+配合 index.csv（表头 Concatenated ID、Log Binding Affinity）即可用于各类结合数据（如 HiqBind、PDBBind 等）。
+将原始复合物处理为 HeteroData 图缓存。
 """
 
 import os
@@ -31,8 +33,9 @@ from ehfnet.datasets.ligand_sanitize import LigandSanitizationError
 
 logger = logging.getLogger(__name__)
 
-ESM_CACHE_VERSION_TAG = "chainseg_v3"
-GRAPH_CACHE_VERSION_TAG = "feature_v2"
+ESM_CACHE_VERSION_TAG = "esm_chainseg"
+GRAPH_CACHE_VERSION_TAG = "graph_cache"
+GRAPH_CACHE_DIRNAME = "cache"
 PREPROCESS_SUMMARY_FILENAME = "preprocess_summary.json"
 PREPROCESS_METADATA_DIRNAME = "_preprocess_meta"
 
@@ -56,14 +59,14 @@ def load_index(index_file: str) -> pd.DataFrame:
     """
     加载数据索引文件。
 
-    仅支持 CSV 格式：
-    - 必须包含列 {"pdb_id", "affinity"}
+    表头必须为 "Concatenated ID" 与 "Log Binding Affinity"（与 prepare_data 输出一致），
+    使用 pdb_id/affinity 等其它列名会报错。
 
     Args:
         index_file: 索引文件路径
 
     Returns:
-        包含 pdb_id 与 affinity 的 DataFrame
+        含 pdb_id、affinity 列的 DataFrame（由上述两列重命名得到）
     """
 
     if not osp.exists(index_file):
@@ -72,13 +75,14 @@ def load_index(index_file: str) -> pd.DataFrame:
     if not index_file.endswith(".csv"):
         raise ValueError("Index file must be a CSV file.")
 
-    df = pd.read_csv(index_file)
-    required_cols = {"pdb_id", "affinity"}
+    df = pd.read_csv(index_file, encoding="utf-8-sig")
+    df.columns = df.columns.str.strip().str.replace("\ufeff", "", regex=False)
+    if "Concatenated ID" not in df.columns or "Log Binding Affinity" not in df.columns:
+        raise ValueError(
+            f"index.csv 表头必须为 Concatenated ID、Log Binding Affinity，不能使用 pdb_id/affinity 等其它列名。当前列: {list(df.columns)}"
+        )
+    df = df.rename(columns={"Concatenated ID": "pdb_id", "Log Binding Affinity": "affinity"})
 
-    if not required_cols.issubset(df.columns):
-        raise ValueError(f"CSV must contain columns: {required_cols}")
-
-    # 过滤掉 affinity 为 NaN 的无效行
     initial_len = len(df)
     df = df.dropna(subset=["affinity"])
     if len(df) < initial_len:
@@ -146,7 +150,7 @@ def esm_cache_paths(pdb_id: str, pdb_dir: str, esm_root: str | None) -> tuple[st
         (read_path, write_path)
     """
 
-    local_path = osp.join(pdb_dir, f"{pdb_id}_esm_{ESM_CACHE_VERSION_TAG}.npz")
+    local_path = osp.join(pdb_dir, f"{pdb_id}_{ESM_CACHE_VERSION_TAG}.npz")
 
     if osp.exists(local_path):
         return local_path, local_path
@@ -162,11 +166,12 @@ def esm_cache_paths(pdb_id: str, pdb_dir: str, esm_root: str | None) -> tuple[st
     return None, local_path
 
 
-class PDBBindDataset(Dataset):
+class ProteinLigandDataset(Dataset):
     """
-    PDBBind 数据集。
+    蛋白-配体复合物数据集。
 
-    读取 index_file 并在 processed_dir 下缓存每个复合物的图数据文件 data_{pdb_id}.pt。
+    目录结构：root/cleaned/<id>/ 下为各复合物；index.csv 表头为 Concatenated ID、Log Binding Affinity。
+    在 processed 目录下缓存每个复合物的图数据 data_{pdb_id}.pt。
     """
 
 
@@ -182,18 +187,15 @@ class PDBBindDataset(Dataset):
         pre_transform: Callable | None = None,
         pre_filter: Callable | None = None,
         r_cutoff_intra: float = 5.0,
-        r_cutoff_inter: float = 6.0,
         max_neighbors_intra: int = 64,
-        max_neighbors_inter: int = 32,
         interaction_profile: str = "full",
         force_reprocess: bool = False,
         esm_dim: int = 960,
-        pocket_radius: float | None = 20.0,
     ) -> None:
         """
         Args:
-            root: 数据集根目录（包含 raw/processed）
-            index_file: 索引文件路径（CSV 或 PDBBind INDEX 格式）
+            root: 数据集根目录（其下应有 cleaned/）
+            index_file: 索引 CSV 路径（表头 Concatenated ID、Log Binding Affinity）
             esm_root: 全局 ESM 缓存目录（可选）
             esm: ESM 处理模式（如 "auto"）
             esm_model_name: ESM 模型名称
@@ -201,13 +203,10 @@ class PDBBindDataset(Dataset):
             pre_transform: PyG Dataset 的 pre_transform（可选）
             pre_filter: PyG Dataset 的 pre_filter（可选）
             r_cutoff_intra: 图内边半径阈值
-            r_cutoff_inter: 保留兼容参数；动态跨图边现由 encoder 侧控制
             max_neighbors_intra: 图内最大邻居数
-            max_neighbors_inter: 保留兼容参数；动态跨图边现由 encoder 侧控制
             interaction_profile: 跨图交互配置（"full" 或 "atom_only"）
             force_reprocess: 是否强制重建缓存
             esm_dim: ESM embedding 维度
-            pocket_radius: 口袋提取半径 (Å)。设为 None 则不进行裁剪。
         """
         self.index_file = index_file
         self.esm_root = esm_root
@@ -215,7 +214,6 @@ class PDBBindDataset(Dataset):
         self.esm_model_name = esm_model_name
         self.force_reprocess = force_reprocess
         self.esm_dim = esm_dim
-        self.pocket_radius = pocket_radius
 
         self.index_df = load_index(index_file)
 
@@ -239,9 +237,7 @@ class PDBBindDataset(Dataset):
 
         self.graph_builder = GraphBuilder(
             r_cutoff_intra=r_cutoff_intra,
-            r_cutoff_inter=r_cutoff_inter,
             max_neighbors_intra=max_neighbors_intra,
-            max_neighbors_inter=max_neighbors_inter,
             esm_filler=esm_filler,
             interaction_profile=interaction_profile,
         )
@@ -307,9 +303,7 @@ class PDBBindDataset(Dataset):
 
     @property
     def processed_dir(self) -> str:
-        if self.pocket_radius is None:
-            return osp.join(self.root, f"processed_full_{GRAPH_CACHE_VERSION_TAG}")
-        return osp.join(self.root, f"processed_{GRAPH_CACHE_VERSION_TAG}")
+        return osp.join(self.root, GRAPH_CACHE_DIRNAME)
 
     @property
     def raw_file_names(self) -> list[str]:
@@ -342,6 +336,9 @@ class PDBBindDataset(Dataset):
 
     def _write_preprocess_metadata(self, pdb_id: str, metadata: dict[str, Any]) -> None:
         os.makedirs(self.preprocess_metadata_dir, exist_ok=True)
+        metadata = dict(metadata)
+        metadata.setdefault("graph_mode", "blind")
+        metadata.setdefault("cache_dir", GRAPH_CACHE_DIRNAME)
         with open(self._preprocess_metadata_path(pdb_id), "w", encoding="utf-8") as f:
             json.dump(metadata, f, ensure_ascii=True, indent=2, sort_keys=True)
 
@@ -359,6 +356,8 @@ class PDBBindDataset(Dataset):
         payload["ligand_sanitize_mode"] = _normalize_ligand_sanitize_mode(
             payload.get("ligand_sanitize_mode")
         )
+        payload.setdefault("graph_mode", "blind")
+        payload.setdefault("cache_dir", GRAPH_CACHE_DIRNAME)
         return payload
 
     def _load_or_recover_preprocess_metadata(self, pdb_id: str, graph_path: str) -> dict[str, Any]:
@@ -468,6 +467,8 @@ class PDBBindDataset(Dataset):
 
         summary = {
             "graph_cache_version": GRAPH_CACHE_VERSION_TAG,
+            "graph_mode": "blind",
+            "cache_dir": GRAPH_CACHE_DIRNAME,
             "esm_cache_version": ESM_CACHE_VERSION_TAG,
             "processed_dir": osp.abspath(self.processed_dir),
             "index_file": osp.abspath(self.index_file),
@@ -550,7 +551,6 @@ class PDBBindDataset(Dataset):
                     esm=self.esm,
                     esm_model=self._esm_model,
                     esm_model_name=self.esm_model_name,
-                    pocket_radius=self.pocket_radius,
                 )
 
         return data
@@ -638,36 +638,17 @@ class PDBBindDataset(Dataset):
 
         data = cast(HeteroData, torch.load(file_path, weights_only=False))
         
-        # [新增] 几何合理性检查：检测原子间最小距离，防止奇异解
-        if "ligand_atom" in data and hasattr(data["ligand_atom"], "pos"):
-            lig_pos = data["ligand_atom"].pos
-            if lig_pos.shape[0] > 1:
-                # 计算配体原子间的最小距离
-                dist_mat = torch.cdist(lig_pos, lig_pos, p=2)
-                # 排除对角线（自身距离为0）
-                dist_mat = dist_mat + torch.eye(dist_mat.shape[0], device=dist_mat.device) * 1000.0
-                min_dist = dist_mat.min().item()
-                
-                # 原子间最小合理距离约 0.5 Å（共价键长度通常 > 1.0 Å）
-                if min_dist < 0.5:
-                    logger.warning(
-                        f"Sample {pdb_id} has unreasonable geometry: min atom distance = {min_dist:.3f} Å. "
-                        "This may cause numerical instability."
-                    )
-        
-        # [新增] 实时归一化逻辑
+        # 几何合理性检查已移至 preprocess build 阶段一次性完成
+
+        # 实时归一化逻辑
         if hasattr(data, "y_energy"):
             raw_val = data.y_energy
             
-            # [鲁棒性修改] 确保 raw_val 是 Tensor，防止意外的类型问题
             if not isinstance(raw_val, torch.Tensor):
                 raw_val = torch.tensor(raw_val, dtype=torch.float)
                 
-            # 保存原始值用于评估
             data.y_energy_raw = raw_val
             
-            # 归一化: (x - mean) / std
-            # 显式转换为 float tensor 进行计算，确保结果仍为 Tensor
             mean = self.affinity_stats["mean"]
             std = self.affinity_stats["std"]
             data.y_energy = (raw_val - mean) / std
@@ -694,8 +675,7 @@ class PDBBindDataset(Dataset):
             )
             data["protein_pocket"].num_nodes = int(data["protein_pocket"].x_cont.size(0))
 
-        # 为 blind candidate replay 提供稳定、可重放的数据集索引。
-        # 该索引基于底层 PDBBindDataset，而不是 DataLoader/batch 内局部编号。
+        # 为 blind candidate replay 提供稳定、可重放的数据集索引（基于本 Dataset，非 DataLoader 内局部编号）
         data.dataset_index = int(idx)
         data.dataset_pdb_id = str(pdb_id)
             

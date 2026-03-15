@@ -1,0 +1,36 @@
+# EHFNet 模型内部参数
+# 训练相关参数在 train.toml 中配置
+
+[rbf]
+num_rbf = 50
+rbf_start = 0.0
+rbf_stop = 10.0
+
+[geometry]
+frame_refine_threshold = 0.55
+frame_refine_temperature = 0.12
+energy_guide_threshold = 0.75
+energy_guide_temperature = 0.10
+
+[collision]
+clash_threshold = 2.0
+clash_push_threshold = 2.2
+clash_push_force = 6.0
+score_clamp_min = -50.0
+score_clamp_max = 50.0
+force_limit = 20.0
+
+[edges]
+dynamic_inter_cutoff = 10.0
+dynamic_inter_knn_k = 8
+dynamic_residue_cutoff = 14.0
+dynamic_residue_knn_k = 6
+force_cutoff = 6.0
+intra_atom_radius = 5.0
+intra_max_neighbors = 32
+
+[prediction]
+r_cutoff = 10.0
+max_neighbors = 256
+min_max_neighbors = 64
+knn_fallback_k = 8

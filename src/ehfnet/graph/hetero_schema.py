@@ -70,7 +70,3 @@ BROADCAST_EDGES: list[tuple[str, str, str]] = [
     ("protein_pocket", "broadcast_to", "protein_residue"),
     ("protein_residue", "broadcast_to", "protein_atom"),
 ]
-
-
-# 所有边的集合
-ALL_EDGES: list[tuple[str, str, str]] = INTRA_EDGES + AGGREGATE_EDGES + INTER_EDGES + BROADCAST_EDGES

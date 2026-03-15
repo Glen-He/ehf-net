@@ -38,6 +38,60 @@ def rerank_bce_loss(
     return F.binary_cross_entropy_with_logits(logits, targets, weight=weight)
 
 
+def _pairwise_margin_ranking_core(
+    logit_a: Tensor,
+    logit_b: Tensor,
+    target_a: Tensor,
+    target_b: Tensor,
+    *,
+    margin: float,
+    min_delta: float = 0.05,
+    extra_mask: Tensor | None = None,
+) -> tuple[Tensor, int]:
+    """Pairwise margin ranking 核心逻辑。
+
+    期望 logit_a[i] vs logit_b[i] 构成一对，target 越大表示质量越好。
+    """
+    qa = target_a.view(-1)
+    qb = target_b.view(-1)
+    sa = logit_a.view(-1)
+    sb = logit_b.view(-1)
+    delta = qa - qb
+    valid = delta.abs() >= min_delta
+    if extra_mask is not None:
+        valid = valid & extra_mask.view(-1).to(device=valid.device, dtype=torch.bool)
+    if not valid.any():
+        return sa.new_zeros(()), 0
+    direction = torch.sign(delta[valid])
+    loss = F.relu(margin - direction * (sa[valid] - sb[valid])).mean()
+    return loss, int(valid.sum().item())
+
+
+def pairwise_ranking_loss_from_pairs(
+    pose_logit_a: Tensor,
+    pose_target_a: Tensor,
+    pose_logit_b: Tensor,
+    pose_target_b: Tensor,
+    *,
+    margin: float,
+    min_delta: float = 0.05,
+    extra_mask: Tensor | None = None,
+) -> tuple[Tensor, int]:
+    """从已配对 (logit_a, target_a) vs (logit_b, target_b) 计算 pairwise ranking loss。
+
+    供 trainer 等调用。
+    """
+    return _pairwise_margin_ranking_core(
+        pose_logit_a,
+        pose_logit_b,
+        pose_target_a,
+        pose_target_b,
+        margin=margin,
+        min_delta=min_delta,
+        extra_mask=extra_mask,
+    )
+
+
 def rerank_pairwise_loss(
     logits: Tensor,
     rmsd: Tensor,
@@ -62,6 +116,10 @@ def rerank_pairwise_loss(
     if pair_indices is not None:
         idx_a = pair_indices[:, 0]
         idx_b = pair_indices[:, 1]
+        logit_a = logits[idx_a]
+        logit_b = logits[idx_b]
+        target_a = targets[idx_a]
+        target_b = targets[idx_b]
     else:
         N = logits.size(0)
         idx_a = torch.arange(N, device=logits.device).repeat_interleave(N)
@@ -69,20 +127,16 @@ def rerank_pairwise_loss(
         mask_diag = idx_a != idx_b
         idx_a = idx_a[mask_diag]
         idx_b = idx_b[mask_diag]
+        logit_a = logits[idx_a]
+        logit_b = logits[idx_b]
+        target_a = targets[idx_a]
+        target_b = targets[idx_b]
 
-    qa = targets[idx_a]
-    qb = targets[idx_b]
-    sa = logits[idx_a]
-    sb = logits[idx_b]
-
-    delta = qa - qb
-    valid = delta.abs() >= min_delta
-    if not valid.any():
-        return logits.new_tensor(0.0), 0
-
-    direction = torch.sign(delta[valid])
-    loss = F.relu(margin - direction * (sa[valid] - sb[valid])).mean()
-    return loss, int(valid.sum().item())
+    return _pairwise_margin_ranking_core(
+        logit_a, logit_b, target_a, target_b,
+        margin=margin,
+        min_delta=min_delta,
+    )
 
 
 def rerank_listwise_loss(
