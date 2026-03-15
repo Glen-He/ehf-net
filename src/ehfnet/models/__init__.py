@@ -1,31 +1,66 @@
 """
-模型模块
+模型模块入口。
+
+导出主模型和关键子模块，
+统一模型侧公开对象的导入路径。
 """
 
-from ehfnet.models.layers.embeddings import (
-    TimeEmbedding,
-    LigandAtomEmbedding,
-    ProteinAtomEmbedding,
-    LigandMoleculeEmbedding,
-    ProteinResidueEmbedding,
-    ProteinPocketEmbedding,
-)
-from ehfnet.models.layers.encoder import EHFEncoder
-from ehfnet.models.heads.prediction import PredictionHead
-from ehfnet.models.ehfnet import EHFNet
+
+from importlib import import_module
 
 __all__ = [
-    # Embeddings
+    "EHFNet",
+    "PredictionHead",
     "TimeEmbedding",
     "LigandAtomEmbedding",
-    "ProteinAtomEmbedding",
     "LigandMoleculeEmbedding",
+    "ProteinAtomEmbedding",
+    "ProteinContextEmbedding",
     "ProteinResidueEmbedding",
-    "ProteinPocketEmbedding",
-    # Encoder
     "EHFEncoder",
-    # Heads
-    "PredictionHead",
-    # Main Model
-    "EHFNet",
 ]
+
+_EXPORT_MAP = {
+    "EHFNet": ("ehfnet.models.ehfnet", "EHFNet"),
+    "PredictionHead": ("ehfnet.models.heads.prediction", "PredictionHead"),
+    "TimeEmbedding": ("ehfnet.models.layers.embeddings", "TimeEmbedding"),
+    "LigandAtomEmbedding": ("ehfnet.models.layers.embeddings", "LigandAtomEmbedding"),
+    "LigandMoleculeEmbedding": (
+        "ehfnet.models.layers.embeddings",
+        "LigandMoleculeEmbedding",
+    ),
+    "ProteinAtomEmbedding": ("ehfnet.models.layers.embeddings", "ProteinAtomEmbedding"),
+    "ProteinContextEmbedding": (
+        "ehfnet.models.layers.embeddings",
+        "ProteinContextEmbedding",
+    ),
+    "ProteinResidueEmbedding": (
+        "ehfnet.models.layers.embeddings",
+        "ProteinResidueEmbedding",
+    ),
+    "EHFEncoder": ("ehfnet.models.layers.encoder", "EHFEncoder"),
+}
+
+
+def __getattr__(name: str):
+    """
+    按名称返回公开对象。
+
+    仅在首次访问时执行真实导入，
+    用于避免包初始化阶段触发重模块加载或循环依赖。
+
+    Args:
+        name: 请求访问或解析的公开对象名称。
+
+    Returns:
+        object: 返回与名称对应的惰性导出对象。
+
+    Raises:
+        AttributeError: 当访问的属性不存在或对象不满足接口约定时抛出。
+    """
+
+    if name in _EXPORT_MAP:
+        module_name, attr_name = _EXPORT_MAP[name]
+        module = import_module(module_name, package=__name__)
+        return getattr(module, attr_name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

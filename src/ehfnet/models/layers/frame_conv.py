@@ -1,42 +1,10 @@
 """
-帧感知异构消息传递
+帧感知卷积层。
 
-为分层 EGNN 编码器的 Aggregate / Broadcast / Intra-feat / Inter-feat 阶段提供
-SE(3)-不变的消息传递，彻底取代原 SAGEConv。
-
-根本问题：
-    SAGEConv 的消息 m_{i→j} = W · [h_i ‖ mean_nbr(h)] 完全忽略几何位置，
-    导致 Aggregate/Broadcast 传播的特征不含方向信息。后续 EGNN 的坐标更新：
-        Δx_i = Σ_j (x_i - x_j) · φ_e(m_{ij})
-    中，调制系数 φ_e 依赖 h，但 h 里混入了非等变高层广播信息，造成等变性软破坏：
-    坐标更新方向正确（等变），但幅度调制不再是旋转不变量。
-
-修复原理（FrameAwareConv）：
-    在消息中引入三类旋转不变几何特征，构成严格 SE(3)-不变的消息：
-
-      ① h_src, h_dst            — 标量节点特征（SE(3)-不变量）
-      ② RBF(d_{ij})             — 距离径向基函数特征（旋转不变量）
-      ③ R̂_j^T · r̂_{ij}         — 在 dst 局部帧中表达的单位方向向量（旋转不变量）
-
-    局部帧 R̂_j 由 dst 节点的邻域均值方向经 Gram-Schmidt 正交化构造，
-    全向量化（无 Python 循环），前向开销极小。
-
-    不变性证明（③）：
-        全局旋转 Q 作用时：
-          r̂_{ij}                → Q r̂_{ij}
-          R̂_j（由 dst 邻域构造）→ Q R̂_j
-          R̂_j^T r̂_{ij}         → (Q R̂_j)^T (Q r̂_{ij})
-                                = R̂_j^T Q^T Q r̂_{ij}
-                                = R̂_j^T r̂_{ij}         ✓ 不变
-
-消息公式：
-    m_{i→j} = φ_msg( h_i, h_j, RBF(d_{ij}), R̂_j^T r̂_{ij} )
-                · σ( φ_gate( RBF(d_{ij}) ) )
-
-    φ_msg  — LayerNorm + Linear + SiLU + Linear
-    φ_gate — Linear + Sigmoid（距离衰减门控，近邻权重大）
-    聚合    — scatter_mean（不受节点度数比例影响）
+提供结合局部参考帧的异构消息传递算子，
+用于几何感知的特征更新与聚合。
 """
+
 
 import torch
 import torch.nn as nn
@@ -45,18 +13,14 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch_scatter import scatter_mean
 
-
 from ehfnet.models.layers.rbf import GaussianRBF
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 局部帧构造（Gram-Schmidt，全向量化）
-# ─────────────────────────────────────────────────────────────────────────────
 
 def compute_mean_direction_frame(
     src_pos: Tensor,
     dst_pos: Tensor,
     edge_index: Tensor,
+    *,
     eps: float = 1e-8,
 ) -> Tensor:
     """
@@ -76,10 +40,10 @@ def compute_mean_direction_frame(
         - 无邻居 / 主方向接近零向量时退化为单位矩阵（保持 SE(3)-不变性）。
 
     Args:
-        src_pos:    源节点坐标 [N_src, 3]
-        dst_pos:    目标节点坐标 [N_dst, 3]
-        edge_index: 边索引 [2, E]，row0=src_idx, row1=dst_idx
-        eps:        向量归一化的数值保护项
+        src_pos: 源节点坐标，形状 [N_src, 3]。
+        dst_pos: 目标节点坐标，形状 [N_dst, 3]。
+        edge_index: 边索引张量，形状 [2, E]。
+        eps: 数值稳定用的小常数，用于避免除零。
 
     Returns:
         R: [N_dst, 3, 3]，列向量为体坐标轴（body→world），已 detach
@@ -90,7 +54,6 @@ def compute_mean_direction_frame(
     device  = dst_pos.device
     dtype   = dst_pos.dtype
 
-    # 默认帧：单位矩阵（无邻居节点也有合法帧）
     R = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).expand(N_dst, -1, -1).clone()
 
     if src_idx.numel() == 0:
@@ -99,7 +62,6 @@ def compute_mean_direction_frame(
     src_pos_d = src_pos.detach()
     dst_pos_d = dst_pos.detach()
 
-    # ── 计算每个 dst 节点的邻域均值位置（向量化 scatter_add） ─────────────────
     count = torch.zeros(N_dst, device=device, dtype=dtype)
     count.scatter_add_(0, dst_idx, torch.ones(dst_idx.shape[0], device=device, dtype=dtype))
 
@@ -110,41 +72,32 @@ def compute_mean_direction_frame(
     valid_count = count[has_nbrs].unsqueeze(-1).clamp(min=1.0)
     mean_src[has_nbrs] = mean_src[has_nbrs] / valid_count
 
-    # ── e1：dst → 邻域均值方向 ────────────────────────────────────────────────
-    e1_raw  = mean_src - dst_pos_d                            # [N_dst, 3]
+    e1_raw = mean_src - dst_pos_d
     e1_norm = e1_raw.norm(dim=-1, keepdim=True).clamp(min=eps)
-    e1      = e1_raw / e1_norm                                # [N_dst, 3]
+    e1 = e1_raw / e1_norm
 
     degenerate_frame = has_nbrs & (e1_norm.squeeze(-1) < eps * 10)
     if degenerate_frame.any():
         has_nbrs = has_nbrs & ~degenerate_frame
 
-    # ── Gram-Schmidt：用参考轴构造与 e1 正交的 e2 ─────────────────────────────
-    # 默认参考轴：x 轴；若 e1 与 x 轴近似平行（|cos| > 0.9），改用 y 轴
     ref = torch.zeros_like(e1)
     ref[:, 0] = 1.0
     parallel_with_x = e1[:, 0].abs() > 0.9
     ref[parallel_with_x, 0] = 0.0
     ref[parallel_with_x, 1] = 1.0
 
-    dot    = (e1 * ref).sum(dim=-1, keepdim=True)             # [N_dst, 1]
+    dot = (e1 * ref).sum(dim=-1, keepdim=True)
     e2_raw = ref - dot * e1
     e2_norm = e2_raw.norm(dim=-1, keepdim=True).clamp(min=eps)
-    e2     = e2_raw / e2_norm                                 # [N_dst, 3]
+    e2 = e2_raw / e2_norm
 
-    # ── e3 = e1 × e2（右手系） ────────────────────────────────────────────────
-    e3 = torch.linalg.cross(e1, e2)                           # [N_dst, 3]
+    e3 = torch.linalg.cross(e1, e2)
 
-    # ── 组装：列向量 = 主轴 ───────────────────────────────────────────────────
-    R_computed = torch.stack([e1, e2, e3], dim=-1)            # [N_dst, 3, 3]
+    R_computed = torch.stack([e1, e2, e3], dim=-1)
     R[has_nbrs] = R_computed[has_nbrs]
 
     return R.detach()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 单边类型帧感知卷积
-# ─────────────────────────────────────────────────────────────────────────────
 
 class FrameAwareConv(nn.Module):
     """
@@ -173,16 +126,16 @@ class FrameAwareConv(nn.Module):
         cutoff: float = 20.0,
     ) -> None:
         """
+        初始化对象。
+
         Args:
-            hidden_dim: 节点特征维度 H（src/dst 均为 H，输出也是 H）
-            num_rbf:    高斯 RBF 基函数数量
-            cutoff:     RBF 覆盖的最大距离 Å（超出范围的边几乎无信号）
+            hidden_dim: 隐藏层维度。
+            num_rbf: RBF 基函数数量。
+            cutoff: 截断阈值。
         """
         super().__init__()
-        self.rbf    = GaussianRBF(0.0, cutoff, num_rbf)
+        self.rbf    = GaussianRBF(0.0, cutoff, num_gaussians=num_rbf)
 
-        # 消息 MLP：输入 = [h_src ‖ h_dst ‖ RBF(d) ‖ r_body]
-        #   维度 = H + H + num_rbf + 3 = 2H + num_rbf + 3
         msg_in_dim = hidden_dim * 2 + num_rbf + 3
         self.msg_mlp = nn.Sequential(
             nn.LayerNorm(msg_in_dim),
@@ -191,8 +144,6 @@ class FrameAwareConv(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # 距离门控：仅依赖 RBF 特征，输出 H 维 Sigmoid 门控
-        # 物理含义：耦合强度随距离单调衰减
         self.dist_gate = nn.Sequential(
             nn.Linear(num_rbf, hidden_dim),
             nn.Sigmoid(),
@@ -200,20 +151,32 @@ class FrameAwareConv(nn.Module):
 
     def forward(
         self,
-        h_src:      Tensor,   # [N_src, H]
-        pos_src:    Tensor,   # [N_src, 3]
-        h_dst:      Tensor,   # [N_dst, H]
-        pos_dst:    Tensor,   # [N_dst, 3]
-        edge_index: Tensor,   # [2, E]，row0=src_idx, row1=dst_idx
+        h_src: Tensor,
+        pos_src: Tensor,
+        h_dst: Tensor,
+        pos_dst: Tensor,
+        edge_index: Tensor,
     ) -> Tensor:
         """
+        执行帧感知消息传递。
+
+        结合局部参考帧、距离编码与节点特征计算单类边的聚合消息，
+        用于几何感知的节点更新。
+
+        Args:
+            h_src: 源节点特征张量。
+            pos_src: 源节点坐标张量。
+            h_dst: 目标节点特征张量。
+            pos_dst: 目标节点坐标张量。
+            edge_index: 边索引张量。
+
         Returns:
             aggr: 聚合消息 [N_dst, H]
         """
-        N_dst  = h_dst.shape[0]
-        H      = h_src.shape[1]
+        N_dst = h_dst.shape[0]
+        H = h_src.shape[1]
         device = h_src.device
-        dtype  = h_src.dtype
+        dtype = h_src.dtype
 
         if edge_index.numel() == 0 or edge_index.shape[1] == 0:
             return torch.zeros(N_dst, H, device=device, dtype=dtype)
@@ -221,36 +184,24 @@ class FrameAwareConv(nn.Module):
         src_idx = edge_index[0]
         dst_idx = edge_index[1]
 
-        # ── 几何特征（全为旋转不变量） ─────────────────────────────────────────
-        r_vec    = pos_src[src_idx] - pos_dst[dst_idx]           # [E, 3]
-        dist     = torch.sqrt((r_vec ** 2).sum(dim=-1) + 1e-8)     # [E]
-        rbf_feat = self.rbf(dist)                                 # [E, num_rbf]
+        r_vec = pos_src[src_idx] - pos_dst[dst_idx]
+        dist = torch.sqrt((r_vec ** 2).sum(dim=-1) + 1e-8)
+        rbf_feat = self.rbf(dist)
 
-        # dst 局部帧：[N_dst, 3, 3]，列向量 = 体轴（body→world），已 detach
         R_dst = compute_mean_direction_frame(pos_src, pos_dst, edge_index)
+        r_hat = F.normalize(r_vec, dim=-1, eps=1e-8)
+        R_edge = R_dst[dst_idx]
+        r_body = torch.einsum("eji,ej->ei", R_edge, r_hat)
 
-        # 将世界帧方向投影至 dst 局部帧（旋转不变量）
-        # r_body[e,i] = Σ_j R_dst[dst_idx[e], j, i] · r_hat[e, j]
-        #             = (R^T @ r_hat)_i  （列 = 体轴 → R 是 body→world，R^T 是 world→body）
-        r_hat  = F.normalize(r_vec, dim=-1, eps=1e-8)             # [E, 3]
-        R_edge = R_dst[dst_idx]                                   # [E, 3, 3]
-        r_body = torch.einsum("eji,ej->ei", R_edge, r_hat)       # [E, 3]
-
-        # ── 消息计算（Gated MLP） ────────────────────────────────────────────
         msg_in = torch.cat(
             [h_src[src_idx], h_dst[dst_idx], rbf_feat, r_body], dim=-1
-        )                                                         # [E, 2H+num_rbf+3]
-        gate = self.dist_gate(rbf_feat)                           # [E, H]
-        msg  = self.msg_mlp(msg_in) * gate                        # [E, H]
+        )
+        gate = self.dist_gate(rbf_feat)
+        msg = self.msg_mlp(msg_in) * gate
 
-        # ── scatter_mean 聚合 ─────────────────────────────────────────────────
-        aggr = scatter_mean(msg, dst_idx, dim=0, dim_size=N_dst)  # [N_dst, H]
+        aggr = scatter_mean(msg, dst_idx, dim=0, dim_size=N_dst)
         return aggr
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# 多边类型异构帧感知卷积
-# ─────────────────────────────────────────────────────────────────────────────
 
 class FrameAwareHeteroConv(nn.Module):
     """
@@ -272,13 +223,20 @@ class FrameAwareHeteroConv(nn.Module):
         self,
         convs: dict[tuple[str, str, str], FrameAwareConv],
     ) -> None:
+        """
+        初始化异构帧感知卷积层。
+
+        按边类型组织多组帧感知卷积模块，
+        为异构图上的多关系消息传递做准备。
+
+        Args:
+            convs: 按边类型 (src, rel, dst) 组织的帧感知卷积模块字典。
+        """
         super().__init__()
 
-        # 存入 ModuleDict（字符串化键）
         self._convs = nn.ModuleDict({
             "__".join(k): v for k, v in convs.items()
         })
-        # 反向映射：字符串键 → 原始三元组
         self._edge_keys: dict[str, tuple[str, str, str]] = {
             "__".join(k): k for k in convs.keys()
         }
@@ -290,10 +248,15 @@ class FrameAwareHeteroConv(nn.Module):
         edge_index_dict: dict[tuple[str, str, str], Tensor],
     ) -> dict[str, Tensor]:
         """
+        执行异构帧感知消息传递。
+
+        遍历不同边类型的卷积模块并汇总结果，
+        输出各节点类型的聚合消息字典。
+
         Args:
-            x_dict:          节点特征字典 {node_type: [N, H]}
-            full_pos_dict:   节点坐标字典 {node_type: [N, 3]}（含 molecule/residue/pocket）
-            edge_index_dict: 边索引字典   {(src,rel,dst): [2, E]}
+            x_dict: 各节点类型的标量特征字典。
+            full_pos_dict: 各节点类型的坐标字典。
+            edge_index_dict: 各边类型的边索引字典。
 
         Returns:
             out_dict: {dst_type: aggregated_msg [N_dst, H]}
@@ -319,7 +282,7 @@ class FrameAwareHeteroConv(nn.Module):
                 x_dict[src_t], src_pos,
                 x_dict[dst_t], dst_pos,
                 edge,
-            )  # [N_dst, H]
+            )
 
             if dst_t in out:
                 out[dst_t] = out[dst_t] + msg

@@ -1,27 +1,32 @@
 """
-图数据批处理拼接
+图批处理工具。
 
-提供 HeteroData 的 batch 拼接逻辑，并对扭转约束字段进行定制化合并。
+负责样本拼接、batch 属性整理和扭转约束合并，
+服务 DataLoader 阶段的批处理组装。
 """
 
-import torch
 
 from typing import cast
+
+import torch
 from torch_geometric.data import Batch, HeteroData
 from torch_geometric.data.data import BaseData
 
 
 class GraphCollator:
     """
-    图数据 Collator。
+    图批处理器。
 
-    负责将多个 HeteroData 样本拼接成 Batch，并补齐跨样本的扭转约束张量。
+    负责将多个 `HeteroData` 样本合并为批对象，
+    并同步整理 torsion 约束等跨样本需要重建的附加字段。
     """
 
     def __init__(self, *, follow_batch: list[str] | None = None) -> None:
         """
+        初始化对象。
+
         Args:
-            follow_batch: 需要额外生成 `<node_type>_batch` 索引的节点类型列表
+            follow_batch: follow_batch 中列出的节点类型所属的 batch 索引。
         """
 
         self.follow_batch = follow_batch or []
@@ -31,11 +36,13 @@ class GraphCollator:
         """
         将样本列表拼接为 Batch。
 
+        调用 PyG 默认拼接逻辑，并补齐 torsion 约束与 residue 索引偏移。
+
         Args:
-            samples: HeteroData 样本列表
+            samples: 待拼接的 HeteroData 样本列表。
 
         Returns:
-            Batch 对象
+            Batch: 返回拼接后的批量图对象，含 torsion_indices、torsion_moving_mask 及偏移后的 residue_idx。
         """
 
         exclude_keys = ["torsion_indices", "torsion_moving_mask"]
@@ -56,11 +63,14 @@ class GraphCollator:
         需要在 batch 维度上做索引偏移，并构建全局 moving mask。
 
         Args:
-            batch: 已由 PyG 默认逻辑拼接好的 Batch
-            samples: 原始样本列表
+            batch: 已由 PyG 默认逻辑拼接好的 Batch。
+            samples: 原始样本列表。
 
         Returns:
-            更新后的 Batch
+            Batch: 返回补齐扭转约束字段后的批量图对象。
+
+        Raises:
+            ValueError: 当输入参数或运行时状态不满足要求时抛出。
         """
 
         if not samples:
@@ -76,7 +86,6 @@ class GraphCollator:
         ligand_atom_offset = 0
 
         for data in samples:
-            # 优先从属性获取，否则尝试推断
             if hasattr(data["ligand_atom"], "num_nodes") and data["ligand_atom"].num_nodes is not None:
                 n_lig = int(data["ligand_atom"].num_nodes)
             elif hasattr(data["ligand_atom"], "pos"):
@@ -107,7 +116,7 @@ class GraphCollator:
 
             if torsion_moving_mask.dtype != torch.bool:
                 torsion_moving_mask = torsion_moving_mask.bool()
-                
+
             n_torsions = int(torsion_indices.size(0))
 
             if n_torsions > 0:
@@ -156,6 +165,9 @@ class GraphCollator:
 
         这是 atom -> residue 的结构映射，不属于 PyG 默认会识别并自动偏移的 edge_index。
         为支持 batched 下的动态 residue 几何重建，需要把它改成全局 residue 索引。
+
+        Returns:
+            Batch: 返回完成 residue 索引显式偏移后的批量图对象。
         """
 
         if not samples or "protein_atom" not in batch.node_types:

@@ -1,11 +1,10 @@
 """
-动态跨图边构建工具。
+跨图边构建工具。
 
-统一管理 ligand->protein_atom / ligand->protein_residue 的边方向契约：
-所有正向边统一返回 [lig_idx, protein_idx]。
+负责按半径建立动态交互边，
+并在缺边场景下回退到 kNN 连接策略。
 """
 
-from __future__ import annotations
 
 import torch
 
@@ -23,7 +22,21 @@ def build_batched_bipartite_knn_edges(
     src_indices: Tensor | None = None,
 ) -> Tensor:
     """
-    构建批内 src->dst 的 kNN 边，返回 [src_idx, dst_idx]。
+    构建批内双向 kNN 边。
+
+    在同一 batch 内为源节点和目标节点建立最近邻连接，
+    用于半径边缺失时补充跨类型邻接关系。
+
+    Args:
+        src_pos: 源节点坐标。
+        src_batch: 源节点所属 batch 索引。
+        dst_pos: 目标节点坐标。
+        dst_batch: 目标节点所属 batch 索引。
+        k: kNN 连接时保留的邻居数。
+        src_indices: 源节点在原始集合中的索引。
+
+    Returns:
+        Tensor: 形状为 `[2, E]` 的双向 kNN 边索引。
     """
 
     device = src_pos.device
@@ -71,9 +84,26 @@ def build_batched_radius_or_knn_edges(
     max_num_neighbors: int = 64,
 ) -> Tensor:
     """
-    构建批内 src->dst 的半径边；半径边为空或不完整时回退 / 补充 kNN。
+    构建半径边或回退 kNN 边。
 
-    返回契约始终为 [src_idx, dst_idx]。
+    优先在同一 batch 内建立满足半径阈值的邻接关系，
+    当半径边为空或覆盖不完整时再补充 kNN 连接避免节点失联。
+
+    Args:
+        src_pos: 源节点坐标。
+        src_batch: 源节点所属 batch 索引。
+        dst_pos: 目标节点坐标。
+        dst_batch: 目标节点所属 batch 索引。
+        radius_cutoff: 半径使用的截断阈值。
+        knn_k: 回退到 kNN 时使用的邻居数。
+        ensure_src_coverage: 是否保证每个源节点至少连接到一个目标节点。
+        max_num_neighbors: 单个节点允许保留的最大邻居数。
+
+    Returns:
+        Tensor: 优先基于半径、必要时补充 kNN 后的边索引。
+
+    Raises:
+        ValueError: 当输入 batch 或坐标张量形状不匹配时抛出。
     """
 
     device = src_pos.device
@@ -81,7 +111,6 @@ def build_batched_radius_or_knn_edges(
     if src_pos.numel() == 0 or dst_pos.numel() == 0:
         return torch.zeros((2, 0), dtype=torch.long, device=device)
 
-    # PyG radius(x=dst, y=src) 返回 [src_idx, dst_idx]
     radius_edges = radius(
         x=dst_pos,
         y=src_pos,

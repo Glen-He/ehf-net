@@ -1,8 +1,10 @@
 """
-共享 RBF 模块
+RBF 编码层。
 
-高斯径向基函数距离编码，供 FrameAwareConv 与 PredictionHead 统一使用。
+提供距离的高斯径向基展开，
+用于几何距离特征的连续表示。
 """
+
 
 import torch
 import torch.nn as nn
@@ -25,8 +27,23 @@ class GaussianRBF(nn.Module):
         self,
         start: float = 0.0,
         stop: float = 10.0,
+        *,
         num_gaussians: int = 50,
     ) -> None:
+        """
+        初始化高斯 RBF 层。
+
+        配置距离展开所需的中心分布和范围参数，
+        为连续距离特征编码提供基础。
+
+        Args:
+            start: 高斯基中心覆盖的起始距离。
+            stop: 高斯基中心覆盖的终止距离。
+            num_gaussians: 用于展开距离特征的高斯基数量。
+
+        Raises:
+            ValueError: 当输入参数或运行时状态不满足要求时抛出。
+        """
         super().__init__()
         if stop <= start:
             raise ValueError(f"stop ({stop}) must be > start ({start})")
@@ -41,11 +58,16 @@ class GaussianRBF(nn.Module):
 
     def forward(self, dist: Tensor) -> Tensor:
         """
+        执行距离的 RBF 展开。
+
+        将输入距离映射到高维高斯基表示，
+        供几何相关模块使用连续距离编码。
+
         Args:
-            dist: 距离标量 [N] 或 [..., 1]（单位：Å），应为非负值
+            dist: 待展开的距离张量。
 
         Returns:
-            RBF 特征 [..., num_gaussians]，范围 [0, 1]
+            Tensor: 返回与输入距离对齐的 RBF 特征张量，最后一维为 `num_gaussians`。
         """
         dist = torch.clamp(dist, min=0.0)
         if dist.ndim == 1:

@@ -1,14 +1,16 @@
 """
-EHFNet 编码器
+分层编码器。
 
-分层 EGNN 网络，按四个阶段处理图与坐标信息。
+负责多层级消息传递、坐标更新和全局特征融合，
+是模型主干网络的核心实现。
 """
 
+
 import logging
+from typing import Any, cast
+
 import torch
 import torch.nn as nn
-
-from typing import Any, cast
 from torch import Tensor
 from torch.nn import ModuleList
 from torch_geometric.data import HeteroData
@@ -17,17 +19,25 @@ from egnn_pytorch import EGNN_Sparse
 from ehfnet.models.layers.frame_conv import FrameAwareConv, FrameAwareHeteroConv
 from egnn_pytorch.egnn_pytorch import CoorsNorm
 
-# [修复] Monkey Patch egnn_pytorch.CoorsNorm
-# PyTorch 的 tensor.norm(dim=-1) 在输入为严格 0 时会产生 NaN 梯度。
-# 在分子对接随机初始化或完全重合场景下，这是 grad_norm=nan 的直接原因。
 def safe_coors_norm_forward(self, coors):
-    # 在 sum 之后立即加 eps 再开根号，彻底杜绝开根号 0 的梯度问题
+    """
+    安全坐标归一化前向函数。
+
+    为坐标归一化提供更稳健的实现，
+    用于避免极端输入下出现数值不稳定或无效梯度。
+
+    Args:
+        coors: 待归一化的坐标张量。
+
+    Returns:
+        Tensor: 返回经过安全归一化后的坐标张量。
+    """
     norm = torch.sqrt((coors ** 2).sum(dim=-1, keepdim=True) + self.eps)
     normed_coors = coors / norm
     return normed_coors * self.scale
 CoorsNorm.forward = safe_coors_norm_forward
 
-from ehfnet.graph.hetero_schema import (
+from ehfnet.graph import (
     NODE_TYPES,
     ATOM_NODE_TYPES,
     INTRA_EDGES,
@@ -35,17 +45,16 @@ from ehfnet.graph.hetero_schema import (
     DYNAMIC_INTER_EDGES,
     INTER_EDGES,
     BROADCAST_EDGES,
+    build_batched_radius_or_knn_edges,
+    context_feature_dim,
 )
-from ehfnet.graph.inter_edges import build_batched_radius_or_knn_edges
-from ehfnet.graph.pocket_features import build_pocket_features, pocket_feature_dim
-from ehfnet.encoders.feature_specs import PROTEIN_RESIDUE_CONT_SCHEMA
 from ehfnet.models.layers.embeddings import (
-    TimeEmbedding,
     LigandAtomEmbedding,
     LigandMoleculeEmbedding,
     ProteinAtomEmbedding,
+    ProteinContextEmbedding,
     ProteinResidueEmbedding,
-    ProteinPocketEmbedding,
+    TimeEmbedding,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,7 +86,6 @@ class EHFEncoder(nn.Module):
         m_dim_scalar: int = 16,
         num_rbf: int = 32,
         dropout_rate: float = 0.0,
-        fix_protein: bool = True,
         stats: dict | None = None,
         interaction_profile: str = "full",
         dynamic_inter_cutoff: float = 10.0,
@@ -86,30 +94,33 @@ class EHFEncoder(nn.Module):
         dynamic_residue_knn_k: int = 6,
     ) -> None:
         """
+        初始化对象。
+
         Args:
-            hidden_dim: 隐藏层维度
-            time_dim: 时间嵌入维度（必须是偶数）
-            num_gnn_blocks: GNN 块数量
-            lig_atom_cont_count: 配体原子连续特征数量
-            lig_mol_cont_count: 配体分子连续特征数量
-            pro_atom_cont_count: 蛋白原子连续特征数量
-            pro_res_cont_count: 蛋白残基连续特征数量
-            m_dim_scalar: EGNN 消息维度
-            num_rbf: 帧感知卷的高斯 RBF 基函数数量
-            dropout_rate: Dropout 比例
-            fix_protein: 是否冻结蛋白坐标
-            stats: 统计数据字典 (用于输入归一化)
-            interaction_profile: 跨图交互配置，支持 "full" 或 "atom_only"
-            dynamic_inter_cutoff: 动态跨图原子边半径
-            dynamic_inter_knn_k: 半径为空时的 kNN 回退邻居数
-            dynamic_residue_cutoff: 动态 ligand-residue 跨图边半径
-            dynamic_residue_knn_k: ligand-residue 边为空时的 kNN 回退邻居数
+            hidden_dim: 隐藏层维度。
+            time_dim: 时间嵌入维度。
+            num_gnn_blocks: 主干 GNN 块数量。
+            lig_atom_cont_count: 配体原子连续特征维度。
+            lig_mol_cont_count: 配体分子连续特征维度。
+            pro_atom_cont_count: 蛋白原子连续特征维度。
+            pro_res_cont_count: 蛋白残基连续特征维度。
+            m_dim_scalar: 消息传递分支的标量维度。
+            num_rbf: RBF 基函数数量。
+            dropout_rate: Dropout 比例。
+            stats: 统计量。
+            interaction_profile: 跨图交互拓扑配置。
+            dynamic_inter_cutoff: 动态跨图原子边的半径阈值。
+            dynamic_inter_knn_k: 动态跨图原子边回退到 kNN 时的邻居数。
+            dynamic_residue_cutoff: 动态配体-残基边的半径阈值。
+            dynamic_residue_knn_k: 动态配体-残基边回退到 kNN 时的邻居数。
+
+        Raises:
+            ValueError: 当输入参数或运行时状态不满足要求时抛出。
         """
         super().__init__()
 
         self.hidden_dim  = hidden_dim
         self.num_rbf     = num_rbf
-        self.fix_protein = fix_protein
         self.interaction_profile = interaction_profile
         self.dynamic_inter_cutoff = float(dynamic_inter_cutoff)
         self.dynamic_inter_knn_k = max(1, int(dynamic_inter_knn_k))
@@ -122,41 +133,33 @@ class EHFEncoder(nn.Module):
                 "Use one of {'full', 'atom_only'}."
             )
 
-        # 1. 特征嵌入
         self.ligand_atom_embedder = LigandAtomEmbedding(
-            cont_feature_count=lig_atom_cont_count, 
+            cont_feature_count=lig_atom_cont_count,
             hidden_dim=hidden_dim,
             stats=stats.get("ligand_atom") if stats else None
         )
         self.ligand_molecule_embedder = LigandMoleculeEmbedding(
-            cont_feature_count=lig_mol_cont_count, 
+            cont_feature_count=lig_mol_cont_count,
             hidden_dim=hidden_dim,
             stats=stats.get("ligand_molecule") if stats else None
         )
         self.protein_atom_embedder = ProteinAtomEmbedding(
-            cont_feature_count=pro_atom_cont_count, 
+            cont_feature_count=pro_atom_cont_count,
             hidden_dim=hidden_dim,
             stats=stats.get("protein_atom") if stats else None
         )
         self.protein_residue_embedder = ProteinResidueEmbedding(
-            cont_feature_count=pro_res_cont_count, 
+            cont_feature_count=pro_res_cont_count,
             hidden_dim=hidden_dim,
             stats=stats.get("protein_residue") if stats else None
         )
-        self.protein_pocket_embedder = ProteinPocketEmbedding(
-            cont_feature_count=pocket_feature_dim(pro_res_cont_count),
+        self.protein_context_embedder = ProteinContextEmbedding(
+            cont_feature_count=context_feature_dim(pro_res_cont_count),
             hidden_dim=hidden_dim,
-        )
-        self.pocket_refresh_mlp = nn.Sequential(
-            nn.LayerNorm(hidden_dim * 2),
-            nn.Linear(hidden_dim * 2, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
         )
 
         self.time_embedder = TimeEmbedding(dim=time_dim, hidden_dim=hidden_dim)
 
-        # 2. 边类型分类
         self.intra_atom_edges = [
             e for e in INTRA_EDGES if "atom" in e[0] and "atom" in e[2]
         ]
@@ -171,13 +174,11 @@ class EHFEncoder(nn.Module):
             self.inter_feat_edges = [e for e in INTER_EDGES if e not in self.inter_atom_edges]
         self.bcast_edges = BROADCAST_EDGES
 
-        # 3. 构造 GNN 模块序列
         self.gnn_blocks: ModuleList = ModuleList()
 
         for _ in range(num_gnn_blocks):
             block = nn.ModuleDict()
 
-            # 阶段 1：层内精化
             if self.intra_atom_edges:
                 block["1_intra_egnn"] = self._build_egnn_block(
                     hidden_dim, m_dim_scalar, dropout_rate
@@ -191,18 +192,16 @@ class EHFEncoder(nn.Module):
                     ["protein_residue"], hidden_dim, dropout_rate
                 )
 
-            # 阶段 2：自下而上聚合
             if self.agg_edges:
                 block["2_agg_gnn"] = self._build_frame_conv_block(
                     self.agg_edges, hidden_dim, num_rbf
                 )
                 block["2_agg_update"] = self._build_update_mlp(
-                    ["ligand_molecule", "protein_residue", "protein_pocket"],
+                    ["ligand_molecule", "protein_residue", "protein_context"],
                     hidden_dim,
                     dropout_rate,
                 )
 
-            # 阶段 3：层间交互
             if self.inter_atom_edges:
                 block["3_inter_egnn"] = self._build_egnn_block(
                     hidden_dim, m_dim_scalar, dropout_rate
@@ -216,7 +215,6 @@ class EHFEncoder(nn.Module):
                     NODE_TYPES, hidden_dim, dropout_rate
                 )
 
-            # 阶段 4：自上而下广播
             if self.bcast_edges:
                 block["4_bcast_gnn"] = self._build_frame_conv_block(
                     self.bcast_edges, hidden_dim, num_rbf
@@ -227,7 +225,6 @@ class EHFEncoder(nn.Module):
                     dropout_rate,
                 )
 
-            # 模块末端的全局特征细化
             block["post_mlp"] = self._build_update_mlp(NODE_TYPES, hidden_dim, dropout_rate)
 
             self.gnn_blocks.append(block)
@@ -278,9 +275,7 @@ class EHFEncoder(nn.Module):
             pos_dim=3,
             m_dim=m_dim_scalar,
             aggr="mean",
-            update_coors=True,    # 全部 block 启用坐标更新：每层 EGNN 输出的坐标增量
-                                  # 通过多步迭代积累等变位移信号；
-                                  # encoder 通过 displacement_dict = pos_final - pos_init 返回给 EHFNet。
+            update_coors=True,
             update_feats=True,
             dropout=dropout_rate,
             norm_feats=True,
@@ -335,7 +330,6 @@ class EHFEncoder(nn.Module):
         x_dict: dict[str, Tensor] = {}
         pos_dict: dict[str, Tensor] = {}
 
-        # 配体原子
         x_all_lig = self.ligand_atom_embedder(
             data["ligand_atom"].x_cat,
             data["ligand_atom"].x_cont,
@@ -345,7 +339,6 @@ class EHFEncoder(nn.Module):
         x_dict["ligand_atom"] = x_all_lig[:, 3:]
         initial_lig_pos = pos_dict["ligand_atom"].clone()
 
-        # 蛋白原子
         x_all_pro = self.protein_atom_embedder(
             data["protein_atom"].x_cat,
             data["protein_atom"].x_cont,
@@ -354,7 +347,6 @@ class EHFEncoder(nn.Module):
         pos_dict["protein_atom"] = x_all_pro[:, :3]
         x_dict["protein_atom"] = x_all_pro[:, 3:]
 
-        # 其他节点
         x_dict["ligand_molecule"] = self.ligand_molecule_embedder(
             data["ligand_molecule"].x_cont
         )
@@ -364,8 +356,8 @@ class EHFEncoder(nn.Module):
             data["protein_residue"].x_cont,
             esm_missing_mask=esm_missing_mask,
         )
-        x_dict["protein_pocket"] = self.protein_pocket_embedder(
-            data["protein_pocket"].x_cont
+        x_dict["protein_context"] = self.protein_context_embedder(
+            data["protein_context"].x_cont
         )
 
         return x_dict, pos_dict, initial_lig_pos
@@ -397,6 +389,7 @@ class EHFEncoder(nn.Module):
         offsets: dict[str, int] = {}
         feats_list: list[Tensor] = []
         pos_list: list[Tensor] = []
+        rigid_pos_inputs: dict[str, Tensor] = {}
         current_offset: int = 0
 
         for nt in atom_nodes:
@@ -405,6 +398,7 @@ class EHFEncoder(nn.Module):
                 offsets[nt] = current_offset
                 feats_list.append(x_dict[nt])
                 pos_list.append(pos_dict[nt])
+                rigid_pos_inputs[nt] = pos_dict[nt]
                 current_offset += x_dict[nt].shape[0]
 
         if not feats_list:
@@ -453,10 +447,12 @@ class EHFEncoder(nn.Module):
 
         out_pos, out_feats = homo_x_out[:, :3], homo_x_out[:, 3:]
 
-        # 原地更新以优化内存
         for nt, offset in offsets.items():
             length = x_dict[nt].shape[0]
-            pos_dict[nt] = out_pos[offset : offset + length]
+            if nt == "protein_atom":
+                pos_dict[nt] = rigid_pos_inputs[nt]
+            else:
+                pos_dict[nt] = out_pos[offset : offset + length]
             x_dict[nt] = out_feats[offset : offset + length]
 
         return x_dict, pos_dict
@@ -504,13 +500,15 @@ class EHFEncoder(nn.Module):
             block:         当前 GNN 块的 ModuleDict
             x_dict:        节点特征字典
             pos_dict:      原子层节点坐标字典（EGNN 可更新）
-            edge_dict:     边索密字典
+            edge_dict:     边索引字典
             full_pos_dict: 包含所有 5 种节点类型坐标的字典
                            （为 FrameAwareHeteroConv 提供几何参考）
+
+        Returns:
+            tuple[dict[str, Tensor], dict[str, Tensor]]: 返回更新后的节点特征字典与原子坐标字典。
         """
         typed_block = cast(nn.ModuleDict, block)
 
-        # 阶段 1: 层内精化
         if "1_intra_egnn" in typed_block:
             x_dict, pos_dict = self._run_egnn_on_atoms(
                 cast(EGNN_Sparse, typed_block["1_intra_egnn"]),
@@ -526,14 +524,12 @@ class EHFEncoder(nn.Module):
                 x_dict, out, cast(nn.ModuleDict, typed_block["1_intra_update"])
             )
 
-        # 阶段 2: 自下而上聚合
         if "2_agg_gnn" in typed_block:
             out = typed_block["2_agg_gnn"](x_dict, full_pos_dict, edge_dict)
             x_dict = self._apply_residual_update(
                 x_dict, out, cast(nn.ModuleDict, typed_block["2_agg_update"])
             )
 
-        # 阶段 3: 层间交互
         if "3_inter_egnn" in typed_block:
             x_dict, pos_dict = self._run_egnn_on_atoms(
                 cast(EGNN_Sparse, typed_block["3_inter_egnn"]),
@@ -549,32 +545,44 @@ class EHFEncoder(nn.Module):
                 x_dict, out, cast(nn.ModuleDict, typed_block["3_inter_update"])
             )
 
-        # 阶段 4: 自上而下广播
         if "4_bcast_gnn" in typed_block:
             out = typed_block["4_bcast_gnn"](x_dict, full_pos_dict, edge_dict)
             x_dict = self._apply_residual_update(
                 x_dict, out, cast(nn.ModuleDict, typed_block["4_bcast_update"])
             )
 
-        # 全局特征精化
         if "post_mlp" in typed_block:
             post_mlp = cast(nn.ModuleDict, typed_block["post_mlp"])
 
             for nt in x_dict:
-                
+
                 if nt in post_mlp:
                     update = post_mlp[nt](x_dict[nt])
                     x_dict[nt] = x_dict[nt] + update
-        
+
         return x_dict, pos_dict
 
 
     @staticmethod
-    def _get_node_batch(data: HeteroData, node_type: str, num_nodes: int, device: torch.device) -> Tensor:
+    def _get_node_batch(
+        data: HeteroData,
+        node_type: str,
+        *,
+        num_nodes: int,
+        device: torch.device,
+    ) -> Tensor:
         """
         获取节点 batch 索引；若缺失则默认为单图 batch=0。
-        """
 
+        Args:
+            data: 异构图数据。
+            node_type: 节点类型名称。
+            num_nodes: 该类型节点数量。
+            device: 输出张量设备。
+
+        Returns:
+            Tensor: 与节点数对齐的 batch 索引，形状 [num_nodes]。
+        """
         if hasattr(data[node_type], "batch") and data[node_type].batch is not None:
             node_batch = data[node_type].batch
 
@@ -594,6 +602,9 @@ class EHFEncoder(nn.Module):
         """
         动态重建 ligand_atom<->protein_atom 跨图边。
         半径图为空时回退 kNN，确保跨图信息不断链。
+
+        Returns:
+            dict[tuple[str, str, str], Tensor]: 返回补入动态原子跨图边后的边字典。
         """
 
         key_fw = ("ligand_atom", "inter_proximity", "protein_atom")
@@ -609,11 +620,9 @@ class EHFEncoder(nn.Module):
             return edge_dict
 
         device = lig_pos.device
-        lig_batch = self._get_node_batch(data, "ligand_atom", lig_pos.size(0), device)
-        pro_batch = self._get_node_batch(data, "protein_atom", pro_pos.size(0), device)
+        lig_batch = self._get_node_batch(data, "ligand_atom", num_nodes=lig_pos.size(0), device=device)
+        pro_batch = self._get_node_batch(data, "protein_atom", num_nodes=pro_pos.size(0), device=device)
 
-        # radius 返回 [dst(y), src(x)]，此处 y=ligand, x=protein
-        # 输出正向边使用 [lig_idx, pro_idx]
         edge_fw = build_batched_radius_or_knn_edges(
             src_pos=lig_pos,
             src_batch=lig_batch,
@@ -641,6 +650,9 @@ class EHFEncoder(nn.Module):
     ) -> dict[tuple[str, str, str], Tensor]:
         """
         动态重建 ligand_atom<->protein_residue 跨图边（Stage-3 多尺度交互）。
+
+        Returns:
+            dict[tuple[str, str, str], Tensor]: 返回补入动态配体-残基跨图边后的边字典。
         """
 
         key_fw = ("ligand_atom", "inter_proximity", "protein_residue")
@@ -656,8 +668,8 @@ class EHFEncoder(nn.Module):
             return edge_dict
 
         device = lig_pos.device
-        lig_batch = self._get_node_batch(data, "ligand_atom", lig_pos.size(0), device)
-        res_batch = self._get_node_batch(data, "protein_residue", res_pos.size(0), device)
+        lig_batch = self._get_node_batch(data, "ligand_atom", num_nodes=lig_pos.size(0), device=device)
+        res_batch = self._get_node_batch(data, "protein_residue", num_nodes=res_pos.size(0), device=device)
 
         edge_fw = build_batched_radius_or_knn_edges(
             src_pos=lig_pos,
@@ -676,42 +688,6 @@ class EHFEncoder(nn.Module):
         return edge_dict
 
 
-    def _compute_current_residue_positions(
-        self,
-        *,
-        data: HeteroData,
-        pos_dict: dict[str, Tensor],
-    ) -> Tensor:
-        """
-        从当前 protein_atom 坐标派生 residue 几何中心。
-
-        rigid 模式直接复用输入 residue 坐标；
-        flexible 模式下保持 atom / residue / pocket 几何一致。
-        """
-
-        if self.fix_protein:
-            return data["protein_residue"].pos
-
-        if "protein_atom" not in pos_dict or pos_dict["protein_atom"].numel() == 0:
-            return data["protein_residue"].pos
-
-        residue_idx = data["protein_atom"].residue_idx.long()
-        num_residues = int(data["protein_residue"].num_nodes)
-        residue_pos = scatter_mean(
-            pos_dict["protein_atom"],
-            residue_idx,
-            dim=0,
-            dim_size=num_residues,
-        )
-        counts = torch.bincount(residue_idx, minlength=num_residues).to(
-            device=residue_pos.device
-        )
-        missing_mask = counts == 0
-        if bool(missing_mask.any()):
-            residue_pos[missing_mask] = data["protein_residue"].pos.to(residue_pos.device)[missing_mask]
-        return residue_pos
-
-
     def _refresh_protein_context(
         self,
         *,
@@ -722,48 +698,25 @@ class EHFEncoder(nn.Module):
         batch_size: int,
     ) -> tuple[Tensor, Tensor, dict[str, Tensor]]:
         """
-        构建当前 block 使用的 residue / pocket 几何与 pocket 隐状态。
+        构建当前 block 使用的刚体蛋白几何参考。
 
-        flexible 模式下：
-        - residue / pocket 坐标随当前 protein atom 坐标刷新
-        - pocket 连续特征随当前几何刷新
-        - pocket 隐表示通过 refresh MLP 融合当前语义与几何 summary
+        Returns:
+            tuple[Tensor, Tensor, dict[str, Tensor]]: 返回残基中心、context 节点坐标与完整坐标字典。
         """
-
-        residue_pos = self._compute_current_residue_positions(data=data, pos_dict=pos_dict)
+        residue_pos = data["protein_residue"].pos.to(device=device)
         residue_batch = self._get_node_batch(
-            data, "protein_residue", residue_pos.size(0), device
+            data, "protein_residue", num_nodes=residue_pos.size(0), device=device
         )
-        protein_atom_batch = self._get_node_batch(
-            data, "protein_atom", data["protein_atom"].num_nodes, device
-        )
-        pocket_pos = scatter_mean(
-            residue_pos.detach(),
+        context_pos = scatter_mean(
+            residue_pos,
             residue_batch,
             dim=0,
             dim_size=batch_size,
         )
 
-        if not self.fix_protein:
-            pocket_x_cont = build_pocket_features(
-                residue_x_cont=data["protein_residue"].x_cont.to(device),
-                residue_pos=residue_pos,
-                protein_atom_pos=pos_dict["protein_atom"].detach(),
-                residue_batch=residue_batch,
-                protein_atom_batch=protein_atom_batch,
-                residue_esm_missing_mask=getattr(data["protein_residue"], "esm_missing_mask", None),
-                esm_feature_start=len(PROTEIN_RESIDUE_CONT_SCHEMA),
-                center=pocket_pos.detach(),
-            )
-            refreshed_pocket = self.protein_pocket_embedder(pocket_x_cont)
-            refresh_input = torch.cat(
-                [x_dict["protein_pocket"], refreshed_pocket], dim=-1
-            )
-            x_dict["protein_pocket"] = x_dict["protein_pocket"] + self.pocket_refresh_mlp(refresh_input)
-
         full_pos_dict: dict[str, Tensor] = {
             "ligand_atom": pos_dict["ligand_atom"],
-            "protein_atom": pos_dict["protein_atom"],
+            "protein_atom": data["protein_atom"].pos.to(device=device),
             "ligand_molecule": scatter_mean(
                 pos_dict["ligand_atom"].detach(),
                 data["ligand_atom"].batch,
@@ -771,9 +724,9 @@ class EHFEncoder(nn.Module):
                 dim_size=batch_size,
             ),
             "protein_residue": residue_pos,
-            "protein_pocket": pocket_pos,
+            "protein_context": context_pos,
         }
-        return residue_pos, pocket_pos, full_pos_dict
+        return residue_pos, context_pos, full_pos_dict
 
 
     def forward(self, data: HeteroData, t: Tensor) -> dict[str, Any]:
@@ -781,8 +734,8 @@ class EHFEncoder(nn.Module):
         前向传播
 
         Args:
-            data: 异构图数据
-            t: 时间步 [B]
+            data: 当前处理的图数据对象。
+            t: t。
 
         Returns:
             包含编码后特征、坐标及初始配体位置的字典
@@ -791,7 +744,6 @@ class EHFEncoder(nn.Module):
 
         t_emb = self.time_embedder(t)
 
-        # 添加时间嵌入
         for nt, x in x_dict.items():
 
             if (
@@ -812,22 +764,16 @@ class EHFEncoder(nn.Module):
 
         edge_dict = dict(data.edge_index_dict)
 
-        # 保存初始位置用于速度计算（在 GNN 更新之前）
         pos_input: dict[str, Tensor] = {
             "ligand_atom": pos_dict["ligand_atom"].clone(),
             "protein_atom": pos_dict["protein_atom"].clone(),
         }
 
-        # 运行 GNN 块
-        device    = t.device
+        device = t.device
         lig_batch = data["ligand_atom"].batch
-        B         = int(lig_batch.max().item()) + 1
+        B = int(lig_batch.max().item()) + 1
 
         for block in self.gnn_blocks:
-            # fix_protein=True 时，每 block 开始前恢复蛋白坐标，确保动态边始终基于刚性蛋白构建
-            if self.fix_protein and "protein_atom" in pos_dict:
-                pos_dict["protein_atom"] = pos_input["protein_atom"].clone()
-
             residue_pos, _, full_pos_dict = self._refresh_protein_context(
                 data=data,
                 x_dict=x_dict,
@@ -852,7 +798,6 @@ class EHFEncoder(nn.Module):
                 cast(nn.ModuleDict, block), x_dict, pos_dict, edge_dict, full_pos_dict
             )
 
-        # 计算累计位移：delta_pos = pos_out - pos_in
         displacement_dict: dict[str, Tensor] = {}
 
         for nt in pos_dict:
@@ -863,8 +808,7 @@ class EHFEncoder(nn.Module):
             else:
                 displacement_dict[nt] = torch.zeros_like(pos_dict[nt])
 
-        # 如果冻结蛋白，将蛋白位移设为零，坐标恢复为初始值
-        if self.fix_protein and "protein_atom" in displacement_dict:
+        if "protein_atom" in displacement_dict:
             displacement_dict["protein_atom"] = torch.zeros_like(displacement_dict["protein_atom"])
             pos_dict["protein_atom"] = pos_input["protein_atom"]
 

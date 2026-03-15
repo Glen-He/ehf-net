@@ -1,8 +1,10 @@
 """
-静态几何计算
+静态几何工具。
 
-提供数据预处理阶段的几何计算功能，包括二面角计算和可旋转键识别。
+负责二面角、旋转键和固定几何量计算，
+为初始化与扭转建模提供基础能力。
 """
+
 
 import logging
 import numpy as np
@@ -12,10 +14,9 @@ from rdkit import Chem
 logger = logging.getLogger(__name__)
 
 
-# 物理化学常量
-MIN_BOND_LENGTH = 0.5   # Å, 最小合理键长
-MAX_BOND_LENGTH = 3.0   # Å, 最大合理键长
-EPSILON = 1e-8          # 数值稳定性保护
+MIN_BOND_LENGTH = 0.5
+MAX_BOND_LENGTH = 3.0
+EPSILON = 1e-8
 
 
 def calculate_dihedral(
@@ -33,17 +34,18 @@ def calculate_dihedral(
     - p1-p2 是旋转轴
 
     Args:
-        p0: 第一个点的3D坐标 (shape=(3,))
-        p1: 第二个点的3D坐标，定义轴线起点
-        p2: 第三个点的3D坐标，定义轴线终点
-        p3: 第四个点的3D坐标 (shape=(3,))
+        p0: 定义第一个平面的起始三维点坐标。
+        p1: 同时属于两个平面的第一个旋转轴端点坐标。
+        p2: 同时属于两个平面的第二个旋转轴端点坐标。
+        p3: 定义第二个平面的末端三维点坐标。
 
     Returns:
-        二面角的弧度值，范围为 [-π, π]。
-        如果点共线无法定义平面，返回 None。
+        float | None: 返回计算得到的二面角弧度；当几何关系退化而无法定义二面角时返回 `None`。
+
+    Raises:
+        ValueError: 当输入参数或运行时状态不满足要求时抛出。
     """
 
-    # 确保输入是向量并检查维度
     p0, p1, p2, p3 = map(np.asarray, (p0, p1, p2, p3))
 
     if not all(p.shape == (3,) for p in (p0, p1, p2, p3)):
@@ -52,12 +54,10 @@ def calculate_dihedral(
             f"Got shapes: {[p.shape for p in (p0, p1, p2, p3)]}"
         )
 
-    # 计算键向量
-    b0 = p0 - p1  # 从 p1 指向 p0
-    b1 = p2 - p1  # 旋转轴向量
-    b2 = p3 - p2  # 从 p2 指向 p3
+    b0 = p0 - p1
+    b1 = p2 - p1
+    b2 = p3 - p2
 
-    # 归一化旋转轴（添加数值稳定性保护）
     b1_norm = np.linalg.norm(b1)
 
     if b1_norm < EPSILON:
@@ -66,13 +66,11 @@ def calculate_dihedral(
 
     b1 = b1 / (b1_norm + EPSILON)
 
-    # 投影向量：计算 b0 和 b2 在垂直于 b1 的平面上的投影
-    v = b0 - np.dot(b0, b1) * b1        # b0 垂直于 b1 的分量
-    w = b2 - np.dot(b2, b1) * b1        # b2 垂直于 b1 的分量
+    v = b0 - np.dot(b0, b1) * b1
+    w = b2 - np.dot(b2, b1) * b1
 
-    # 计算角度
-    x = np.dot(v, w)  # |v||w|cos(θ)
-    y = np.dot(np.cross(b1, v), w)  # |v||w|sin(θ) * 轴方向
+    x = np.dot(v, w)
+    y = np.dot(np.cross(b1, v), w)
 
     return float(np.arctan2(y, x))
 
@@ -83,8 +81,23 @@ def _fragment_signature(
 ) -> tuple[tuple[int, int], ...]:
     """
     为断键后的片段构造稳定、与输入原子顺序弱相关的签名。
-    """
 
+    Args:
+        fragment: 断键后某个片段包含的原子索引序列。
+        canonical_ranks: 与原子索引对齐的规范排序结果列表。
+
+    Returns:
+        tuple[tuple[int, int], ...]: 返回描述片段组成与排序信息的稳定签名元组。
+
+    Raises:
+        ValueError: 当片段中存在越界原子索引时抛出。
+    """
+    invalid_indices = [idx for idx in fragment if idx < 0 or idx >= len(canonical_ranks)]
+    if invalid_indices:
+        raise ValueError(
+            "Fragment contains atom indices outside the canonical rank range: "
+            f"{invalid_indices}."
+        )
     return tuple(sorted((canonical_ranks[idx], idx) for idx in fragment))
 
 
@@ -100,20 +113,20 @@ def get_moving_atoms(
     该函数通过断开指定键并分析生成的片段来确定哪些原子会随旋转移动。
     采用启发式规则：原子数较少的片段作为移动部分。
 
+
     Args:
-        mol: RDKit 分子对象
-        bond_idx: 旋转键索引
+        mol: 待读取或处理的 RDKit 分子对象。
+        bond_idx: 目标键在分子中的键索引。
+        canonical_ranks: RDKit 计算得到的规范原子排序。
+
 
     Returns:
-        moving_atoms: 移动部分的所有原子索引列表 (list[int])
-        axis_fixed: 旋转轴上属于固定部分的原子索引 (int)
-        axis_moving: 旋转轴上属于移动部分的原子索引 (int)
+        tuple[list[int], int, int]: 移动原子索引列表、轴固定原子索引、轴移动原子索引。
 
     Raises:
         ValueError: 如果键索引超出范围
     """
 
-    # 边界检查
     num_bonds = mol.GetNumBonds()
 
     if bond_idx < 0 or bond_idx >= num_bonds:
@@ -124,15 +137,12 @@ def get_moving_atoms(
     bond = mol.GetBondWithIdx(bond_idx)
     u, v = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
 
-    # 在分子副本上断开该键
     mol_cp = Chem.RWMol(mol)
     mol_cp.RemoveBond(u, v)
 
-    # 获取断开后的片段 (RDKit C++ 实现)
     frags = Chem.GetMolFrags(mol_cp)
 
     if len(frags) != 2:
-        # 断键后没有分成两部分(如环上的键)，该键不可旋转
         logger.debug(
             f"Bond {bond_idx} ({u}-{v}) is not rotatable (ring bond or other constraint)"
         )
@@ -143,8 +153,6 @@ def get_moving_atoms(
     if canonical_ranks is None:
         canonical_ranks = list(Chem.CanonicalRankAtoms(mol, breakTies=True))
 
-    # 启发式规则：原子数较少的片段作为移动部分；
-    # 若两侧大小相同，则按 canonical signature 稳定打破平局。
     if len(frag0) < len(frag1):
         moving_atoms = list(frag0)
         axis_moving, axis_fixed = (u, v) if u in moving_atoms else (v, u)

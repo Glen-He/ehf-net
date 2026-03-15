@@ -1,56 +1,37 @@
 """
-Blind Candidate Pool — 可回放候选池系统。
+Blind pool 工具。
 
-核心设计原则：
-- 缓存能被当前模型重放并重新打分的候选数据（pose_xyz + dataset_index + center_xyz）
-- 不依赖 teacher logit 作为训练主输入
-- 验证 / 测试 / pool refresh / 离线候选池 全部调用 candidate_generation 单一真源
+负责候选池结果的缓存、回放、采样与统计，
+支撑两阶段训练中的候选重放流程。
 """
 
-import os
+
+import gc
 import json
 import logging
+import os
 import random
 import time
-import gc
-from typing import Any, cast
 from pathlib import Path
+from typing import Any, cast
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
-from torch_scatter import scatter_mean
 
 from ehfnet.graph import GraphCollator, crop_graph_to_center
 from ehfnet.training.candidate_generation import generate_candidates_from_loader
+from ehfnet.training.inference import predict_center_proposal_logits
 from ehfnet.training.rerank_losses import (
-    compute_rerank_losses,
     compute_center_value_loss,
+    compute_rerank_losses,
     rmsd_to_soft_target,
 )
-from ehfnet.training.checkpoint_schema import build_feature_signature
 
 logger = logging.getLogger(__name__)
 
-
-BLIND_POOL_SCHEMA_VERSION = "blind_pool_v2"
-
-
-def build_blind_pool_compatibility(
-    *,
-    esm_dim: int,
-    processed_dir: str,
-    index_file: str,
-    interaction_profile: str,
-) -> dict[str, Any]:
-    return {
-        "pool_schema_version": BLIND_POOL_SCHEMA_VERSION,
-        "feature_signature": build_feature_signature(esm_dim=esm_dim),
-        "processed_dir": os.path.abspath(processed_dir),
-        "index_file": os.path.abspath(index_file),
-        "interaction_profile": str(interaction_profile),
-    }
+PAIR_POSITIVE_RMSD_THRESHOLD = 2.0
+PAIR_MIN_RMSD_GAP = 0.25
 
 
 def _load_pool_manifest(epoch_dir: str | Path) -> dict[str, Any] | None:
@@ -70,21 +51,17 @@ def _load_pool_manifest(epoch_dir: str | Path) -> dict[str, Any] | None:
 
 def _pool_manifest_matches(
     manifest: dict[str, Any] | None,
-    expected_compatibility: dict[str, Any] | None,
+    expected_signature: dict[str, Any] | None,
 ) -> bool:
-    if expected_compatibility is None:
+    if expected_signature is None:
         return True
     if manifest is None:
         return False
-    compatibility = manifest.get("compatibility")
-    if not isinstance(compatibility, dict):
+    signature = manifest.get("signature")
+    if not isinstance(signature, dict):
         return False
-    return compatibility == expected_compatibility
+    return signature == expected_signature
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 1. 候选池生成（委托给 candidate_generation 单一真源）
-# ──────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
 def refresh_blind_candidate_pool(
@@ -95,21 +72,56 @@ def refresh_blind_candidate_pool(
     device: torch.device,
     graph_builder: Any,
     collator: GraphCollator,
-    center_topk: int = 8,
-    refine_topk: int = 3,
-    center_nms_radius: float = 6.0,
-    stage1_pose_samples: int = 2,
-    stage2_pose_samples: int = 4,
-    crop_radius: float = 10.0,
-    ode_steps: int = 50,
-    warmup_epochs: int = 20,
-    center_hit_radius: float = 4.0,
+    center_topk: int,
+    refine_topk: int,
+    center_nms_radius: float,
+    stage1_pose_samples: int,
+    stage2_pose_samples: int,
+    crop_radius: float,
+    ode_steps: int,
+    warmup_epochs: int,
+    center_hit_radius: float,
+    crop_min_residues: int,
+    crop_atom_margin: float,
     max_complexes: int | None = None,
     fusion_weights: dict[str, float] | None = None,
+    use_learned_center_scores: bool = True,
     pool_epoch: int = -1,
     generator_ckpt_id: str = "",
 ) -> list[dict[str, Any]]:
-    """Run full blind pipeline via unified candidate_generation engine."""
+    """
+    刷新 blind 候选池。
+
+    运行完整候选生成流程并更新缓存候选池内容，
+    为后续回放训练提供新的局部候选样本。
+
+    Args:
+        model: 当前使用的模型实例。
+        matcher: 流匹配控制器或 ODE 推理控制器。
+        loader: 提供批次数据的 DataLoader。
+        device: 运行所用设备，如 CPU 或 CUDA 设备。
+        graph_builder: 用于构图或重建局部图的图构建器。
+        collator: 用于拼接局部样本的图批处理器。
+        center_topk: 中心提议阶段保留的候选中心数量。
+        refine_topk: 局部重排序阶段保留的候选构象数量。
+        center_nms_radius: 中心去重时使用的最小间距半径。
+        stage1_pose_samples: 第一阶段局部对接生成的候选构象数。
+        stage2_pose_samples: 第二阶段精排生成的候选构象数。
+        crop_radius: 局部裁剪半径。
+        ode_steps: ODE 推理积分步数。
+        warmup_epochs: 课程学习预热轮数。
+        center_hit_radius: 判断中心命中的距离阈值。
+        crop_min_residues: 局部裁剪后至少保留的残基数量。
+        crop_atom_margin: 基于原子距离扩展残基裁剪范围的边界。
+        max_complexes: 本轮最多处理的复合物数量。
+        fusion_weights: 融合不同分支分数时使用的权重字典。
+        use_learned_center_scores: 是否优先使用模型学习得到的中心分数。
+        pool_epoch: 当前候选池对应的训练轮次。
+        generator_ckpt_id: 生成候选时使用的 checkpoint 标识。
+
+    Returns:
+        list[dict[str, Any]]: 当前轮次生成的候选池记录列表。
+    """
     return generate_candidates_from_loader(
         model=model,
         matcher=matcher,
@@ -126,16 +138,15 @@ def refresh_blind_candidate_pool(
         ode_steps=ode_steps,
         warmup_epochs=warmup_epochs,
         center_hit_radius=center_hit_radius,
+        crop_min_residues=crop_min_residues,
+        crop_atom_margin=crop_atom_margin,
         max_complexes=max_complexes,
         fusion_weights=fusion_weights,
+        use_learned_center_scores=use_learned_center_scores,
         pool_epoch=pool_epoch,
         generator_ckpt_id=generator_ckpt_id,
     )
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# 2. 存储 / 加载
-# ──────────────────────────────────────────────────────────────────────────────
 
 def save_blind_pool(
     records: list[dict[str, Any]],
@@ -144,7 +155,21 @@ def save_blind_pool(
     epoch: int,
     meta: dict[str, Any] | None = None,
 ) -> str:
-    """Save candidate pool to disk with manifest."""
+    """
+    保存 blind 候选池。
+
+    将候选记录、签名字典和清单文件写入磁盘，
+    供训练恢复或后续回放阶段重复使用。
+
+    Args:
+        records: 待保存的候选池记录列表。
+        cache_dir: 缓存目录路径。
+        epoch: 当前训练轮次。
+        meta: 与候选池一同保存的附加元数据。
+
+    Returns:
+        str: 返回当前轮次 blind pool 缓存文件的保存路径。
+    """
     epoch_dir = os.path.join(cache_dir, f"epoch_{epoch:04d}")
     os.makedirs(epoch_dir, exist_ok=True)
 
@@ -164,7 +189,6 @@ def save_blind_pool(
 
     manifest = {
         "epoch": epoch,
-        "pool_schema_version": BLIND_POOL_SCHEMA_VERSION,
         "n_complexes": len(records),
         "n_total_poses": total_poses,
         "n_total_centers": total_centers,
@@ -196,9 +220,22 @@ def load_blind_pool(
     cache_dir: str,
     epoch: int | None = None,
     *,
-    expected_compatibility: dict[str, Any] | None = None,
+    expected_signature: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Load most recent (or specified) pool from cache."""
+    """
+    加载 blind 候选池。
+
+    从磁盘读取最近一次或指定运行的候选池缓存，
+    并在必要时完成缓存签名校验。
+
+    Args:
+        cache_dir: 缓存目录路径。
+        epoch: 当前训练轮次。
+        expected_signature: 读取缓存时期望匹配的 blind pool 签名字典。
+
+    Returns:
+        list[dict[str, Any]]: 从缓存中读取到的候选池记录列表。
+    """
     if not os.path.isdir(cache_dir):
         return []
 
@@ -207,9 +244,9 @@ def load_blind_pool(
         if not pool_path.exists():
             return None
         manifest = _load_pool_manifest(epoch_dir)
-        if not _pool_manifest_matches(manifest, expected_compatibility):
+        if not _pool_manifest_matches(manifest, expected_signature):
             logger.info(
-                "Skipping incompatible blind pool cache at %s.",
+                "Skipping blind pool cache with mismatched signature at %s.",
                 epoch_dir,
             )
             return None
@@ -230,31 +267,40 @@ def load_blind_pool(
     return []
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 3. 可回放候选数据集 (BlindCandidateReplayDataset)
-# ──────────────────────────────────────────────────────────────────────────────
-
 class BlindCandidateReplayDataset(Dataset):
-    """从 blind pool 中按 complex 采样可回放候选组。
+    """
+    从 blind pool 中按 complex 采样可回放候选组。
 
-    每个 item 返回一个 complex 的多个候选，每个候选包含：
+    每个条目返回一个复合物的多个候选，每个候选包含：
     - dataset_index: 用于从 train_set 取缓存样本
     - center_xyz: 用于 crop_graph_to_center
     - pose_xyz: 用于覆盖 ligand_atom.pos
     - rmsd, soft_target: 用于计算损失
-    - center_value_target: center-level supervision
+    - center_value_target: 中心价值监督目标
 
-    不返回 teacher logit 作为训练主输入。
+    不返回教师模型打分作为训练主输入。
     """
 
     def __init__(
         self,
         pool: list[dict[str, Any]],
         *,
-        candidates_per_complex: int = 8,
-        positive_rmsd_threshold: float = 2.0,
-        hard_negative_clash_threshold: float = 5.0,
+        candidates_per_complex: int,
+        positive_rmsd_threshold: float,
+        hard_negative_clash_threshold: float,
     ):
+        """
+        初始化 blind pool 回放数据集。
+
+        根据候选池记录配置每个复合物的采样与配对规则，
+        为回放训练阶段提供可迭代的数据接口。
+
+        Args:
+            pool: 候选池记录或其汇总对象。
+            candidates_per_complex: 候选集合percomplex。
+            positive_rmsd_threshold: 正例RMSD使用的阈值。
+            hard_negative_clash_threshold: hard负例位阻使用的阈值。
+        """
         self.pool = [r for r in pool if len(r.get("poses", [])) >= 2]
         self.candidates_per_complex = candidates_per_complex
         self.pos_thresh = positive_rmsd_threshold
@@ -269,7 +315,6 @@ class BlindCandidateReplayDataset(Dataset):
         centers = record.get("centers", [])
         dataset_index = record.get("dataset_index", idx)
 
-        # 分层采样候选
         positives = [p for p in poses if p["rmsd"] < self.pos_thresh]
         pos_center_ids = {p["center_id"] for p in positives}
         same_center_negs = [
@@ -290,7 +335,6 @@ class BlindCandidateReplayDataset(Dataset):
 
         selected: list[dict[str, Any]] = []
 
-        # 按优先级填充：先保证有 positives 和各类 negatives
         n = self.candidates_per_complex
         if positives:
             k = min(max(1, n // 3), len(positives))
@@ -304,7 +348,6 @@ class BlindCandidateReplayDataset(Dataset):
                     self._extend_unique(selected, pool_list, k)
                     remaining = n - len(selected)
 
-        # 随机补齐
         if len(selected) < n:
             seen = {self._candidate_key(p) for p in selected}
             others = [p for p in poses if self._candidate_key(p) not in seen]
@@ -312,7 +355,6 @@ class BlindCandidateReplayDataset(Dataset):
                 k = min(n - len(selected), len(others))
                 self._extend_unique(selected, others, k)
 
-        # 构造回放数据
         candidates = []
         for p in selected:
             center_xyz = self._get_center_xyz(p, centers)
@@ -342,7 +384,6 @@ class BlindCandidateReplayDataset(Dataset):
                 "steric_clash_teacher": p.get("steric_clash_teacher", 0.0),
             })
 
-        # center-value targets
         center_values = {}
         for c in centers:
             label = c.get("center_success_label", "negative")
@@ -396,10 +437,6 @@ class BlindCandidateReplayDataset(Dataset):
         return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 4. 回放前向 + 损失计算
-# ──────────────────────────────────────────────────────────────────────────────
-
 def replay_and_compute_losses(
     *,
     model: torch.nn.Module,
@@ -408,28 +445,49 @@ def replay_and_compute_losses(
     graph_builder: Any,
     collator: GraphCollator,
     device: torch.device,
-    crop_radius: float = 10.0,
-    margin: float = 0.5,
-    lambda_bce: float = 1.0,
-    lambda_pair: float = 1.0,
-    lambda_list: float = 0.5,
-    lambda_center_value: float = 0.3,
-    use_pose_rank_head: bool = True,
+    crop_radius: float,
+    crop_min_residues: int,
+    crop_atom_margin: float,
+    margin: float,
+    lambda_bce: float,
+    lambda_pair: float,
+    lambda_list: float,
+    lambda_center_value: float,
+    use_pose_rank_head: bool,
 ) -> dict[str, Tensor]:
-    """Replay cached candidates through the current model and compute rerank losses.
+    """
+    将缓存候选通过当前模型重放并计算 rerank 损失。
 
-    This is the core function that makes blind pool training *actually*
-    train the current model. Instead of operating on cached teacher logits,
-    it:
-    1. Loads cached sample by dataset_index
-    2. Crops to center_xyz
-    3. Overrides ligand_atom.pos with pose_xyz
-    4. Forwards through current model
-    5. Computes BCE + pairwise + listwise losses against RMSD targets
+    这是 blind pool 训练真正驱动当前模型学习的核心函数。
+    与使用缓存 teacher logit 不同，本函数执行以下流程：
+    1. 通过 dataset_index 加载缓存样本
+    2. 按 center_xyz 裁剪图
+    3. 用 pose_xyz 覆盖 ligand_atom.pos
+    4. 对当前模型做前向推理
+    5. 基于 RMSD 目标计算 BCE + pairwise + listwise 损失
 
     Args:
-        replay_items: list of items from BlindCandidateReplayDataset
-        train_set: the original training dataset for looking up samples by index
+        model: 当前使用的模型实例。
+        replay_items: replayitems。
+        train_set: trainset。
+        graph_builder: 用于构图或重建局部图的图构建器。
+        collator: 用于拼接局部样本的图批处理器。
+        device: 运行所用设备，如 CPU 或 CUDA 设备。
+        crop_radius: 局部裁剪半径。
+        crop_min_residues: 局部裁剪后至少保留的残基数量。
+        crop_atom_margin: 基于原子距离扩展残基裁剪范围的边界。
+        margin: 排序损失中的最小边界间隔。
+        lambda_bce: BCE 损失权重。
+        lambda_pair: pairwise 损失权重。
+        lambda_list: listwise 损失权重。
+        lambda_center_value: lambda中心数值。
+        use_pose_rank_head: 是否使用构象rankhead。
+
+    Returns:
+        dict[str, Tensor | float]: 当前模型在 blind pool 回放样本上的损失与统计信息。
+
+    Raises:
+        RuntimeError: 当回放过程中没有得到任何有效局部样本时抛出。
     """
     per_group_totals: list[Tensor] = []
     per_group_bce: list[Tensor] = []
@@ -475,6 +533,8 @@ def replay_and_compute_losses(
 
                 local_sample = crop_graph_to_center(
                     sample, center=center_xyz, radius=crop_radius,
+                    min_residues=crop_min_residues,
+                    atom_margin=crop_atom_margin,
                     graph_builder=graph_builder,
                 )
 
@@ -523,7 +583,12 @@ def replay_and_compute_losses(
             resolved_groups += 1
             logits_cat = torch.cat(group_logits)
             rmsd_cat = torch.cat(group_rmsd)
-            pair_indices = _build_group_pair_indices(valid_candidates, device=device)
+            pair_indices = _build_group_pair_indices(
+                valid_candidates,
+                device=device,
+                positive_rmsd_threshold=PAIR_POSITIVE_RMSD_THRESHOLD,
+                min_rmsd_gap=PAIR_MIN_RMSD_GAP,
+            )
             rerank_results = compute_rerank_losses(
                 logits_cat,
                 rmsd_cat,
@@ -539,12 +604,10 @@ def replay_and_compute_losses(
             per_group_list.append(rerank_results["rerank_listwise"])
             total_pairs += int(rerank_results["rerank_n_pairs"].item())
 
-        # center-value: run proposal on the cached source sample once per complex
         if lambda_center_value > 0 and center_values:
             try:
                 sample_batch = cast(Any, collator.collate([sample])).to(device)
 
-                from ehfnet.training.trainer import predict_center_proposal_logits
                 prop_logits, res_pos, res_batch, _ = predict_center_proposal_logits(
                     model, sample_batch, device=device,
                 )
@@ -618,10 +681,18 @@ def replay_and_compute_losses(
 
 
 def _resolve_replay_sample(train_subset_or_dataset: Any, dataset_index: int) -> Any:
-    """Resolve replay samples against the base dataset.
+    """
+    根据底层数据集解析 replay 样本。
 
-    blind pool stores indices from the underlying dataset; when training uses
-    torch.utils.data.Subset wrappers, replay must bypass subset-local indexing.
+    blind pool 存储的是底层数据集的索引；当训练使用
+    torch.utils.data.Subset 包装器时，replay 必须绕过子集局部索引。
+
+    Args:
+        train_subset_or_dataset: 训练阶段使用的数据集或 `Subset` 包装对象。
+        dataset_index: blind pool 中记录的底层数据集样本索引。
+
+    Returns:
+        Any: 返回与底层数据集索引对应的原始训练样本。
     """
     if hasattr(train_subset_or_dataset, "dataset") and hasattr(train_subset_or_dataset, "indices"):
         return train_subset_or_dataset.dataset[int(dataset_index)]
@@ -632,8 +703,8 @@ def _build_group_pair_indices(
     candidates: list[dict[str, Any]],
     *,
     device: torch.device,
-    positive_rmsd_threshold: float = 2.0,
-    min_rmsd_gap: float = 0.25,
+    positive_rmsd_threshold: float,
+    min_rmsd_gap: float,
 ) -> Tensor | None:
     if len(candidates) < 2:
         return None
@@ -669,17 +740,28 @@ def _build_group_pair_indices(
     return torch.tensor(pair_list, device=device, dtype=torch.long)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# 5. 调度 + 统计
-# ──────────────────────────────────────────────────────────────────────────────
-
 def should_refresh_pool(
     epoch: int,
     *,
-    refresh_every: int = 5,
-    min_start_epoch: int = 10,
-    best_updated_this_epoch: bool = False,
+    refresh_every: int,
+    min_start_epoch: int,
+    best_updated_this_epoch: bool,
 ) -> bool:
+    """
+    判断是否刷新候选池。
+
+    根据训练轮次和刷新间隔决定当前是否需要重建 blind pool，
+    用于控制候选池更新频率和训练开销。
+
+    Args:
+        epoch: 当前训练轮次。
+        refresh_every: 候选池刷新间隔。
+        min_start_epoch: 允许开始刷新候选池的最小训练轮次。
+        best_updated_this_epoch: 当前轮次是否更新了最佳模型。
+
+    Returns:
+        bool: 返回布尔判断结果。
+    """
     if epoch < min_start_epoch:
         return False
     if best_updated_this_epoch:
@@ -688,7 +770,18 @@ def should_refresh_pool(
 
 
 def get_pool_stats(pool: list[dict[str, Any]]) -> dict[str, float]:
-    """Summarize pool for logging."""
+    """
+    汇总候选池统计。
+
+    从候选记录中整理关键统计量，
+    供日志输出和训练监控流程直接使用。
+
+    Args:
+        pool: 候选池记录或其汇总对象。
+
+    Returns:
+        dict[str, float]: 适合直接写入日志的候选池统计信息。
+    """
     if not pool:
         return {"pool_complexes": 0.0}
 

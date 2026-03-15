@@ -1,42 +1,48 @@
 """
-EHFNet 主模型
+EHFNet 主模型。
 
-结合分层 EGNN 编码器与统一预测头。
+整合编码器、预测头与辅助分支，
+输出对接过程所需的位姿和打分信号。
 """
+
+
+from typing import TypedDict
 
 import torch
 import torch.nn.functional as F
-
-from typing import TypedDict
 from torch import nn, Tensor
 from torch_geometric.data import HeteroData
 from torch_scatter import scatter_mean
 
-from ehfnet.geometry.dynamics import compute_center_of_mass, compute_principal_frame
-from ehfnet.models.layers.encoder import EHFEncoder
-from ehfnet.models.heads.prediction import PredictionHead
+from ehfnet.geometry import compute_center_of_mass, compute_principal_frame
+from ehfnet.models.layers import EHFEncoder
+from ehfnet.models.heads import PredictionHead
 
 
 class EHFNetOutput(TypedDict):
     """
-    EHFNet 模型输出类型定义
+    EHFNet 输出结构。
+
+    封装模型前向传播产生的主要预测张量，
+    统一训练、验证和推理阶段对输出字段的访问方式。
     """
 
-    x_dict: dict[str, Tensor]               # 节点特征字典
-    v_translation: Tensor                   # 刚体平移速度 [B, 3]
-    v_rotation: Tensor                      # 刚体旋转速度 [B, 3]
-    v_torsion: Tensor                       # 扭转角速度 [T] （numel 可为 0）
-    binding_affinity: Tensor                # 结合能 [B, 1]
-    pose_quality: Tensor                    # pose 质量分数 [B, 1]
-    pose_rank_score: Tensor                 # 候选集排序分数 [B, 1]
-    steric_clash_batch: Tensor | None       # 每分子位阻惩罚量 [B]，无边时为 None
+    x_dict: dict[str, Tensor]
+    v_translation: Tensor
+    v_rotation: Tensor
+    v_torsion: Tensor
+    binding_affinity: Tensor
+    pose_quality: Tensor
+    pose_rank_score: Tensor
+    steric_clash_batch: Tensor | None
 
 
 class EHFNet(nn.Module):
     """
-    EHFNet 顶层模型
+    EHFNet 顶层模型。
 
-    编码器获取原子特征，readout 生成 SE(3) 切空间速度与亲和力预测。
+    整合多层级编码器、几何更新分支和统一预测头，
+    输出对接过程需要的位姿更新信号、排序信号和相关打分。
     """
 
     def __init__(
@@ -49,38 +55,110 @@ class EHFNet(nn.Module):
         pro_atom_cont_count: int,
         pro_res_cont_count: int,
         *,
-        m_dim_scalar: int = 16,
-        dropout_rate: float = 0.0,
-        num_rbf: int = 50,
-        r_cutoff: float = 10.0,
-        force_cutoff: float = 6.0,
-        fix_protein: bool = True,
-        interaction_profile: str = "full",
+        m_dim_scalar: int,
+        dropout_rate: float,
+        num_rbf: int,
+        r_cutoff: float,
+        force_cutoff: float,
+        interaction_profile: str,
         normalization_stats: dict | None = None,
-        dynamic_inter_cutoff: float = 10.0,
-        dynamic_inter_knn_k: int = 8,
-        dynamic_residue_cutoff: float = 14.0,
-        dynamic_residue_knn_k: int = 6,
+        frame_refine_threshold: float,
+        frame_refine_temperature: float,
+        energy_guide_threshold: float,
+        energy_guide_temperature: float,
+        clash_threshold: float,
+        clash_push_threshold: float,
+        clash_push_force: float,
+        score_clamp_min: float,
+        score_clamp_max: float,
+        force_limit: float,
+        max_neighbors: int,
+        min_max_neighbors: int,
+        knn_fallback_k: int,
+        dynamic_inter_cutoff: float,
+        dynamic_inter_knn_k: int,
+        dynamic_residue_cutoff: float,
+        dynamic_residue_knn_k: int,
     ) -> None:
         """
+        初始化 EHFNet 模型。
+
+        配置编码器、预测头和相关几何参数，
+        建立完整的两阶段盲对接主模型。
+
         Args:
-            hidden_dim: 隐藏层维度
-            time_dim: 时间嵌入维度（必须是偶数）
-            num_gnn_blocks: GNN 块数量
-            lig_atom_cont_count: 配体原子连续特征数量
-            lig_mol_cont_count: 配体分子连续特征数量
-            pro_atom_cont_count: 蛋白原子连续特征数量
-            pro_res_cont_count: 蛋白残基连续特征数量
-            m_dim_scalar: EGNN 消息维度
-            dropout_rate: Dropout 比例
-            num_rbf: RBF 基函数数量
-            r_cutoff: 截断距离（单位：Å）
-            fix_protein: 是否冻结蛋白坐标（刚性对接）
-            interaction_profile: 跨图交互配置，支持 "full" 或 "atom_only"
-            normalization_stats: 归一化统计数据
+            hidden_dim: 隐藏层维度。
+            time_dim: 时间嵌入维度。
+            num_gnn_blocks: 主干 GNN 块数量。
+            lig_atom_cont_count: 配体原子连续特征维度。
+            lig_mol_cont_count: 配体分子连续特征维度。
+            pro_atom_cont_count: 蛋白原子连续特征维度。
+            pro_res_cont_count: 蛋白残基连续特征维度。
+            m_dim_scalar: 消息传递分支的标量维度。
+            dropout_rate: Dropout 比例。
+            num_rbf: RBF 基函数数量。
+            r_cutoff: 几何邻域构建的距离截断半径。
+            force_cutoff: 力相关分支使用的局部截断半径。
+            interaction_profile: 跨图交互拓扑配置。
+            normalization_stats: 输入特征归一化统计量。
+            frame_refine_threshold: 主惯量帧细化门控阈值。
+            frame_refine_temperature: 主惯量帧细化门控温度。
+            energy_guide_threshold: 能量引导门控阈值。
+            energy_guide_temperature: 能量引导门控温度。
+            clash_threshold: 位阻判定阈值。
+            clash_push_threshold: 位阻推开分支使用的距离阈值。
+            clash_push_force: 位阻推开分支的力缩放系数。
+            score_clamp_min: 分数裁剪下界。
+            score_clamp_max: 分数裁剪上界。
+            force_limit: 力大小的软限制。
+            max_neighbors: 预测头阶段每个节点保留的最大邻居数。
+            min_max_neighbors: 预测头动态邻居数的下限。
+            knn_fallback_k: 回退到 kNN 时使用的邻居数。
+            dynamic_inter_cutoff: 动态跨图原子边的半径阈值。
+            dynamic_inter_knn_k: 动态跨图原子边回退到 kNN 时的邻居数。
+            dynamic_residue_cutoff: 动态配体-残基边的半径阈值。
+            dynamic_residue_knn_k: 动态配体-残基边回退到 kNN 时的邻居数。
+
+        Raises:
+            ValueError: 当输入参数或运行时状态不满足要求时抛出。
         """
 
         super().__init__()
+        required_args = {
+            "m_dim_scalar": m_dim_scalar,
+            "dropout_rate": dropout_rate,
+            "num_rbf": num_rbf,
+            "r_cutoff": r_cutoff,
+            "force_cutoff": force_cutoff,
+            "interaction_profile": interaction_profile,
+            "frame_refine_threshold": frame_refine_threshold,
+            "frame_refine_temperature": frame_refine_temperature,
+            "energy_guide_threshold": energy_guide_threshold,
+            "energy_guide_temperature": energy_guide_temperature,
+            "clash_threshold": clash_threshold,
+            "clash_push_threshold": clash_push_threshold,
+            "clash_push_force": clash_push_force,
+            "score_clamp_min": score_clamp_min,
+            "score_clamp_max": score_clamp_max,
+            "force_limit": force_limit,
+            "max_neighbors": max_neighbors,
+            "min_max_neighbors": min_max_neighbors,
+            "knn_fallback_k": knn_fallback_k,
+            "dynamic_inter_cutoff": dynamic_inter_cutoff,
+            "dynamic_inter_knn_k": dynamic_inter_knn_k,
+            "dynamic_residue_cutoff": dynamic_residue_cutoff,
+            "dynamic_residue_knn_k": dynamic_residue_knn_k,
+        }
+        missing_args = [name for name, value in required_args.items() if value is None]
+        if missing_args:
+            raise ValueError(
+                "EHFNet is missing required explicit configuration values: "
+                f"{missing_args}."
+            )
+        self.frame_refine_threshold = float(frame_refine_threshold)
+        self.frame_refine_temperature = float(frame_refine_temperature)
+        self.energy_guide_threshold = float(energy_guide_threshold)
+        self.energy_guide_temperature = float(energy_guide_temperature)
 
         self.encoder = EHFEncoder(
             hidden_dim=hidden_dim,
@@ -92,7 +170,6 @@ class EHFNet(nn.Module):
             pro_res_cont_count=pro_res_cont_count,
             m_dim_scalar=m_dim_scalar,
             dropout_rate=dropout_rate,
-            fix_protein=fix_protein,
             interaction_profile=interaction_profile,
             stats=normalization_stats,
             num_rbf=num_rbf,
@@ -108,10 +185,17 @@ class EHFNet(nn.Module):
             r_cutoff=r_cutoff,
             force_cutoff=force_cutoff,
             dropout_rate=dropout_rate,
-            affinity_stats=normalization_stats.get("affinity") if normalization_stats else None,
+            clash_threshold=clash_threshold,
+            clash_push_threshold=clash_push_threshold,
+            clash_push_force=clash_push_force,
+            score_clamp_min=score_clamp_min,
+            score_clamp_max=score_clamp_max,
+            force_limit=force_limit,
+            max_neighbors=max_neighbors,
+            min_max_neighbors=min_max_neighbors,
+            knn_fallback_k=knn_fallback_k,
         )
 
-        # 扭转角速度 readout [T, H*2] → [T]
         self.torsion_head = nn.Sequential(
             nn.Linear(hidden_dim * 2, hidden_dim // 2),
             nn.SiLU(),
@@ -126,14 +210,12 @@ class EHFNet(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
         )
 
-        # 体帧旋转方向 readout [B, H] → [B, 3]
         self.rot_body_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 3),
         )
 
-        # 旋转幅度 readout [B, H] → [B, 1]
         self.rot_scale_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
@@ -142,23 +224,18 @@ class EHFNet(nn.Module):
             nn.Linear(hidden_dim // 4, 1),
         )
 
-        # 平移幅度 readout [B, H] → [B, 1]
         self.trans_scale_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
 
-        # [新增] 体帧平移方向 readout [B, H] → [B, 3]
-        # MLP 在主惯量帧（body frame）中预测方向，经 R_frame 投射回世界帧保证等变性
         self.trans_body_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 3),
         )
 
-        # [新增] EGNN-MLP 融合门控 [B, H] → [B, 1]
-        # 自适应选择：t→1 时 EGNN 位移信号强偏 EGNN，t≈0 时偏 MLP
         self.fusion_gate = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 4),
             nn.SiLU(),
@@ -203,6 +280,24 @@ class EHFNet(nn.Module):
         residue_esm_missing_mask: Tensor | None = None,
         residue_prior_feat: Tensor | None = None,
     ) -> Tensor:
+        """
+        预测残基层中心提议分数。
+
+        在不执行完整对接前向的情况下仅运行中心提议相关分支，
+        用于候选中心选择阶段的快速打分。
+
+        Args:
+            residue_x_cat: 残基分类特征张量。
+            residue_x_cont: 残基连续特征张量。
+            residue_pos: 残基坐标张量。
+            residue_batch: 残基所属 batch 索引。
+            lig_mol_x_cont: 配体分子级连续特征张量。
+            residue_esm_missing_mask: 标记残基 ESM 是否缺失的布尔掩码。
+            residue_prior_feat: 残基级几何先验特征。
+
+        Returns:
+            Tensor: 返回计算得到的张量结果。
+        """
         residue_feat = self.encoder.protein_residue_embedder(
             residue_x_cat,
             residue_x_cont,
@@ -249,30 +344,26 @@ class EHFNet(nn.Module):
         前向传播
 
         Args:
-            data: 异构图数据
-            t: 时间步 [B]
+            data: 当前处理的图数据对象。
+            t: t。
 
         Returns:
             模型输出字典
         """
 
-        # 1. 编码器
         ctx = self.encoder(data, t)
-        x_dict  = ctx["x_dict"]
+        x_dict = ctx["x_dict"]
         pos_dict = ctx["pos_dict"]
-        displacement_dict = ctx["displacement_dict"]        # pos_final - pos_init，等变位移
+        displacement_dict = ctx["displacement_dict"]
         initial_lig_pos = ctx["initial_ligand_pos"]
         current_lig_pos = pos_dict["ligand_atom"]
 
-        lig_atom_feat = x_dict["ligand_atom"]               # [N_lig, H]
-        lig_mol_feat  = x_dict["ligand_molecule"]           # [B, H]
-        lig_batch     = data["ligand_atom"].batch           # [N_lig]
-        lig_displacement = displacement_dict["ligand_atom"] # [N_lig, 3] — 等变位移向量
-
-        # 2. 等变宏观运动读出
+        lig_atom_feat = x_dict["ligand_atom"]
+        lig_mol_feat = x_dict["ligand_molecule"]
+        lig_batch = data["ligand_atom"].batch
+        lig_displacement = displacement_dict["ligand_atom"]
         B = lig_mol_feat.shape[0]
 
-        # 共享：计算主惯量帧（平移和旋转共用）
         masses = getattr(data["ligand_atom"], "masses", None)
 
         if masses is None:
@@ -282,42 +373,38 @@ class EHFNet(nn.Module):
 
         R_frame_initial = compute_principal_frame(
             initial_lig_pos, lig_batch, masses, dim_size=B
-        )                                                                               # [B, 3, 3]
+        )
         R_frame_current = compute_principal_frame(
             current_lig_pos.detach(), lig_batch, masses, dim_size=B
         )
-        frame_refine_gate = torch.sigmoid((t.view(B, 1, 1) - 0.55) / 0.12)
+        frame_refine_gate = torch.sigmoid(
+            (t.view(B, 1, 1) - self.frame_refine_threshold)
+            / max(self.frame_refine_temperature, 1e-6)
+        )
 
-        # 平移：Hybrid Fusion（EGNN 物理先验 + MLP 体帧方向，门控融合）
-        # 分支 1：EGNN 等变位移信号（物理先验）
-        v_com_raw = scatter_mean(lig_displacement, lig_batch, dim=0, dim_size=B)        # [B, 3] Equivariant
-
-        # 分支 2：MLP 体帧方向 → 世界帧等变向量（严格保持 SE(3) 等变性）
-        v_body_trans = self.trans_body_head(lig_mol_feat)                               # [B, 3] Invariant
+        v_com_raw = scatter_mean(lig_displacement, lig_batch, dim=0, dim_size=B)
+        v_body_trans = self.trans_body_head(lig_mol_feat)
         v_mlp_trans_initial = (R_frame_initial @ v_body_trans.unsqueeze(-1)).squeeze(-1)
         v_mlp_trans_current = (R_frame_current @ v_body_trans.unsqueeze(-1)).squeeze(-1)
         v_mlp_trans = (
             (1.0 - frame_refine_gate.squeeze(-1)) * v_mlp_trans_initial
             + frame_refine_gate.squeeze(-1) * v_mlp_trans_current
-        )                                                                               # [B, 3] Equivariant
+        )
 
-        # 门控融合：网络自适应选择信任 EGNN 还是 MLP
-        gate = torch.sigmoid(self.fusion_gate(lig_mol_feat))                            # [B, 1] in (0,1)
-        trans_scale = F.softplus(self.trans_scale_head(lig_mol_feat))                   # [B, 1]
-        v_translation = (gate * v_com_raw + (1.0 - gate) * v_mlp_trans) * trans_scale   # [B, 3]
+        gate = torch.sigmoid(self.fusion_gate(lig_mol_feat))
+        trans_scale = F.softplus(self.trans_scale_head(lig_mol_feat))
+        v_translation = (gate * v_com_raw + (1.0 - gate) * v_mlp_trans) * trans_scale
 
-        # 旋转：体帧 MLP → 世界帧等变角速度
-        omega_dir  = F.normalize(self.rot_body_head(lig_mol_feat), dim=-1, eps=1e-8)    # [B, 3]
-        rot_scale  = F.softplus(self.rot_scale_head(lig_mol_feat))                      # [B, 1]
-        omega_body = omega_dir * rot_scale                                              # [B, 3]
+        omega_dir = F.normalize(self.rot_body_head(lig_mol_feat), dim=-1, eps=1e-8)
+        rot_scale = F.softplus(self.rot_scale_head(lig_mol_feat))
+        omega_body = omega_dir * rot_scale
         v_rotation_initial = (R_frame_initial @ omega_body.unsqueeze(-1)).squeeze(-1)
         v_rotation_current = (R_frame_current @ omega_body.unsqueeze(-1)).squeeze(-1)
         v_rotation = (
             (1.0 - frame_refine_gate.squeeze(-1)) * v_rotation_initial
             + frame_refine_gate.squeeze(-1) * v_rotation_current
-        )                                                                               # [B, 3]
+        )
 
-        # 3. 扭转角速度
         device = lig_atom_feat.device
         torsion_indices = getattr(
             data,
@@ -327,10 +414,12 @@ class EHFNet(nn.Module):
 
         guidance_input = torch.cat([lig_mol_feat, t.view(B, 1)], dim=-1)
         learned_refine_gate = torch.sigmoid(self.energy_guidance_gate(guidance_input))
-        time_refine_gate = torch.sigmoid((t.view(B, 1) - 0.75) / 0.10)
+        time_refine_gate = torch.sigmoid(
+            (t.view(B, 1) - self.energy_guide_threshold)
+            / max(self.energy_guide_temperature, 1e-6)
+        )
         refine_gate = learned_refine_gate * time_refine_gate
 
-        # 4. 亲和力预测与能量引导局部上下文（基于当前 pose，而非初始 pose）
         predictions = self.prediction_head(
             lig_atom_feat=lig_atom_feat,
             lig_atom_pos=current_lig_pos,
@@ -369,9 +458,9 @@ class EHFNet(nn.Module):
             v_rotation = v_rotation + refine_gate * rot_refine
 
         if torsion_indices.numel() > 0 and torsion_indices.size(0) > 0:
-            a1_feat = lig_atom_feat[torsion_indices[:, 1]]              # [T, H]
-            a2_feat = lig_atom_feat[torsion_indices[:, 2]]              # [T, H]
-            bond_feat = torch.cat([a1_feat, a2_feat], dim=-1)           # [T, 2H]
+            a1_feat = lig_atom_feat[torsion_indices[:, 1]]
+            a2_feat = lig_atom_feat[torsion_indices[:, 2]]
+            bond_feat = torch.cat([a1_feat, a2_feat], dim=-1)
             ctx1 = interaction_context[torsion_indices[:, 1]]
             ctx2 = interaction_context[torsion_indices[:, 2]]
             bond_refine_feat = torch.cat([a1_feat, a2_feat, ctx1, ctx2], dim=-1)

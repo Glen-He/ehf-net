@@ -1,9 +1,10 @@
 """
-统一 blind candidate 生成引擎。
+候选生成流程。
 
-验证、测试、blind pool refresh、离线候选池生成，全部调用同一套逻辑。
-保证候选分布在任何使用场景下完全一致。
+负责执行中心提议到局部对接的完整候选生成，
+是 blind pipeline 的统一实现入口。
 """
+
 
 import gc
 import logging
@@ -16,13 +17,15 @@ from torch.utils.data import DataLoader
 from torch_scatter import scatter_mean
 
 from ehfnet.graph import GraphCollator, crop_graph_to_center
+from ehfnet.training.rerank_losses import rmsd_to_soft_target
+from ehfnet.training.inference import (
+    combine_center_pose_score,
+    compute_center_guidance_scores,
+    predict_center_proposal_logits,
+    select_diverse_center_indices,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _rmsd_to_soft_target(rmsd: float, center: float = 4.0, scale: float = 0.75) -> float:
-    import math
-    return 1.0 / (1.0 + math.exp((rmsd - center) / scale))
 
 
 def _classify_rank_bucket(rmsd: float) -> str:
@@ -50,40 +53,59 @@ def generate_blind_candidates(
     device: torch.device,
     graph_builder: Any,
     collator: GraphCollator,
-    center_topk: int = 8,
-    refine_topk: int = 3,
-    center_nms_radius: float = 6.0,
-    stage1_pose_samples: int = 2,
-    stage2_pose_samples: int = 4,
-    crop_radius: float = 10.0,
-    ode_steps: int = 50,
-    warmup_epochs: int = 20,
-    center_hit_radius: float = 4.0,
+    center_topk: int,
+    refine_topk: int,
+    center_nms_radius: float,
+    stage1_pose_samples: int,
+    stage2_pose_samples: int,
+    crop_radius: float,
+    ode_steps: int,
+    warmup_epochs: int,
+    center_hit_radius: float,
+    crop_min_residues: int,
+    crop_atom_margin: float,
     fusion_weights: dict[str, float] | None = None,
+    use_learned_center_scores: bool = True,
     dataset_indices: list[int] | None = None,
     pool_epoch: int = -1,
     generator_ckpt_id: str = "",
 ) -> list[dict[str, Any]]:
-    """Run the full two-stage blind pipeline on a list of samples.
+    """
+    在给定样本列表上运行完整的两阶段 blind pipeline。
 
-    This is the *single source of truth* for candidate generation.
-    Both validation metrics and blind pool refresh call this function.
+    本函数是候选生成的 *唯一真实来源*。
+    验证指标计算和 blind pool 刷新均调用此函数。
 
     Args:
-        samples: list of cached HeteroData samples.
-        dataset_indices: optional parallel list of indices into the original dataset,
-            stored in records so replay can look up the original sample.
+        model: 当前使用的模型实例。
+        matcher: 流匹配控制器或 ODE 推理控制器。
+        samples: 待拼接或处理的样本列表。
+        device: 运行所用设备，如 CPU 或 CUDA 设备。
+        graph_builder: 用于构图或重建局部图的图构建器。
+        collator: 用于拼接局部样本的图批处理器。
+        center_topk: 中心提议阶段保留的候选中心数量。
+        refine_topk: 局部重排序阶段保留的候选构象数量。
+        center_nms_radius: 中心去重时使用的最小间距半径。
+        stage1_pose_samples: 第一阶段局部对接生成的候选构象数。
+        stage2_pose_samples: 第二阶段精排生成的候选构象数。
+        crop_radius: 局部裁剪半径。
+        ode_steps: ODE 推理积分步数。
+        warmup_epochs: 课程学习预热轮数。
+        center_hit_radius: 判断中心命中的距离阈值。
+        crop_min_residues: 局部裁剪后至少保留的残基数量。
+        crop_atom_margin: 基于原子距离扩展残基裁剪范围的边界。
+        fusion_weights: 融合不同分支分数时使用的权重字典。
+        use_learned_center_scores: 是否优先使用模型学习得到的中心分数。
+        dataset_indices: 与样本一一对应的原始数据集索引。
+        pool_epoch: 当前候选池对应的训练轮次。
+        generator_ckpt_id: 生成候选时使用的 checkpoint 标识。
 
     Returns:
-        Per-complex records with center-level and pose-level data, including
-        ``pose_xyz`` for replay.
-    """
-    from ehfnet.training.trainer import (
-        predict_center_proposal_logits,
-        select_diverse_center_indices,
-        combine_center_pose_score,
-    )
+        list[dict[str, Any]]: 每个复合物对应的候选中心与构象记录列表。
 
+    Raises:
+        RuntimeError: 当候选生成过程出现不可恢复的局部对接错误时抛出。
+    """
     model.eval()
     records: list[dict[str, Any]] = []
     failed_samples = 0
@@ -91,10 +113,14 @@ def generate_blind_candidates(
     for sample_idx, sample in enumerate(samples):
         try:
             batch = collator.collate([sample])
-            proposal_logits, residue_pos_device, residue_batch_device, _ = predict_center_proposal_logits(
+            proposal_logits, residue_pos_device, residue_batch_device, residue_prior_feat = predict_center_proposal_logits(
                 model, batch, device=device,
             )
-            graph_logits = proposal_logits.view(-1).detach().cpu()
+            graph_logits = compute_center_guidance_scores(
+                proposal_logits.detach().cpu().view(-1),
+                residue_prior_feat.detach().cpu(),
+                use_learned_scores=use_learned_center_scores,
+            )
             graph_positions = residue_pos_device.detach().cpu()
 
             if graph_positions.numel() == 0:
@@ -115,7 +141,6 @@ def generate_blind_candidates(
             center_best_stage1: list[tuple[float, int, Tensor, float]] = []
             pose_counter = 0
 
-            # ── Stage 1: screen all proposal centers ──
             for proposal_rank, center_idx in enumerate(center_indices.tolist(), start=1):
                 center_pos = graph_positions[center_idx]
                 center_logit = float(graph_logits[center_idx].item())
@@ -133,6 +158,8 @@ def generate_blind_candidates(
 
                 local_sample = crop_graph_to_center(
                     sample, center=center_pos, radius=crop_radius,
+                    min_residues=crop_min_residues,
+                    atom_margin=crop_atom_margin,
                     graph_builder=graph_builder,
                 )
 
@@ -168,7 +195,6 @@ def generate_blind_candidates(
                 center_records.append(center_rec)
                 center_best_stage1.append((best_s1_score, proposal_rank, center_pos, center_logit))
 
-            # ── Stage 2: refine top centers by stage1 score ──
             center_best_stage1.sort(key=lambda x: x[0], reverse=True)
             refined_center_ids = set()
 
@@ -176,6 +202,8 @@ def generate_blind_candidates(
                 refined_center_ids.add(c_rank)
                 local_sample = crop_graph_to_center(
                     sample, center=center_pos, radius=crop_radius,
+                    min_residues=crop_min_residues,
+                    atom_margin=crop_atom_margin,
                     graph_builder=graph_builder,
                 )
                 for pose_id in range(stage2_pose_samples):
@@ -203,7 +231,6 @@ def generate_blind_candidates(
             if not pose_records:
                 continue
 
-            # back-fill center success labels
             for crec in center_records:
                 cid = crec["center_id"]
                 center_poses = [p for p in pose_records if p["center_id"] == cid]
@@ -212,26 +239,6 @@ def generate_blind_candidates(
                     crec["center_success_label"] = _classify_center_success(best_rmsd)
                 else:
                     crec["center_success_label"] = "negative"
-
-            # center_hits list for backward-compat with summarize_blind_candidate_records
-            center_hits = [crec["is_center_hit_4A"] for crec in center_records]
-
-            # backward-compat candidates list
-            compat_candidates = [
-                {
-                    "score": p["combined_score"],
-                    "rmsd": p["rmsd"],
-                    "ranking_logit": p.get("ranking_logit", p.get("pose_rank_logit", p["pose_quality_logit"])),
-                    "pose_logit": p.get("ranking_logit", p.get("pose_rank_logit", p["pose_quality_logit"])),
-                    "pose_quality_logit": p["pose_quality_logit"],
-                    "pose_rank_logit": p.get("pose_rank_logit", p.get("ranking_logit", p["pose_quality_logit"])),
-                    "center_logit": p["center_logit"],
-                    "aff_logit": p["binding_affinity_teacher"],
-                    "clash_value": p["steric_clash_teacher"],
-                    "proposal_rank": float(p["center_id"]),
-                }
-                for p in pose_records
-            ]
 
             sample_dataset_index = getattr(sample, "dataset_index", None)
             if sample_dataset_index is None and dataset_indices is not None:
@@ -257,9 +264,6 @@ def generate_blind_candidates(
                 },
                 "centers": center_records,
                 "poses": pose_records,
-                # backward-compat fields for summarize_blind_candidate_records
-                "center_hits": center_hits,
-                "candidates": compat_candidates,
             })
 
             del batch
@@ -309,9 +313,12 @@ def _generate_single_pose(
     pose_counter: int,
     fusion_weights: dict[str, float] | None,
 ) -> dict[str, Any] | None:
-    """Generate one pose at a given center. Returns None on OOM."""
-    from ehfnet.training.trainer import combine_center_pose_score
+    """
+    在给定中心点生成一个构象。发生 OOM 时返回 None。
 
+    Returns:
+        dict[str, Any] | None: 返回单个候选构象的记录字典；若生成过程中发生 OOM 则返回 `None`。
+    """
     try:
         infer_batch = cast(Any, collator.collate([local_sample])).to(device)
         x_ref = infer_batch["ligand_atom"].pos
@@ -353,9 +360,6 @@ def _generate_single_pose(
 
         aff_val = float(aff_raw.detach().cpu().view(-1)[0].item())
         clash_val = float(clash_raw.detach().cpu().view(-1)[0].item()) if clash_raw is not None else 0.0
-        force_norm = 0.0
-        if force_atom is not None and force_atom.numel() > 0:
-            force_norm = float(force_atom.detach().norm(dim=-1).mean().cpu().item())
         rank_score = float(rank_score_raw.detach().cpu().view(-1)[0].item()) if rank_score_raw is not None else None
         primary_ranking_logit = rank_score if rank_score is not None else pose_quality_logit
 
@@ -382,19 +386,17 @@ def _generate_single_pose(
             "centroid_dist": centroid_dist,
             "ranking_logit": primary_ranking_logit,
             "pose_quality_logit": pose_quality_logit,
-            "pose_rank_logit": primary_ranking_logit,
             "binding_affinity_teacher": aff_val,
             "steric_clash_teacher": clash_val,
-            "force_norm_teacher": force_norm,
             "center_logit": center_logit,
             "combined_score": combined_score,
             "is_hit_2A": rmsd < 2.0,
             "is_hit_5A": rmsd < 5.0,
-            "soft_target": _rmsd_to_soft_target(rmsd),
+            "soft_target": float(
+                rmsd_to_soft_target(torch.tensor(rmsd, dtype=torch.float32)).item()
+            ),
             "rank_bucket": _classify_rank_bucket(rmsd),
         }
-        if rank_score is not None:
-            rec["pose_rank_score_teacher"] = rank_score
         return rec
 
     except torch.cuda.OutOfMemoryError:
@@ -414,25 +416,60 @@ def generate_candidates_from_loader(
     device: torch.device,
     graph_builder: Any,
     collator: GraphCollator,
-    center_topk: int = 8,
-    refine_topk: int = 3,
-    center_nms_radius: float = 6.0,
-    stage1_pose_samples: int = 2,
-    stage2_pose_samples: int = 4,
-    crop_radius: float = 10.0,
-    ode_steps: int = 50,
-    warmup_epochs: int = 20,
-    center_hit_radius: float = 4.0,
+    center_topk: int,
+    refine_topk: int,
+    center_nms_radius: float,
+    stage1_pose_samples: int,
+    stage2_pose_samples: int,
+    crop_radius: float,
+    ode_steps: int,
+    warmup_epochs: int,
+    center_hit_radius: float,
+    crop_min_residues: int,
+    crop_atom_margin: float,
     fusion_weights: dict[str, float] | None = None,
+    use_learned_center_scores: bool = True,
     edge_guard_limit: int | None = None,
     max_complexes: int | None = None,
     pool_epoch: int = -1,
     generator_ckpt_id: str = "",
 ) -> list[dict[str, Any]]:
-    """Convenience wrapper: iterate over a DataLoader, unbatch, and generate candidates.
+    """
+    便捷封装：遍历 DataLoader，拆分 batch 后逐样本生成候选。
 
-    This replaces both ``evaluate_topn_success`` (partially) and
-    ``refresh_blind_candidate_pool``.
+    本函数取代了 ``evaluate_topn_success``（部分）和
+    ``refresh_blind_candidate_pool`` 的功能。
+
+    Args:
+        model: 当前使用的模型实例。
+        matcher: 流匹配控制器或 ODE 推理控制器。
+        loader: 提供批次数据的 DataLoader。
+        device: 运行所用设备，如 CPU 或 CUDA 设备。
+        graph_builder: 用于构图或重建局部图的图构建器。
+        collator: 用于拼接局部样本的图批处理器。
+        center_topk: 中心提议阶段保留的候选中心数量。
+        refine_topk: 局部重排序阶段保留的候选构象数量。
+        center_nms_radius: 中心去重时使用的最小间距半径。
+        stage1_pose_samples: 第一阶段局部对接生成的候选构象数。
+        stage2_pose_samples: 第二阶段精排生成的候选构象数。
+        crop_radius: 局部裁剪半径。
+        ode_steps: ODE 推理积分步数。
+        warmup_epochs: 课程学习预热轮数。
+        center_hit_radius: 判断中心命中的距离阈值。
+        crop_min_residues: 局部裁剪后至少保留的残基数量。
+        crop_atom_margin: 基于原子距离扩展残基裁剪范围的边界。
+        fusion_weights: 融合不同分支分数时使用的权重字典。
+        use_learned_center_scores: 是否优先使用模型学习得到的中心分数。
+        edge_guard_limit: 候选生成阶段的边数保护上限。
+        max_complexes: 本轮最多处理的复合物数量。
+        pool_epoch: 当前候选池对应的训练轮次。
+        generator_ckpt_id: 生成候选时使用的 checkpoint 标识。
+
+    Returns:
+        list[dict[str, Any]]: 按 DataLoader 遍历得到的完整候选记录列表。
+
+    Raises:
+        RuntimeError: 当批次拆分或候选生成流程失败时抛出。
     """
     all_records: list[dict[str, Any]] = []
     total_complexes = 0
@@ -481,7 +518,10 @@ def generate_candidates_from_loader(
                 ode_steps=ode_steps,
                 warmup_epochs=warmup_epochs,
                 center_hit_radius=center_hit_radius,
+                crop_min_residues=crop_min_residues,
+                crop_atom_margin=crop_atom_margin,
                 fusion_weights=fusion_weights,
+                use_learned_center_scores=use_learned_center_scores,
                 dataset_indices=batch_dataset_indices if len(batch_dataset_indices) == len(data_list) else None,
                 pool_epoch=pool_epoch,
                 generator_ckpt_id=generator_ckpt_id,

@@ -1,21 +1,22 @@
 """
-动力学几何计算
+动力学几何工具。
 
-提供训练和推理阶段的动力学几何计算，包括速度分解、位姿更新和路径插值。
+负责速度分解、位姿更新、路径插值和相关几何变换，
+是训练与推理阶段的核心几何实现。
 """
 
+
 import logging
+from typing import Any
+
 import torch
 import torch.nn.functional as F
-
-from typing import Any
 from torch import Tensor
 from torch_scatter import scatter_sum
 
 logger = logging.getLogger(__name__)
 
 
-# 物理化学常量
 def compute_center_of_mass(
     pos: Tensor,
     batch: Tensor,
@@ -27,11 +28,11 @@ def compute_center_of_mass(
     统一质心计算工具
 
     Args:
-        pos: 原子坐标 [N, 3]
-        batch: 批次索引 [N]
-        masses: 原子质量 [N] 或 [N, 1]
-        dim_size: 批次大小 (可选)
-        eps: 数值稳定性参数 (默认 1e-6)
+        pos: 节点坐标张量。
+        batch: batch。
+        masses: masses。
+        dim_size: 维度size。
+        eps: eps。
 
     Returns:
         质心坐标 [B, 3]
@@ -73,17 +74,17 @@ def compute_principal_frame(
         - θ ≈ π 旋转（线性/平面分子第三轴近零）→ 翻转最小奇异向量符号
 
     Args:
-        pos:      原子坐标 [N, 3]
-        batch:    批次索引 [N]
-        masses:   原子质量 [N] 或 [N, 1]
-        dim_size: 批次大小（可选，None 则自动推断）
-        eps:      数值稳定性参数
+        pos: 节点坐标张量。
+        batch: batch。
+        masses: masses。
+        dim_size: 维度size。
+        eps: eps。
 
     Returns:
         R: 主惯量帧旋转矩阵 [B, 3, 3]，列向量为主轴（body→world）
     """
     if masses.dim() == 1:
-        masses = masses.unsqueeze(-1)      # [N, 1]
+        masses = masses.unsqueeze(-1)
 
     if dim_size is None:
         dim_size = int(batch.max().item()) + 1
@@ -92,49 +93,38 @@ def compute_principal_frame(
     device = pos.device
     dtype  = pos.dtype
 
-    # 使用 detach 的坐标——主惯量帧仅作几何参考基，不需要反向传播
     pos_d = pos.detach()
-
-    # 质心（质量加权）
     masses_clamped = masses.clamp(min=eps)
     mass_per_mol = scatter_sum(masses_clamped, batch, dim=0, dim_size=B).clamp(min=eps)
     com = scatter_sum(pos_d * masses_clamped, batch, dim=0, dim_size=B) / mass_per_mol
 
-    r = pos_d - com[batch]                 # [N, 3] 质心系坐标
+    r = pos_d - com[batch]
 
-    # 单/双原子分子安全处理：协方差秩 < 3，直接退化为单位矩阵
     atoms_per_mol = scatter_sum(
         torch.ones(pos_d.size(0), device=device, dtype=torch.long),
         batch, dim=0, dim_size=B,
     )
     degenerate_mol_mask = atoms_per_mol < 3
 
-    # ── 向量化构建协方差矩阵 [B, 3, 3] ────────────────────────────────────
-    weighted_r = r * masses_clamped                                    # [N, 3]
-    # 原子级外积：[N, 3, 1] @ [N, 1, 3] → [N, 3, 3]
+    weighted_r = r * masses_clamped
     atom_cov = torch.bmm(weighted_r.unsqueeze(-1), r.unsqueeze(-2))
-    # scatter 聚合到分子维度
     C = scatter_sum(
         atom_cov.reshape(-1, 9), batch, dim=0, dim_size=B
     ).reshape(B, 3, 3)
 
-    # ── 批量 SVD + 符号消歧 ─────────────────────────────────────────────
-    eye = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)        # [1, 3, 3]
+    eye = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
 
     try:
         U, S, Vh = torch.linalg.svd(C)
 
-        # 【关键】消除 SVD 符号歧义（Sign Ambiguity）
-        # 强制 U 对角线元素为正，保证同一分子在坐标微扰时帧方向连续
-        signs = torch.sign(torch.diagonal(U, dim1=-2, dim2=-1))        # [B, 3]
+        signs = torch.sign(torch.diagonal(U, dim1=-2, dim2=-1))
         signs[signs == 0] = 1.0
-        U  = U * signs.unsqueeze(-2)                                   # [B, 3, 3]
-        Vh = Vh * signs.unsqueeze(-1)                                  # 补偿 V 侧
+        U = U * signs.unsqueeze(-2)
+        Vh = Vh * signs.unsqueeze(-1)
 
         R_b = torch.bmm(U, Vh)
 
-        # 保证右手系：det(R) = +1
-        det = torch.linalg.det(R_b)                                   # [B]
+        det = torch.linalg.det(R_b)
         flip_mask = det < 0
         if flip_mask.any():
             U_corr = U.clone()
@@ -142,16 +132,13 @@ def compute_principal_frame(
             R_flip = torch.bmm(U_corr[flip_mask], Vh[flip_mask])
             R_b[flip_mask] = R_flip
 
-        # 逐分子 NaN/Inf 修复（仅失败的退化为单位矩阵）
-        bad_mask = ~torch.isfinite(R_b).all(dim=-1).all(dim=-1)       # [B]
+        bad_mask = ~torch.isfinite(R_b).all(dim=-1).all(dim=-1)
         if bad_mask.any():
             R_b[bad_mask] = eye.expand(int(bad_mask.sum()), -1, -1)
 
-        # 对单/双原子分子：强制使用单位矩阵
         if degenerate_mol_mask.any():
             R_b[degenerate_mol_mask] = eye.expand(int(degenerate_mol_mask.sum()), -1, -1)
 
-        # 对线性/近线性或平面分子：显式修复最小奇异向量，避免第三轴不稳定
         small_sv_mask = (~degenerate_mol_mask) & (S[:, -1] < 1e-5)
         if small_sv_mask.any():
             for idx in small_sv_mask.nonzero(as_tuple=False).view(-1).tolist():
@@ -168,18 +155,16 @@ def compute_principal_frame(
 
 class PhysicsConstants:
     """
-    物理化学常量定义
+    动力学常量集合。
+
+    集中声明动力学与几何更新中使用的固定常量，
+    避免数值定义散落在路径插值和位姿更新逻辑中。
     """
 
-    # 数值稳定性
-    EPSILON = 1e-8              # 通用数值保护
-    MIN_NORM = 1e-7             # 最小向量模长
-
-    # 正则化参数
-    DAMPING_FACTOR = 1e-4       # Tikhonov 正则化系数
-
-    # 旋转相关
-    MIN_ROTATION_ANGLE = 1e-6   # 最小旋转角度（弧度）
+    EPSILON = 1e-8
+    MIN_NORM = 1e-7
+    DAMPING_FACTOR = 1e-4
+    MIN_ROTATION_ANGLE = 1e-6
 
 
 class TangentTargetProjector:
@@ -195,8 +180,10 @@ class TangentTargetProjector:
 
     def __init__(self, eps: float = PhysicsConstants.EPSILON):
         """
+        初始化对象。
+
         Args:
-            eps: 数值稳定性保护参数
+            eps: eps。
         """
 
         self.eps = eps
@@ -268,13 +255,15 @@ class TangentTargetProjector:
         """
         联合最小二乘法将笛卡尔导数投影为切空间目标。
 
+
         Args:
-            pos: 原子坐标 [N, 3]
-            vel: 原子级笛卡尔导数 [N, 3]
-            masses: 原子质量 [N] 或 [N, 1]
-            batch: 批次索引 [N]
-            torsion_indices: 扭转角定义 [T, 4]
-            torsion_moving_mask: 移动原子掩码 [T, N]
+            pos: 节点坐标张量。
+            vel: vel。
+            masses: masses。
+            batch: batch。
+            torsion_indices: 扭转角对应的原子索引张量。
+            torsion_moving_mask: 扭转更新时需要跟随旋转的原子掩码。
+
 
         Returns:
             v_trans: 平移速度 [B, 3]
@@ -379,15 +368,18 @@ class TangentTargetProjector:
 
 class PoseUpdater:
     """
-    位姿更新器
+    位姿更新器。
 
-    根据速度场更新分子位姿，支持刚体变换和扭转角变化。
+    负责根据模型预测的平移、旋转和扭转速度更新当前分子位姿，
+    是 ODE 推理轨迹和局部位姿演化的核心几何组件。
     """
 
     def __init__(self, eps: float = PhysicsConstants.EPSILON):
         """
+        初始化对象。
+
         Args:
-            eps: 数值稳定性保护参数
+            eps: eps。
         """
 
         self.eps = eps
@@ -409,16 +401,18 @@ class PoseUpdater:
         """
         更新位姿：先应用扭转，再应用刚体变换。
 
+
         Args:
-            pos: 当前坐标 [N, 3]
-            masses: 原子质量 [N] 或 [N, 1]
-            batch: 批次索引 [N]
-            v_trans: 平移速度 [B, 3]
-            v_rot: 旋转速度 [B, 3]
-            v_torsion: 扭转角速度 [T] 或 None
-            torsion_indices: 扭转角定义 [T, 4] 或 None
-            torsion_moving_mask: 移动原子掩码 [T, N] 或 None
-            dt: 时间步长
+            pos: 节点坐标张量。
+            masses: masses。
+            batch: batch。
+            v_trans: v平移。
+            v_rot: v旋转。
+            v_torsion: 扭转角速度或扭转更新量。
+            torsion_indices: 扭转角对应的原子索引张量。
+            torsion_moving_mask: 扭转更新时需要跟随旋转的原子掩码。
+            dt: 时间步长。
+
 
         Returns:
             更新后的坐标 [N, 3]
@@ -431,14 +425,13 @@ class PoseUpdater:
         T = torsion_indices.shape[0] if torsion_indices is not None else 0
         new_pos = pos.clone()
 
-        # 1. 扭转更新
         if (
             T > 0
             and v_torsion is not None
             and torsion_indices is not None
             and torsion_moving_mask is not None
         ):
-            angles = (v_torsion * dt).reshape(-1)  # ensure 1-D [T]
+            angles = (v_torsion * dt).reshape(-1)
 
             for i in range(T):
                 angle = angles[i]
@@ -467,10 +460,8 @@ class PoseUpdater:
                 rot_mat = self._axis_angle_to_matrix(axis, angle)
                 rel_pts = new_pos[mask] - origin
 
-                # (R @ rel^T)^T = rel @ R^T
                 new_pos[mask] = torch.matmul(rel_pts, rot_mat.T) + origin
 
-        # 2. 刚体更新
         com = compute_center_of_mass(new_pos, batch, masses, dim_size=B)
 
         d_trans = v_trans * dt
@@ -478,25 +469,19 @@ class PoseUpdater:
         theta = torch.norm(d_rot_vec, dim=-1, keepdim=True)
         rot_axis = d_rot_vec / (theta + self.eps)
 
-        # 向量化刚体更新：避免 Python for 循环，所有分子并行处理
-        # 计算全体分子的旋转矩阵 [B, 3, 3]
-        R_all = self._axis_angle_to_matrix_batched(rot_axis, theta.squeeze(-1))  # [B, 3, 3]
+        R_all = self._axis_angle_to_matrix_batched(rot_axis, theta.squeeze(-1))
 
-        # 小角掩码：角度过小时跳过旋转（保持原坐标），防止数值噪声
-        small_angle = (theta.squeeze(-1) <= PhysicsConstants.MIN_ROTATION_ANGLE)  # [B]
-        # 对小角分子，旋转矩阵退化为单位矩阵
+        small_angle = theta.squeeze(-1) <= PhysicsConstants.MIN_ROTATION_ANGLE
         eye_B = torch.eye(3, device=new_pos.device, dtype=new_pos.dtype).unsqueeze(0).expand(B, -1, -1)
-        R_all = torch.where(small_angle[:, None, None], eye_B, R_all)  # [B, 3, 3]
+        R_all = torch.where(small_angle[:, None, None], eye_B, R_all)
 
-        # 展开到原子维度
-        com_per_atom   = com[batch]          # [N, 3]
-        R_per_atom     = R_all[batch]        # [N, 3, 3]
-        d_trans_per_atom = d_trans[batch]    # [N, 3]
+        com_per_atom = com[batch]
+        R_per_atom = R_all[batch]
+        d_trans_per_atom = d_trans[batch]
 
-        # 中心化 → 旋转 → 移回质心 → 平移
-        pos_centered = new_pos - com_per_atom                                  # [N, 3]
-        pos_rotated  = torch.einsum('nij,nj->ni', R_per_atom, pos_centered)    # [N, 3]
-        new_pos = pos_rotated + com_per_atom + d_trans_per_atom                # [N, 3]
+        pos_centered = new_pos - com_per_atom
+        pos_rotated = torch.einsum('nij,nj->ni', R_per_atom, pos_centered)
+        new_pos = pos_rotated + com_per_atom + d_trans_per_atom
 
         return new_pos
 
@@ -536,35 +521,37 @@ class PoseUpdater:
         Returns:
             旋转矩阵 [B, 3, 3]
         """
-        x, y, z = axis.unbind(-1)          # 各 [B]
+        x, y, z = axis.unbind(-1)
         zeros = torch.zeros_like(x)
 
-        # 反对称矩阵 K [B, 3, 3]
         K = torch.stack([
             torch.stack([zeros,  -z,      y    ], dim=-1),
             torch.stack([z,       zeros,  -x   ], dim=-1),
             torch.stack([-y,      x,      zeros], dim=-1),
         ], dim=-2)
 
-        I = torch.eye(3, device=axis.device, dtype=axis.dtype).unsqueeze(0)  # [1, 3, 3]
-        s = torch.sin(angle)[:, None, None]          # [B, 1, 1]
-        c = (1.0 - torch.cos(angle))[:, None, None]  # [B, 1, 1]
+        I = torch.eye(3, device=axis.device, dtype=axis.dtype).unsqueeze(0)
+        s = torch.sin(angle)[:, None, None]
+        c = (1.0 - torch.cos(angle))[:, None, None]
 
-        return I + s * K + c * torch.bmm(K, K)       # [B, 3, 3]
+        return I + s * K + c * torch.bmm(K, K)
 
 
 class PathInterpolator:
     """
-    路径插值器
+    路径插值器。
 
-    计算两个构象之间的物理合理插值路径（Kabsch对齐 + 扭转角插值）。
+    负责在初始构象与目标构象之间构造物理上更合理的插值路径，
+    为流匹配训练提供位置轨迹和速度监督目标。
     """
 
     def __init__(self, eps: float = PhysicsConstants.EPSILON, fd_dt: float = 0.05):
         """
+        初始化对象。
+
         Args:
-            eps:   数值稳定性保护参数
-            fd_dt: 速度有限差分步长，v = Δpos / fd_dt（默认 0.05 Å/unit-t）
+            eps: eps。
+            fd_dt: 有限差分计算目标速度时使用的时间步长。
         """
 
         self.eps = eps
@@ -597,13 +584,15 @@ class PathInterpolator:
         """
         计算 pos_0 到 pos_1 的最优变换参数（Kabsch + 扭转差）
 
+
         Args:
-            pos_0: 初始坐标 [N, 3]
-            pos_1: 目标坐标 [N, 3]
-            masses: 原子质量 [N] 或 [N, 1]
-            batch: 批次索引 [N]
-            torsion_indices: 扭转角定义 [T, 4] 或 None
-            torsion_moving_mask: 移动原子掩码 [T, N] 或 None
+            pos_0: pos0。
+            pos_1: pos1。
+            masses: masses。
+            batch: batch。
+            torsion_indices: 扭转角对应的原子索引张量。
+            torsion_moving_mask: 扭转更新时需要跟随旋转的原子掩码。
+
 
         Returns:
             包含变换参数的字典
@@ -617,7 +606,6 @@ class PathInterpolator:
         if masses.dim() == 1:
             masses = masses.unsqueeze(-1)
 
-        # 1. 质心对齐
         com_0 = compute_center_of_mass(pos_0, batch, masses, dim_size=B)
         com_1 = compute_center_of_mass(pos_1, batch, masses, dim_size=B)
         delta_trans = com_1 - com_0
@@ -638,7 +626,6 @@ class PathInterpolator:
                 "torsion_moving_mask": torsion_moving_mask,
             }
 
-        # 2. 计算最佳旋转（批量质量加权 Kabsch）
         eye = torch.eye(3, device=device, dtype=dtype).unsqueeze(0).expand(B, -1, -1)
         R = eye.clone()
         atom_counts = scatter_sum(
@@ -681,7 +668,6 @@ class PathInterpolator:
         for idx in fallback_indices.tolist():
             R[idx] = self._solve_single_kabsch(H[idx], device=device, dtype=dtype)
 
-        # 3. 计算扭转角差异
         R_expanded = R[batch]
         pos_0_aligned = (
             torch.einsum("nij,nj->ni", R_expanded, pos_0_centered) + com_1[batch]
@@ -692,13 +678,14 @@ class PathInterpolator:
             idx0, idx1 = torsion_indices[:, 0], torsion_indices[:, 1]
             idx2, idx3 = torsion_indices[:, 2], torsion_indices[:, 3]
 
-            angle_0 = self._calc_dihedrals(pos_0_aligned, idx0, idx1, idx2, idx3)
-            angle_1 = self._calc_dihedrals(pos_1, idx0, idx1, idx2, idx3)
+            angle_0 = self._calc_dihedrals(
+                pos_0_aligned, idx0=idx0, idx1=idx1, idx2=idx2, idx3=idx3
+            )
+            angle_1 = self._calc_dihedrals(pos_1, idx0=idx0, idx1=idx1, idx2=idx2, idx3=idx3)
 
-            # 最小角度差
             diff = angle_1 - angle_0
             delta_torsions = torch.atan2(torch.sin(diff), torch.cos(diff))
-            
+
             if not torch.isfinite(delta_torsions).all():
                 logger.warning("NaN detected in delta_torsions, replacing with zeros")
                 delta_torsions = torch.nan_to_num(delta_torsions, nan=0.0)
@@ -722,8 +709,8 @@ class PathInterpolator:
         计算 t 时刻的 x_t 和 v_t（有限差分）
 
         Args:
-            params: 路径参数字典
-            t: 时间参数 [B]
+            params: params。
+            t: t。
 
         Returns:
             pos_t: t 时刻的坐标 [N, 3]
@@ -736,31 +723,26 @@ class PathInterpolator:
         t_next = torch.clamp(t_float + self.fd_dt, max=1.0)
         pos_next = self._compute_pose_at_t(params, t_next)
 
-        # 用实际步长而非固定 fd_dt 做归一化：
-        # 当 t 接近 1.0 时 clamp 会压缩实际步长，若仍除以 fd_dt 会
-        # 系统性低估目标速度，导致模型在 t→1 阶段学到"刹车"行为。
-        # actual_dt 形状 [B, 1]，需按原子 batch 索引展开为 [N, 1]
-        # 才能与 pos 差值 [N, 3] 正确广播。
-        actual_dt = (t_next - t_float).clamp(min=self.eps)       # [B, 1]
-        actual_dt_per_atom = actual_dt[params["batch"]]           # [N, 1]
+        actual_dt = (t_next - t_float).clamp(min=self.eps)
+        actual_dt_per_atom = actual_dt[params["batch"]]
         return pos_t, (pos_next - pos_t) / actual_dt_per_atom
 
 
     def _compute_pose_at_t(self, params: dict[str, Any], t: Tensor) -> Tensor:
         """
         计算 t 时刻的位姿
+
+        Returns:
+            Tensor: 返回计算得到的张量结果。
         """
 
         batch = params["batch"]
 
-        # 1. 插值平移
         com_t = params["com_0"] + t * params["delta_trans"]
 
-        # 2. 插值旋转（轴角线性插值）
-        rot_vec = self._matrix_to_axis_angle(params["R_total"])     # [B, 3]
-        R_t = self._rotation_vector_to_matrix(rot_vec * t)          # [B, 3, 3]
+        rot_vec = self._matrix_to_axis_angle(params["R_total"])
+        R_t = self._rotation_vector_to_matrix(rot_vec * t)
 
-        # 3. 应用刚体 + 扭转
         pos_torsioned = params["pos_0_centered"].clone()
 
         if params["delta_torsions"].numel() > 0:
@@ -788,11 +770,24 @@ class PathInterpolator:
 
 
     @staticmethod
-    def _calc_dihedrals(pos: Tensor, idx0: Tensor, idx1: Tensor, idx2: Tensor, idx3: Tensor) -> Tensor:
+    def _calc_dihedrals(
+        pos: Tensor,
+        *,
+        idx0: Tensor,
+        idx1: Tensor,
+        idx2: Tensor,
+        idx3: Tensor,
+    ) -> Tensor:
         """
-        计算二面角
-        """
+        计算由四组原子索引定义的二面角（弧度）。
 
+        Args:
+            pos: 原子坐标，形状 [N, 3]。
+            idx0, idx1, idx2, idx3: 四元组原子索引，形状 [T]，定义 T 个二面角。
+
+        Returns:
+            Tensor: 二面角弧度值，形状 [T]。
+        """
         b0 = -1.0 * (pos[idx1] - pos[idx0])
         b1 = F.normalize(pos[idx2] - pos[idx1], dim=-1, eps=PhysicsConstants.EPSILON)
         b2 = pos[idx3] - pos[idx2]
@@ -810,6 +805,9 @@ class PathInterpolator:
     def _matrix_to_axis_angle(R: Tensor) -> Tensor:
         """
         对数映射（log map）：SO(3) -> so(3)
+
+        Returns:
+            Tensor: 返回计算得到的张量结果。
         """
 
         trace = R[:, 0, 0] + R[:, 1, 1] + R[:, 2, 2]
@@ -838,6 +836,9 @@ class PathInterpolator:
     def _rotation_vector_to_matrix(rot_vec: Tensor) -> Tensor:
         """
         指数映射（exp map）：so(3) -> SO(3)（batch 版本）
+
+        Returns:
+            Tensor: 返回计算得到的张量结果。
         """
 
         angle = torch.norm(rot_vec, dim=-1, keepdim=True)

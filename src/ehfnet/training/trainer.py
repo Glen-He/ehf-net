@@ -1,1020 +1,240 @@
 """
-训练循环
+训练主循环。
 
-提供 EHFNet 模型的训练和验证功能。
+负责组织数据加载、优化更新、验证评估、候选池训练与 checkpoint 管理，
+是训练阶段调度各模块的核心入口。
 """
 
-import os
-import math
-import json
-import hashlib
-import traceback
-import torch
-import logging
+
 import gc
-import numpy as np
-from typing import Any, cast
+import json
+import logging
+import math
+import os
+import traceback
 from pathlib import Path
-from scipy import stats as scipy_stats
+from typing import Any, cast
+
+import numpy as np
+import torch
 import torch.nn.functional as F
 import torch.optim as optim
-
-from tqdm import tqdm
-from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.optim.swa_utils import AveragedModel
-from torch.optim.lr_scheduler import LinearLR, CosineAnnealingLR, SequentialLR
-from torch_geometric.data import HeteroData
-
+from torch.utils.data import DataLoader
 from torch_scatter import scatter_mean
+from tqdm import tqdm
 
-from ehfnet.models import EHFNet
-from ehfnet.graph import GraphCollator, crop_graph_to_center
-from ehfnet.datasets.protein_ligand import GRAPH_CACHE_DIRNAME, ProteinLigandDataset
-from ehfnet.datasets.splitter import ScaffoldSplitter
-from ehfnet.encoders.feature_specs import (
+from ehfnet.data import ProteinLigandDataset
+from ehfnet.data.datasets import ScaffoldSplitter
+from ehfnet.data.featurizers import (
     LIGAND_ATOM_CONT_SCHEMA,
     LIGAND_MOLECULE_CONT_SCHEMA,
     PROTEIN_ATOM_CONT_SCHEMA,
     PROTEIN_RESIDUE_CONT_SCHEMA,
 )
-from ehfnet.training.losses import FlowMatchingLoss
-from ehfnet.training.flow_matcher import ConditionalFlowMatcher
+from ehfnet.graph import GraphCollator
+from ehfnet.runtime import build_dataset, build_model, resolve_interaction_profile
+from ehfnet.training.batch_helpers import (
+    apply_loss_context,
+    build_local_batch_from_centers,
+    compute_pose_quality_target,
+    select_pose_ranking_logit,
+)
 from ehfnet.training.blind_pool import (
-    refresh_blind_candidate_pool,
-    save_blind_pool,
-    load_blind_pool,
-    build_blind_pool_compatibility,
     BlindCandidateReplayDataset,
-    replay_and_compute_losses,
-    should_refresh_pool,
+    build_blind_pool_signature,
     get_pool_stats,
+    load_blind_pool,
+    refresh_blind_candidate_pool,
+    replay_and_compute_losses,
+    save_blind_pool,
+    should_refresh_pool,
 )
-from ehfnet.training.candidate_generation import (
-    generate_blind_candidates,
-    generate_candidates_from_loader,
+from ehfnet.training.candidate_generation import generate_blind_candidates
+from ehfnet.training.center_sampling import (
+    compute_bootstrap_pose_quality_loss,
+    select_bootstrap_blind_centers,
+    select_training_crop_centers,
+    select_wrong_center_candidates,
+    should_run_bootstrap,
 )
-from ehfnet.training.checkpoint_schema import (
-    build_feature_signature,
-    build_model_config,
+from ehfnet.training.checkpoint_io import (
+    build_selection_metrics,
+    compose_checkpoint,
+    is_better_checkpoint,
+    resolve_selection_rule,
 )
+from ehfnet.training.flow_matcher import ConditionalFlowMatcher
+from ehfnet.training.inference import (
+    DEFAULT_FUSION_WEIGHTS,
+    calibrate_linear_fusion_weights,
+    compute_center_guidance_scores,
+    predict_center_proposal_logits,
+    select_diverse_center_indices,
+    summarize_blind_candidate_records,
+)
+from ehfnet.training.losses import FlowMatchingLoss
+from ehfnet.training.normalization import compute_train_split_normalization_stats
 from ehfnet.training.rerank_losses import pairwise_ranking_loss_from_pairs
-
+from ehfnet.training.validation import compute_validation_loss, evaluate_topn_success
 
 logger = logging.getLogger(__name__)
-
-
-DEFAULT_FUSION_WEIGHTS: dict[str, float] = {
-    "pose_weight": 1.0,
-    "center_weight": 0.35,
-    "aff_weight": 0.0,
-    "clash_weight": 0.0,
-    "bias": 0.0,
-}
-
-
-def compute_pose_quality_target(current_pos: torch.Tensor, target_pos: torch.Tensor, batch_idx: torch.Tensor) -> torch.Tensor:
-    sq_diff = ((current_pos - target_pos) ** 2).sum(dim=-1)
-    rmsd = torch.sqrt(scatter_mean(sq_diff, batch_idx, dim=0) + 1e-8)
-    return torch.sigmoid((4.0 - rmsd) / 0.75).unsqueeze(-1)
-
-
-def select_pose_ranking_logit(predictions: dict[str, torch.Tensor]) -> torch.Tensor:
-    rank_logit = predictions.get("pose_rank_score")
-    if rank_logit is not None:
-        return rank_logit
-
-    pose_quality = predictions.get("pose_quality")
-    if pose_quality is None:
-        raise KeyError("Predictions must contain either 'pose_rank_score' or 'pose_quality'.")
-    return pose_quality
-
-
-def apply_loss_context(
-    batch_obj: Any,
-    *,
-    current_epoch: int,
-    total_epochs_count: int,
-    warmup_epochs_count: int,
-    training: bool,
-) -> None:
-    progress = 1.0 if total_epochs_count <= 1 else current_epoch / max(1, total_epochs_count - 1)
-    warmup_end = min(1.0, warmup_epochs_count / max(1, total_epochs_count))
-    batch_obj.loss_progress = float(max(0.0, min(1.0, progress)))
-    batch_obj.loss_warmup_end = float(max(0.0, min(1.0, warmup_end)))
-    batch_obj.loss_is_training = bool(training)
-
-
-def build_local_batch_from_centers(
-    batch_obj: Any,
-    *,
-    centers: torch.Tensor,
-    crop_radius: float,
-    graph_builder: Any,
-    collator: GraphCollator,
-) -> Any:
-    if centers.ndim != 2 or centers.size(1) != 3:
-        raise ValueError("centers must have shape [B, 3].")
-
-    samples = batch_obj.to_data_list() if hasattr(batch_obj, "to_data_list") else [batch_obj]
-    if len(samples) != int(centers.size(0)):
-        raise ValueError(
-            f"Mismatch between samples ({len(samples)}) and centers ({int(centers.size(0))})."
-        )
-
-    cropped_samples = [
-        crop_graph_to_center(
-            sample,
-            center=centers[i].detach().cpu(),
-            radius=crop_radius,
-            graph_builder=graph_builder,
-        )
-        for i, sample in enumerate(samples)
-    ]
-    return collator.collate(cropped_samples)
-
-
-def compute_center_proposal_target(
-    residue_pos: torch.Tensor,
-    residue_batch: torch.Tensor,
-    ligand_centers: torch.Tensor,
-    *,
-    positive_radius: float = 4.0,
-    soft_sigma: float = 3.0,
-) -> torch.Tensor:
-    center_ref = ligand_centers[residue_batch]
-    dist = torch.norm(residue_pos - center_ref, dim=-1)
-    soft_target = torch.exp(-0.5 * (dist / soft_sigma) ** 2)
-    soft_target = torch.where(dist <= positive_radius, torch.ones_like(soft_target), soft_target)
-    return soft_target.unsqueeze(-1)
-
-
-def compute_residue_proposal_priors(
-    residue_pos: torch.Tensor,
-    residue_batch: torch.Tensor,
-    *,
-    knn: int = 16,
-) -> torch.Tensor:
-    priors = residue_pos.new_zeros((residue_pos.size(0), 4))
-    if residue_pos.numel() == 0:
-        return priors
-
-    num_graphs = int(residue_batch.max().item()) + 1 if residue_batch.numel() > 0 else 0
-    for graph_idx in range(num_graphs):
-        mask = residue_batch == graph_idx
-        pos = residue_pos[mask]
-        if pos.size(0) == 0:
-            continue
-        if pos.size(0) == 1:
-            priors[mask] = torch.tensor([0.0, 1.0, 0.0, 0.0], device=residue_pos.device, dtype=residue_pos.dtype)
-            continue
-
-        dist = torch.cdist(pos, pos)
-        dist.fill_diagonal_(float("inf"))
-        k = min(knn, max(1, pos.size(0) - 1))
-        knn_dist = torch.topk(dist, k=k, largest=False, dim=-1).values
-        mean_knn = knn_dist.mean(dim=-1)
-
-        protein_center = pos.mean(dim=0, keepdim=True)
-        radial = torch.norm(pos - protein_center, dim=-1)
-        radial_norm = radial / radial.max().clamp_min(1e-6)
-        depth = 1.0 - radial_norm
-
-        density = torch.exp(-mean_knn / 4.0)
-        exposure = torch.sigmoid((mean_knn - mean_knn.mean()) / mean_knn.std(unbiased=False).clamp_min(1e-6))
-        cavity = density * depth * (1.0 - exposure)
-
-        priors[mask] = torch.stack([density, exposure, depth, cavity], dim=-1)
-
-    return priors.clamp(0.0, 1.0)
-
-
-def predict_center_proposal_logits(
-    model: torch.nn.Module,
-    batch_obj: Any,
-    *,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    base_model = resolve_ehfnet_model(model)
-    residue_store = batch_obj["protein_residue"]
-    lig_store = batch_obj["ligand_molecule"]
-    residue_batch = getattr(
-        residue_store,
-        "batch",
-        torch.zeros(residue_store.pos.size(0), dtype=torch.long),
-    )
-    esm_missing_mask = getattr(residue_store, "esm_missing_mask", None)
-    residue_prior_feat = compute_residue_proposal_priors(
-        residue_store.pos.to(device),
-        residue_batch.to(device),
-    )
-    logits = base_model.predict_center_logits(
-        residue_x_cat=residue_store.x_cat.to(device),
-        residue_x_cont=residue_store.x_cont.to(device),
-        residue_pos=residue_store.pos.to(device),
-        residue_batch=residue_batch.to(device),
-        lig_mol_x_cont=lig_store.x_cont.to(device),
-        residue_esm_missing_mask=esm_missing_mask.to(device) if esm_missing_mask is not None else None,
-        residue_prior_feat=residue_prior_feat,
-    )
-    return logits, residue_store.pos.to(device), residue_batch.to(device), residue_prior_feat
-
-
-def resolve_ehfnet_model(model: torch.nn.Module) -> EHFNet:
-    base_model = getattr(model, "module", model)
-    if not isinstance(base_model, EHFNet):
-        raise TypeError(f"Expected EHFNet-compatible model, got {type(base_model)!r}")
-    return base_model
-
-
-def _normalization_cache_path(
-    *,
-    split_cache_file: str,
-    processed_dir: str,
-    train_indices: list[int],
-) -> Path:
-    digest_src = ",".join(str(int(i)) for i in sorted(train_indices))
-    digest = hashlib.sha1(digest_src.encode("utf-8")).hexdigest()[:12]
-    processed_tag = Path(processed_dir).name
-    split_path = Path(split_cache_file)
-    return split_path.with_name(
-        f"{split_path.stem}_{processed_tag}_{digest}_train_norm.pt"
-    )
-
-
-def _empty_feature_stat(dim: int) -> dict[str, torch.Tensor]:
-    return {
-        "sum": torch.zeros(dim, dtype=torch.float64),
-        "sum_sq": torch.zeros(dim, dtype=torch.float64),
-        "count": torch.zeros(dim, dtype=torch.float64),
-    }
-
-
-def _accumulate_feature_block(
-    stat: dict[str, torch.Tensor],
-    x: torch.Tensor,
-    *,
-    missing_mask: torch.Tensor | None = None,
-    masked_feature_start: int | None = None,
-) -> None:
-    if x.numel() == 0:
-        return
-
-    x_cpu = x.detach().to(dtype=torch.float64, device="cpu")
-    if stat["sum"].numel() != x_cpu.size(1):
-        raise ValueError(
-            f"Feature dimension mismatch while accumulating stats: expected {stat['sum'].numel()}, got {x_cpu.size(1)}."
-        )
-
-    if (
-        missing_mask is not None
-        and masked_feature_start is not None
-        and 0 < int(masked_feature_start) < x_cpu.size(1)
-    ):
-        mask_cpu = missing_mask.detach().to(device="cpu", dtype=torch.bool)
-        split = int(masked_feature_start)
-        torsion = x_cpu[:, :split]
-        esm = x_cpu[:, split:]
-
-        stat["sum"][:split] += torsion.sum(dim=0)
-        stat["sum_sq"][:split] += torsion.pow(2).sum(dim=0)
-        stat["count"][:split] += float(x_cpu.size(0))
-
-        valid_mask = ~mask_cpu
-        if bool(valid_mask.any()):
-            valid_esm = esm[valid_mask]
-            stat["sum"][split:] += valid_esm.sum(dim=0)
-            stat["sum_sq"][split:] += valid_esm.pow(2).sum(dim=0)
-            stat["count"][split:] += float(valid_esm.size(0))
-        return
-
-    stat["sum"] += x_cpu.sum(dim=0)
-    stat["sum_sq"] += x_cpu.pow(2).sum(dim=0)
-    stat["count"] += float(x_cpu.size(0))
-
-
-def _finalize_feature_stats(
-    stat: dict[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
-    count = stat["count"].clamp_min(1.0)
-    mean = stat["sum"] / count
-    mean_sq = stat["sum_sq"] / count
-    var = (mean_sq - mean.pow(2)).clamp(min=1e-6)
-
-    zero_mask = stat["count"] <= 0
-    if bool(zero_mask.any()):
-        mean[zero_mask] = 0.0
-        var[zero_mask] = 1.0
-
-    return {
-        "mean": mean.to(dtype=torch.float32),
-        "std": torch.sqrt(var).to(dtype=torch.float32),
-    }
-
-
-def _compute_train_split_normalization_stats(
-    dataset: ProteinLigandDataset,
-    train_indices: list[int],
-    *,
-    split_cache_file: str,
-) -> tuple[dict[str, dict[str, torch.Tensor]], dict[str, float]]:
-    cache_path = _normalization_cache_path(
-        split_cache_file=split_cache_file,
-        processed_dir=dataset.processed_dir,
-        train_indices=train_indices,
-    )
-    cache_meta = {
-        "processed_dir": os.path.abspath(dataset.processed_dir),
-        "index_file": os.path.abspath(dataset.index_file),
-        "train_size": int(len(train_indices)),
-    }
-
-    if cache_path.exists():
-        cached = torch.load(cache_path, map_location="cpu", weights_only=False)
-        if isinstance(cached, dict) and cached.get("metadata") == cache_meta:
-            cached_stats = cached.get("stats")
-            cached_affinity = cached.get("affinity")
-            if isinstance(cached_stats, dict) and isinstance(cached_affinity, dict):
-                logger.info("Loaded train-only normalization stats from %s", cache_path)
-                return cast(dict[str, dict[str, torch.Tensor]], cached_stats), cast(dict[str, float], cached_affinity)
-
-    sample_dim = cast(HeteroData, torch.load(
-        os.path.join(dataset.processed_dir, f"data_{dataset._valid_pdb_ids[train_indices[0]]}.pt"),
-        map_location="cpu",
-        weights_only=False,
-    ))
-    feature_stats: dict[str, dict[str, torch.Tensor]] = {
-        "ligand_atom": _empty_feature_stat(int(sample_dim["ligand_atom"].x_cont.size(1))),
-        "protein_atom": _empty_feature_stat(int(sample_dim["protein_atom"].x_cont.size(1))),
-        "ligand_molecule": _empty_feature_stat(int(sample_dim["ligand_molecule"].x_cont.size(1))),
-    }
-
-    for dataset_idx in tqdm(train_indices, desc="Computing train normalization stats", leave=False):
-        pdb_id = dataset._valid_pdb_ids[int(dataset_idx)]
-        file_path = os.path.join(dataset.processed_dir, f"data_{pdb_id}.pt")
-        data = cast(HeteroData, torch.load(file_path, map_location="cpu", weights_only=False))
-
-        _accumulate_feature_block(feature_stats["ligand_atom"], data["ligand_atom"].x_cont)
-        _accumulate_feature_block(feature_stats["protein_atom"], data["protein_atom"].x_cont)
-        _accumulate_feature_block(feature_stats["ligand_molecule"], data["ligand_molecule"].x_cont)
-
-    final_stats = {
-        key: _finalize_feature_stats(stat)
-        for key, stat in feature_stats.items()
-    }
-    affinity_stats = dataset.compute_affinity_stats(train_indices)
-
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "metadata": cache_meta,
-            "stats": final_stats,
-            "affinity": affinity_stats,
-        },
-        cache_path,
-    )
-    logger.info("Saved train-only normalization stats to %s", cache_path)
-    return final_stats, affinity_stats
-
-
-def compute_proposal_loss(
-    model: torch.nn.Module,
-    batch_obj: Any,
-    *,
-    device: torch.device,
-    positive_radius: float = 4.0,
-) -> torch.Tensor:
-    residue_store = batch_obj["protein_residue"]
-    lig_store = batch_obj["ligand_molecule"]
-
-    logits, _, residue_batch, _ = predict_center_proposal_logits(
-        model,
-        batch_obj,
-        device=device,
-    )
-    ligand_centers = scatter_mean(
-        batch_obj["ligand_atom"].pos,
-        batch_obj["ligand_atom"].batch,
-        dim=0,
-        dim_size=lig_store.x_cont.size(0),
-    )
-    target = compute_center_proposal_target(
-        residue_store.pos.to(device),
-        residue_batch,
-        ligand_centers.to(device),
-        positive_radius=positive_radius,
-    )
-    weight = 1.0 + 3.0 * target
-    per_residue = F.binary_cross_entropy_with_logits(logits, target, weight=weight, reduction="none")
-    per_graph = scatter_mean(per_residue.view(-1), residue_batch, dim=0)
-    return per_graph.mean()
-
-
-def select_diverse_center_indices(
-    logits: torch.Tensor,
-    positions: torch.Tensor,
-    *,
-    topk: int,
-    min_distance: float,
-) -> torch.Tensor:
-    order = torch.argsort(logits.view(-1), descending=True)
-    selected: list[int] = []
-
-    for idx in order.tolist():
-        if len(selected) >= topk:
-            break
-        if not selected:
-            selected.append(idx)
-            continue
-        pos = positions[idx]
-        if all(torch.norm(pos - positions[j]).item() >= min_distance for j in selected):
-            selected.append(idx)
-
-    if len(selected) < min(topk, positions.size(0)):
-        for idx in order.tolist():
-            if idx not in selected:
-                selected.append(idx)
-            if len(selected) >= min(topk, positions.size(0)):
-                break
-
-    return torch.tensor(selected, dtype=torch.long, device=positions.device)
-
-
-def combine_center_pose_score(
-    center_logit: torch.Tensor,
-    pose_logit: torch.Tensor,
-    *,
-    aff_logit: torch.Tensor | None = None,
-    clash_value: torch.Tensor | None = None,
-    fusion_weights: dict[str, float] | None = None,
-) -> torch.Tensor:
-    fusion = dict(DEFAULT_FUSION_WEIGHTS)
-    if fusion_weights is not None:
-        fusion.update(fusion_weights)
-    center_score = torch.sigmoid(center_logit.view(-1))
-    pose_score = torch.sigmoid(pose_logit.view(-1))
-    result = (
-        fusion["pose_weight"] * pose_score
-        + fusion["center_weight"] * center_score
-        + fusion["bias"]
-    )
-    if aff_logit is not None and fusion.get("aff_weight", 0.0) != 0.0:
-        aff_score = torch.sigmoid(aff_logit.view(-1))
-        result = result + fusion["aff_weight"] * aff_score
-    if clash_value is not None and fusion.get("clash_weight", 0.0) != 0.0:
-        clash_penalty = torch.exp(-clash_value.view(-1) / 10.0)
-        result = result + fusion["clash_weight"] * clash_penalty
-    return result
-
-
-def select_training_crop_centers(
-    ligand_centers: torch.Tensor,
-    proposal_logits: torch.Tensor,
-    residue_pos: torch.Tensor,
-    residue_batch: torch.Tensor,
-    *,
-    progress: float,
-    positive_radius: float,
-    bucket_topk: int = 8,
-    weighted_sampling: bool = True,
-    disable_jitter: bool = False,
-    disable_hard_negative: bool = False,
-) -> tuple[torch.Tensor, list[str]]:
-    progress = float(max(0.0, min(1.0, progress)))
-    stage_weights = {
-        "gt": max(0.10, 0.50 - 0.40 * progress),
-        "jitter": max(0.15, 0.30 - 0.10 * progress),
-        "proposal_pos": 0.10 + 0.20 * progress,
-        "near_miss": 0.05 + 0.15 * progress,
-        "hard_neg": max(0.0, -0.05 + 0.30 * progress),
-    }
-    if disable_jitter:
-        stage_weights["jitter"] = 0.0
-    if disable_hard_negative:
-        stage_weights["hard_neg"] = 0.0
-    jitter_sigma = 2.0 + 6.0 * progress
-    chosen_centers: list[torch.Tensor] = []
-    chosen_modes: list[str] = []
-    num_graphs = int(ligand_centers.size(0))
-
-    def _sample_from_bucket(bucket_pos: torch.Tensor, bucket_logits: torch.Tensor) -> torch.Tensor:
-        if bucket_pos.size(0) == 1:
-            return bucket_pos[0]
-        k = min(max(1, bucket_topk), bucket_pos.size(0))
-        pool_pos = bucket_pos[:k]
-        pool_logits = bucket_logits[:k]
-        if not weighted_sampling:
-            choice_idx = torch.randint(k, (1,), device=pool_pos.device).item()
-            return pool_pos[choice_idx]
-        weight = torch.softmax(pool_logits, dim=0)
-        choice_idx = int(torch.multinomial(weight, 1).item())
-        return pool_pos[choice_idx]
-
-    for graph_idx in range(num_graphs):
-        gt_center = ligand_centers[graph_idx]
-        mask = residue_batch == graph_idx
-        graph_pos = residue_pos[mask]
-        graph_logits = proposal_logits[mask].view(-1)
-        if graph_pos.numel() == 0:
-            chosen_centers.append(gt_center)
-            chosen_modes.append("gt_fallback")
-            continue
-
-        order = torch.argsort(graph_logits, descending=True)
-        ordered_pos = graph_pos[order]
-        ordered_logits = graph_logits[order]
-        ordered_dist = torch.norm(ordered_pos - gt_center.unsqueeze(0), dim=-1)
-        positive_mask = ordered_dist <= positive_radius
-        near_mask = (ordered_dist > positive_radius) & (ordered_dist <= positive_radius * 2.0)
-        hard_mask = ordered_dist > positive_radius * 2.0
-
-        bucket_to_center: dict[str, torch.Tensor] = {
-            "gt": gt_center,
-        }
-        if not disable_jitter:
-            bucket_to_center["jitter"] = gt_center + torch.randn_like(gt_center) * jitter_sigma
-        if positive_mask.any():
-            pos_pool = ordered_pos[positive_mask]
-            pos_logits = ordered_logits[positive_mask]
-            bucket_to_center["proposal_pos"] = _sample_from_bucket(pos_pool, pos_logits)
-        if near_mask.any():
-            near_pool = ordered_pos[near_mask]
-            near_logits = ordered_logits[near_mask]
-            bucket_to_center["near_miss"] = _sample_from_bucket(near_pool, near_logits)
-        if hard_mask.any() and not disable_hard_negative:
-            hard_pool = ordered_pos[hard_mask]
-            hard_logits = ordered_logits[hard_mask]
-            bucket_to_center["hard_neg"] = _sample_from_bucket(hard_pool, hard_logits)
-
-        available_modes = list(bucket_to_center.keys())
-        weight_tensor = torch.tensor(
-            [stage_weights.get(mode, 0.0) for mode in available_modes],
-            dtype=ligand_centers.dtype,
-            device=ligand_centers.device,
-        )
-        if float(weight_tensor.sum().item()) <= 0.0:
-            chosen_mode = "gt"
-        else:
-            chosen_mode = available_modes[int(torch.multinomial(weight_tensor / weight_tensor.sum(), 1).item())]
-
-        chosen_centers.append(bucket_to_center[chosen_mode])
-        chosen_modes.append(chosen_mode)
-
-    return torch.stack(chosen_centers, dim=0), chosen_modes
-
-
-
-
-def select_wrong_center_candidates(
-    ligand_centers: torch.Tensor,
-    proposal_logits: torch.Tensor,
-    residue_pos: torch.Tensor,
-    residue_batch: torch.Tensor,
-    *,
-    positive_radius: float,
-    bucket_topk: int = 8,
-    weighted_sampling: bool = True,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_graphs = int(ligand_centers.size(0))
-    wrong_centers: list[torch.Tensor] = []
-    wrong_center_scores: list[torch.Tensor] = []
-    valid_mask: list[bool] = []
-
-    def _sample_bucket(bucket_pos: torch.Tensor, bucket_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        k = min(max(1, bucket_topk), bucket_pos.size(0))
-        pool_pos = bucket_pos[:k]
-        pool_logits = bucket_logits[:k]
-        if pool_pos.size(0) == 1:
-            return pool_pos[0], pool_logits[0]
-        if not weighted_sampling:
-            idx = int(torch.randint(pool_pos.size(0), (1,), device=pool_pos.device).item())
-            return pool_pos[idx], pool_logits[idx]
-        prob = torch.softmax(pool_logits, dim=0)
-        idx = int(torch.multinomial(prob, 1).item())
-        return pool_pos[idx], pool_logits[idx]
-
-    for graph_idx in range(num_graphs):
-        gt_center = ligand_centers[graph_idx]
-        mask = residue_batch == graph_idx
-        graph_pos = residue_pos[mask]
-        graph_logits = proposal_logits[mask].view(-1)
-        if graph_pos.numel() == 0:
-            wrong_centers.append(gt_center)
-            wrong_center_scores.append(gt_center.new_zeros(()))
-            valid_mask.append(False)
-            continue
-        order = torch.argsort(graph_logits, descending=True)
-        ordered_pos = graph_pos[order]
-        ordered_logits = graph_logits[order]
-        dist = torch.norm(ordered_pos - gt_center.unsqueeze(0), dim=-1)
-        near_mask = (dist > positive_radius) & (dist <= positive_radius * 2.0)
-        hard_mask = dist > positive_radius * 2.0
-        if near_mask.any():
-            center, score = _sample_bucket(ordered_pos[near_mask], ordered_logits[near_mask])
-            valid = True
-        elif hard_mask.any():
-            center, score = _sample_bucket(ordered_pos[hard_mask], ordered_logits[hard_mask])
-            valid = True
-        else:
-            center, score = gt_center, gt_center.new_zeros(())
-            valid = False
-        wrong_centers.append(center)
-        wrong_center_scores.append(score)
-        valid_mask.append(valid)
-
-    return (
-        torch.stack(wrong_centers, dim=0),
-        torch.stack([score.view(1) for score in wrong_center_scores], dim=0).view(-1),
-        torch.as_tensor(valid_mask, dtype=torch.bool, device=ligand_centers.device),
-    )
-
-
-def sample_hard_ranking_time_and_centers(
-    t_anchor: torch.Tensor,
-    crop_centers: torch.Tensor,
-    wrong_centers: torch.Tensor,
-    wrong_center_valid_mask: torch.Tensor,
-    *,
-    progress: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Sample hard ranking variants.
-
-    Returns:
-      t_hard: time steps for hard samples
-      hard_centers: candidate centers
-      strategy_id: 0 same-center-bad-pose, 1 wrong-center
-    """
-    B = t_anchor.size(0)
-    device = t_anchor.device
-
-    strategy = torch.rand(B, device=device)
-    t_hard = t_anchor.clone()
-    hard_centers = crop_centers.clone()
-    strategy_id = torch.zeros(B, device=device, dtype=torch.long)
-
-    mask_worse_time = strategy < 0.45
-    if mask_worse_time.any():
-        n = int(mask_worse_time.sum().item())
-        scale = 0.25 + 0.45 * torch.rand(n, device=device)
-        t_hard[mask_worse_time] = t_anchor[mask_worse_time] * scale
-
-    mask_offset = (~mask_worse_time) & wrong_center_valid_mask.to(device=device)
-    if mask_offset.any():
-        hard_centers[mask_offset] = wrong_centers[mask_offset]
-        strategy_id[mask_offset] = 1
-        scale = 0.65 + 0.25 * torch.rand(int(mask_offset.sum().item()), device=device)
-        t_hard[mask_offset] = torch.clamp(t_anchor[mask_offset] * scale, max=0.85)
-
-    sigma = 1e-3
-    t_hard = t_hard.clamp(min=sigma, max=1.0 - sigma)
-    return t_hard, hard_centers, strategy_id
-
-
-def summarize_blind_candidate_records(
-    candidate_records: list[dict[str, Any]],
-    *,
-    topk_values: tuple[int, ...],
-    fusion_weights: dict[str, float] | None = None,
-) -> dict[str, float]:
-    if not candidate_records:
-        return {"topn_total_graphs": 0.0}
-
-    topk_unique = tuple(sorted({int(k) for k in topk_values if int(k) > 0}))
-    metrics: dict[str, float] = {
-        "topn_total_graphs": float(len(candidate_records)),
-    }
-    center_recall_hits = {1: 0.0, 3: 0.0, 8: 0.0, 16: 0.0}
-    oracle_top1_rmsd: list[float] = []
-    oracle_top5_rmsd: list[float] = []
-    reranked_top1_rmsd: list[float] = []
-    reranked_top5_rmsd: list[float] = []
-    reranked_topk_rmsd: dict[int, list[float]] = {k: [] for k in topk_unique}
-    proposal_failures = 0.0
-    local_failures = 0.0
-    ranking_failures = 0.0
-    successes = 0.0
-
-    for record in candidate_records:
-        center_hits = list(record.get("center_hits", []))
-        candidates = list(record.get("candidates", []))
-        if not candidates:
-            proposal_failures += 1.0
-            continue
-
-        for k in center_recall_hits:
-            if any(center_hits[: min(k, len(center_hits))]):
-                center_recall_hits[k] += 1.0
-
-        oracle_all = min(float(item["rmsd"]) for item in candidates)
-        oracle_first5_pool = [float(item["rmsd"]) for item in candidates if int(item.get("proposal_rank", 999)) <= 5]
-        if not oracle_first5_pool:
-            oracle_first5_pool = [float(item["rmsd"]) for item in candidates]
-        oracle_top1_rmsd.append(oracle_all)
-        oracle_top5_rmsd.append(min(oracle_first5_pool))
-
-        reranked = sorted(
-            candidates,
-            key=lambda item: float(
-                combine_center_pose_score(
-                    torch.tensor([item["center_logit"]], dtype=torch.float32),
-                    torch.tensor([item.get("ranking_logit", item["pose_logit"])], dtype=torch.float32),
-                    aff_logit=torch.tensor([item.get("aff_logit", 0.0)], dtype=torch.float32),
-                    clash_value=torch.tensor([item.get("clash_value", 0.0)], dtype=torch.float32),
-                    fusion_weights=fusion_weights,
-                )[0].item()
-            ),
-            reverse=True,
-        )
-        reranked_top1 = float(reranked[0]["rmsd"])
-        reranked_top5 = min(float(item["rmsd"]) for item in reranked[: min(5, len(reranked))])
-        reranked_top1_rmsd.append(reranked_top1)
-        reranked_top5_rmsd.append(reranked_top5)
-        for k in topk_unique:
-            reranked_topk_rmsd[k].append(min(float(item["rmsd"]) for item in reranked[: min(k, len(reranked))]))
-
-        has_center_hit = any(center_hits)
-        if not has_center_hit:
-            proposal_failures += 1.0
-        elif oracle_all >= 2.0:
-            local_failures += 1.0
-        elif reranked_top1 >= 2.0:
-            ranking_failures += 1.0
-        else:
-            successes += 1.0
-
-    total = max(1.0, float(len(candidate_records)))
-    for k, hit_count in center_recall_hits.items():
-        metrics[f"center_recall@{k}"] = (hit_count / total) * 100.0
-
-    def _mean(values: list[float]) -> float:
-        return float(sum(values) / max(1, len(values)))
-
-    def _success(values: list[float], threshold: float) -> float:
-        return 100.0 * float(sum(v < threshold for v in values)) / max(1, len(values))
-
-    metrics["oracle_top1_success_2a"] = _success(oracle_top1_rmsd, 2.0)
-    metrics["oracle_top1_success_5a"] = _success(oracle_top1_rmsd, 5.0)
-    metrics["oracle_top5_success_2a"] = _success(oracle_top5_rmsd, 2.0)
-    metrics["oracle_top5_success_5a"] = _success(oracle_top5_rmsd, 5.0)
-    metrics["oracle_top1_mean_best_rmsd"] = _mean(oracle_top1_rmsd)
-    metrics["oracle_top5_mean_best_rmsd"] = _mean(oracle_top5_rmsd)
-    metrics["reranked_top1_success_2a"] = _success(reranked_top1_rmsd, 2.0)
-    metrics["reranked_top1_success_5a"] = _success(reranked_top1_rmsd, 5.0)
-    metrics["reranked_top5_success_2a"] = _success(reranked_top5_rmsd, 2.0)
-    metrics["reranked_top5_success_5a"] = _success(reranked_top5_rmsd, 5.0)
-    metrics["reranked_top1_mean_best_rmsd"] = _mean(reranked_top1_rmsd)
-    metrics["reranked_top5_mean_best_rmsd"] = _mean(reranked_top5_rmsd)
-    metrics["proposal_gap"] = (proposal_failures / total) * 100.0
-    metrics["local_gap"] = (local_failures / total) * 100.0
-    metrics["ranking_gap"] = (ranking_failures / total) * 100.0
-    metrics["pipeline_success"] = (successes / total) * 100.0
-
-    for k in topk_unique:
-        source = reranked_topk_rmsd[k]
-        metrics[f"top{k}_success_2a"] = _success(source, 2.0)
-        metrics[f"top{k}_success_5a"] = _success(source, 5.0)
-        metrics[f"top{k}_mean_best_rmsd"] = _mean(source)
-
-    return metrics
-
-
-def calibrate_linear_fusion_weights(
-    candidate_records: list[dict[str, Any]],
-    *,
-    topk_values: tuple[int, ...],
-    search_center_weights: tuple[float, ...] = (0.0, 0.15, 0.25, 0.35, 0.5, 0.65),
-    search_aff_weights: tuple[float, ...] = (0.0,),
-    search_clash_weights: tuple[float, ...] = (0.0,),
-) -> dict[str, float]:
-    best_weights = dict(DEFAULT_FUSION_WEIGHTS)
-    best_metrics = summarize_blind_candidate_records(
-        candidate_records,
-        topk_values=topk_values,
-        fusion_weights=best_weights,
-    )
-
-    def _is_better(trial: dict, ref: dict) -> bool:
-        t1 = trial.get("reranked_top1_success_2a", 0.0)
-        r1 = ref.get("reranked_top1_success_2a", 0.0)
-        if t1 > r1 + 1e-6:
-            return True
-        if t1 < r1 - 1e-6:
-            return False
-        t5 = trial.get("reranked_top5_success_2a", 0.0)
-        r5 = ref.get("reranked_top5_success_2a", 0.0)
-        if t5 > r5 + 1e-6:
-            return True
-        if t5 < r5 - 1e-6:
-            return False
-        return trial.get("reranked_top1_mean_best_rmsd", float("inf")) < ref.get("reranked_top1_mean_best_rmsd", float("inf")) - 1e-6
-
-    for cw in search_center_weights:
-        for aw in search_aff_weights:
-            for clw in search_clash_weights:
-                trial_weights = {
-                    "pose_weight": 1.0,
-                    "center_weight": float(cw),
-                    "aff_weight": float(aw),
-                    "clash_weight": float(clw),
-                    "bias": 0.0,
-                }
-                trial_metrics = summarize_blind_candidate_records(
-                    candidate_records,
-                    topk_values=topk_values,
-                    fusion_weights=trial_weights,
-                )
-                if _is_better(trial_metrics, best_metrics):
-                    best_weights = trial_weights
-                    best_metrics = trial_metrics
-
-    return best_weights
-
-
-def should_run_bootstrap(
-    *,
-    epoch: int,
-    batch_idx: int,
-    total_epochs: int,
-    frequency: int,
-    start_ratio: float,
-) -> bool:
-    if frequency <= 0:
-        return False
-    progress = 1.0 if total_epochs <= 1 else epoch / max(1, total_epochs - 1)
-    return progress >= start_ratio and batch_idx % frequency == 0
-
-
-def select_bootstrap_blind_centers(
-    ligand_centers: torch.Tensor,
-    proposal_logits: torch.Tensor,
-    residue_pos: torch.Tensor,
-    residue_batch: torch.Tensor,
-    *,
-    positive_radius: float,
-    bucket_topk: int = 8,
-) -> torch.Tensor:
-    wrong_centers, _, wrong_valid_mask = select_wrong_center_candidates(
-        ligand_centers,
-        proposal_logits,
-        residue_pos,
-        residue_batch,
-        positive_radius=positive_radius,
-        bucket_topk=bucket_topk,
-        weighted_sampling=True,
-    )
-    bootstrap_centers = ligand_centers.clone()
-    if wrong_valid_mask.any():
-        mix_mask = (torch.rand_like(wrong_valid_mask.float()) < 0.7) & wrong_valid_mask
-        bootstrap_centers[mix_mask] = wrong_centers[mix_mask]
-    return bootstrap_centers
-
-
-def compute_bootstrap_pose_quality_loss(
-    *,
-    student_model: torch.nn.Module,
-    teacher_model: torch.nn.Module,
-    matcher: ConditionalFlowMatcher,
-    source_batch: Any,
-    placement_centers: torch.Tensor,
-    epoch: int,
-    ode_steps: int,
-    graph_builder: Any,
-    collator: GraphCollator,
-    crop_radius: float,
-) -> torch.Tensor:
-    blind_local_batch = build_local_batch_from_centers(
-        source_batch,
-        centers=placement_centers.detach().cpu(),
-        crop_radius=crop_radius,
-        graph_builder=graph_builder,
-        collator=collator,
-    )
-    device = next(student_model.parameters()).device
-    blind_local_batch = blind_local_batch.to(device)
-    x_ref = blind_local_batch["ligand_atom"].pos
-    lig_batch = blind_local_batch["ligand_atom"].batch
-    masses = blind_local_batch["ligand_atom"].masses
-    B = int(lig_batch.max().item()) + 1
-    with torch.no_grad():
-        teacher_batch = blind_local_batch.clone()
-        x0 = matcher._generate_random_pose(
-            x_ref=x_ref,
-            batch=lig_batch,
-            B=B,
-            masses=masses,
-            torsion_indices=getattr(teacher_batch, "torsion_indices", None),
-            torsion_moving_mask=getattr(teacher_batch, "torsion_moving_mask", None),
-            seed_pos=teacher_batch["ligand_atom"].get("start_pos", None),
-            protein_pos=teacher_batch["protein_atom"].pos,
-            protein_batch=getattr(teacher_batch["protein_atom"], "batch", None),
-            placement_centers=placement_centers,
-            epoch=epoch,
-        )
-        teacher_batch["ligand_atom"].pos = x0
-        final_pos, _ = matcher.ode_solve(
-            model=teacher_model,
-            data=teacher_batch,
-            steps=ode_steps,
-            method="euler",
-            store_trajectory=False,
-        )
-        teacher_target = compute_pose_quality_target(final_pos, x_ref, lig_batch)
-
-    student_batch = blind_local_batch.clone()
-    student_batch["ligand_atom"].pos = final_pos.detach()
-    student_batch.t = torch.ones(B, device=x_ref.device, dtype=x_ref.dtype)
-    student_pred = student_model(student_batch, student_batch.t)
-    pred_pose_quality = student_pred["pose_quality"].view(-1)
-    target_pose_quality = teacher_target.view(-1).to(device=pred_pose_quality.device, dtype=pred_pose_quality.dtype)
-    weight = 1.0 + 2.0 * target_pose_quality
-    return F.binary_cross_entropy_with_logits(pred_pose_quality, target_pose_quality, weight=weight)
 
 
 def train(
     *,
     data_root: str,
     index_file: str,
-    save_dir: str = "./checkpoints",
+    save_dir: str,
+    esm: str,
+    epochs: int,
+    lr: float,
+    weight_decay: float,
+    clip_grad: float,
+    hidden_dim: int,
+    num_gnn_blocks: int,
+    m_dim_scalar: int,
+    dropout_rate: float,
+    lig_atom_cont_count: int,
+    lig_mol_cont_count: int,
+    pro_atom_cont_count: int,
+    pro_res_cont_count: int,
+    esm_dim: int,
+    esm_model_name: str,
+    num_rbf: int,
+    r_cutoff: float,
+    force_cutoff: float,
+    frame_refine_threshold: float,
+    frame_refine_temperature: float,
+    energy_guide_threshold: float,
+    energy_guide_temperature: float,
+    clash_threshold: float,
+    clash_push_threshold: float,
+    clash_push_force: float,
+    score_clamp_min: float,
+    score_clamp_max: float,
+    force_limit: float,
+    prediction_max_neighbors: int,
+    prediction_min_max_neighbors: int,
+    prediction_knn_fallback_k: int,
+    r_cutoff_intra: float,
+    max_neighbors_intra: int,
+    atom_neighbor_cap: int,
+    residue_neighbor_cap: int,
+    residue_radius_scale: float,
+    residue_radius_bias: float,
+    ligand_atom_fallback_k: int,
+    protein_atom_fallback_k: int,
+    protein_residue_fallback_k: int,
+    dynamic_inter_cutoff: float,
+    dynamic_inter_knn_k: int,
+    dynamic_residue_cutoff: float,
+    dynamic_residue_knn_k: int,
+    flow_sigma_min: float,
+    flow_spatial_sigma_min: float,
+    flow_spatial_sigma_max: float,
+    flow_fd_dt: float,
+    flow_rotation_angle_min: float,
+    flow_rotation_angle_max: float,
+    flow_torsion_scale_min: float,
+    flow_torsion_scale_max: float,
+    loss_characteristic_scale: float,
+    loss_weight_trans: float,
+    loss_weight_rot: float,
+    loss_weight_torsion: float,
+    loss_weight_energy: float,
+    loss_weight_clash: float,
+    loss_weight_pose_quality: float,
+    loss_coarse_trans: float,
+    loss_coarse_rot: float,
+    loss_coarse_torsion: float,
+    loss_coarse_energy: float,
+    loss_coarse_clash: float,
+    loss_coarse_pose_quality: float,
+    loss_transition_trans: float,
+    loss_transition_rot: float,
+    loss_transition_torsion: float,
+    loss_transition_energy: float,
+    loss_transition_clash: float,
+    loss_transition_pose_quality: float,
+    loss_refine_trans: float,
+    loss_refine_rot: float,
+    loss_refine_torsion: float,
+    loss_refine_energy: float,
+    loss_refine_clash: float,
+    loss_refine_pose_quality: float,
+    loss_refine_start: float,
+    loss_pose_gate_epoch_start: float,
+    loss_pose_gate_epoch_end: float,
+    loss_pose_gate_tau_start: float,
+    loss_pose_gate_tau_end: float,
+    loss_pose_gate_temperature: float,
+    device: str | torch.device,
+    crop_radius: float,
+    warmup_epochs: int,
+    rmsd_check_ratio: float,
+    accumulation_steps: int,
+    max_nodes_per_batch: int,
+    val_max_nodes_per_batch: int,
+    test_max_nodes_per_batch: int,
+    topn_max_nodes_per_batch: int,
+    edge_budget_factor: int,
+    eval_edge_guard_headroom: float,
+    ema_decay: float,
+    dataloader_num_workers: int,
+    dataloader_pin_memory: bool,
+    dataloader_persistent_workers: bool,
+    split_train_frac: float,
+    split_val_frac: float,
+    split_test_frac: float,
+    split_seed: int,
+    split_cache_file: str,
+    force_resplit: bool,
+    ablation_mode: str,
+    run_test_after_training: bool,
+    test_topk_values: tuple[int, ...],
+    test_pose_samples: int,
+    enable_oom_adaptive_batch: bool,
+    oom_reduce_threshold: int,
+    oom_reduce_factor: float,
+    min_max_nodes_per_batch: int,
+    enable_val_oom_adaptive_batch: bool,
+    val_oom_reduce_threshold: int,
+    val_oom_reduce_factor: float,
+    min_val_max_nodes_per_batch: int,
+    oom_recover_epochs: int,
+    oom_recover_factor: float,
+    center_proposal_weight: float,
+    center_positive_radius: float,
+    center_proposal_topk: int,
+    center_refine_topk: int,
+    center_nms_radius: float,
+    stage1_pose_samples: int,
+    stage2_pose_samples: int,
+    crop_candidate_topk: int,
+    crop_min_residues: int,
+    crop_atom_margin: float,
+    disable_jitter_crop: bool,
+    disable_hard_negative_crop: bool,
+    pose_ranking_pair_weight: float,
+    pose_ranking_margin: float,
+    pose_bootstrap_weight: float,
+    pose_bootstrap_frequency: int,
+    pose_bootstrap_ode_steps: int,
+    enable_fusion_calibration: bool,
+    val_ode_steps: int,
+    checkpoint_selection_mode: str,
+    fusion_search_center_weights: tuple[float, ...],
+    fusion_search_aff_weights: tuple[float, ...],
+    fusion_search_clash_weights: tuple[float, ...],
+    blind_pool_refresh_every: int,
+    blind_pool_start_epoch: int,
+    blind_pool_max_complexes: int,
+    blind_pool_cache_bce_weight: float,
+    blind_pool_cache_rank_weight: float,
+    blind_pool_pairs_per_complex: int,
     esm_path: str | None = None,
-    epochs: int = 100,
-
-    lr: float = 1e-4,
-    weight_decay: float = 1e-6,
-    clip_grad: float = 10.0,
-    hidden_dim: int = 128,
-    num_gnn_blocks: int = 6,
-    lig_atom_cont_count: int = len(LIGAND_ATOM_CONT_SCHEMA),
-    lig_mol_cont_count: int = len(LIGAND_MOLECULE_CONT_SCHEMA),
-    pro_atom_cont_count: int = len(PROTEIN_ATOM_CONT_SCHEMA),
-    pro_res_cont_count: int = len(PROTEIN_RESIDUE_CONT_SCHEMA) + 960,
-    esm_dim: int = 960,
-    num_rbf: int = 50,
-    r_cutoff: float = 10.0,
-    force_cutoff: float = 6.0,
-    dynamic_inter_cutoff: float = 10.0,
-    dynamic_inter_knn_k: int = 8,
-    dynamic_residue_cutoff: float = 14.0,
-    dynamic_residue_knn_k: int = 6,
-    device: str | torch.device = "auto",
-    crop_radius: float = 10.0,
-    normalization_stats: dict | None = None,
-    warmup_epochs: int = 20,
-    rmsd_check_ratio: float = 0.2,
-    accumulation_steps: int = 1,
-    max_nodes_per_batch: int = 10000,
-    val_max_nodes_per_batch: int | None = None,
-    test_max_nodes_per_batch: int | None = None,
-    topn_max_nodes_per_batch: int | None = None,
-    ema_decay: float = 0.999,
-    dataloader_num_workers: int = 4,
-    dataloader_pin_memory: bool = True,
-    dataloader_persistent_workers: bool = True,
-    split_train_frac: float = 0.7,
-    split_val_frac: float = 0.1,
-    split_test_frac: float = 0.2,
-    split_seed: int = 42,
-    split_cache_file: str | None = None,
-    force_resplit: bool = False,
-    ablation_mode: str = "none",
-    run_test_after_training: bool = True,
-    test_topk_values: tuple[int, ...] = (1, 5, 10),
-    test_pose_samples: int = 10,
-    enable_oom_adaptive_batch: bool = True,
-    oom_reduce_threshold: int = 3,
-    oom_reduce_factor: float = 0.85,
-    min_max_nodes_per_batch: int = 12000,
-    enable_val_oom_adaptive_batch: bool = True,
-    val_oom_reduce_threshold: int = 3,
-    val_oom_reduce_factor: float = 0.85,
-    min_val_max_nodes_per_batch: int | None = None,
-    oom_recover_epochs: int = 3,
-    oom_recover_factor: float = 1.1,
-    center_proposal_weight: float = 0.15,
-    center_positive_radius: float = 4.0,
-    center_proposal_topk: int = 8,
-    center_refine_topk: int = 3,
-    center_nms_radius: float = 6.0,
-    stage1_pose_samples: int = 2,
-    stage2_pose_samples: int = 4,
-    crop_candidate_topk: int = 8,
-    disable_jitter_crop: bool = False,
-    disable_hard_negative_crop: bool = False,
-    pose_ranking_pair_weight: float = 0.2,
-    pose_ranking_margin: float = 0.5,
-    pose_bootstrap_weight: float = 0.05,
-    pose_bootstrap_frequency: int = 25,
-    pose_bootstrap_ode_steps: int = 10,
-    enable_fusion_calibration: bool = True,
-    val_ode_steps: int = 50,
-    checkpoint_selection_mode: str = "composite",
-    fusion_search_center_weights: tuple[float, ...] = (0.0, 0.15, 0.25, 0.35, 0.5, 0.65),
-    fusion_search_aff_weights: tuple[float, ...] = (0.0,),
-    fusion_search_clash_weights: tuple[float, ...] = (0.0,),
-    blind_pool_refresh_every: int = 5,
-    blind_pool_start_epoch: int = 10,
-    blind_pool_max_complexes: int = 500,
-    blind_pool_cache_bce_weight: float = 0.5,
-    blind_pool_cache_rank_weight: float = 1.0,
-    blind_pool_pairs_per_complex: int = 4,
     run_name: str | None = None,
     run_log_file: str | None = None,
 ):
@@ -1022,66 +242,175 @@ def train(
     训练 EHFNet 模型
 
     Args:
-        data_root: 蛋白-配体数据集根目录（含 cleaned/ 与 index.csv）
-        index_file: 索引 CSV 文件路径
-        save_dir: 模型保存目录
-        esm_path: 预计算的 ESM 嵌入路径
-        epochs: 训练轮数
+        data_root: 数据集根目录。
+        index_file: 数据索引文件路径。
+        save_dir: 训练产物保存目录。
+        esm: ESM 处理模式或缓存策略。
+        epochs: 训练总轮数。
+        lr: 优化器学习率。
+        weight_decay: 权重衰减系数。
+        clip_grad: 梯度裁剪阈值。
+        hidden_dim: 隐藏层维度。
+        num_gnn_blocks: 主干 GNN 块数量。
+        m_dim_scalar: 消息传递分支的标量维度。
+        dropout_rate: Dropout 比例。
+        lig_atom_cont_count: 配体原子连续特征维度。
+        lig_mol_cont_count: 配体分子连续特征维度。
+        pro_atom_cont_count: 蛋白原子连续特征维度。
+        pro_res_cont_count: 蛋白残基连续特征维度。
+        esm_dim: ESM 残基嵌入维度。
+        esm_model_name: ESM 主干模型名称。
+        num_rbf: RBF 基函数数量。
+        r_cutoff: 几何邻域构建的距离截断半径。
+        force_cutoff: 力相关分支使用的局部截断半径。
+        frame_refine_threshold: 主惯量帧细化门控阈值。
+        frame_refine_temperature: 主惯量帧细化门控温度。
+        energy_guide_threshold: 能量引导门控阈值。
+        energy_guide_temperature: 能量引导门控温度。
+        clash_threshold: 位阻判定阈值。
+        clash_push_threshold: 位阻推开分支使用的距离阈值。
+        clash_push_force: 位阻推开分支的力缩放系数。
+        score_clamp_min: 分数裁剪下界。
+        score_clamp_max: 分数裁剪上界。
+        force_limit: 力大小的软限制。
+        prediction_max_neighbors: 预测头阶段允许保留的最大邻居数。
+        prediction_min_max_neighbors: 预测头动态邻居上限的最小值。
+        prediction_knn_fallback_k: 预测头回退到 kNN 时使用的邻居数。
+        r_cutoff_intra: 图内边构建的距离截断半径。
+        max_neighbors_intra: 图内边构建时每类节点允许的最大邻居数。
+        atom_neighbor_cap: 原子层图内边的邻居上限。
+        residue_neighbor_cap: 残基层图内边的邻居上限。
+        residue_radius_scale: 残基层邻域半径相对原子半径的缩放系数。
+        residue_radius_bias: 残基层邻域半径的额外偏置。
+        ligand_atom_fallback_k: 配体原子图内边回退到 kNN 时的邻居数。
+        protein_atom_fallback_k: 蛋白原子图内边回退到 kNN 时的邻居数。
+        protein_residue_fallback_k: 蛋白残基层图内边回退到 kNN 时的邻居数。
+        dynamic_inter_cutoff: 动态跨图原子边的半径阈值。
+        dynamic_inter_knn_k: 动态跨图原子边回退到 kNN 时的邻居数。
+        dynamic_residue_cutoff: 动态配体-残基边的半径阈值。
+        dynamic_residue_knn_k: 动态配体-残基边回退到 kNN 时的邻居数。
+        flow_sigma_min: 流匹配时间噪声下界。
+        flow_spatial_sigma_min: 平移扰动课程的最小尺度。
+        flow_spatial_sigma_max: 平移扰动课程的最大尺度。
+        flow_fd_dt: 流匹配目标构造时使用的有限差分步长。
+        flow_rotation_angle_min: 课程初期允许的最大旋转角。
+        flow_rotation_angle_max: 课程后期允许的最大旋转角。
+        flow_torsion_scale_min: 课程初期的扭转扰动缩放系数。
+        flow_torsion_scale_max: 课程后期的扭转扰动缩放系数。
+        loss_characteristic_scale: 平衡平移与旋转量纲的特征长度尺度。
+        loss_weight_trans: 平移损失的全局权重。
+        loss_weight_rot: 旋转损失的全局权重。
+        loss_weight_torsion: 扭转损失的全局权重。
+        loss_weight_energy: 亲和力损失的全局权重。
+        loss_weight_clash: 位阻损失的全局权重。
+        loss_weight_pose_quality: 构象质量损失的全局权重。
+        loss_coarse_trans: 粗阶段平移损失权重。
+        loss_coarse_rot: 粗阶段旋转损失权重。
+        loss_coarse_torsion: 粗阶段扭转损失权重。
+        loss_coarse_energy: 粗阶段亲和力损失权重。
+        loss_coarse_clash: 粗阶段位阻损失权重。
+        loss_coarse_pose_quality: 粗阶段构象质量损失权重。
+        loss_transition_trans: 过渡阶段平移损失权重。
+        loss_transition_rot: 过渡阶段旋转损失权重。
+        loss_transition_torsion: 过渡阶段扭转损失权重。
+        loss_transition_energy: 过渡阶段亲和力损失权重。
+        loss_transition_clash: 过渡阶段位阻损失权重。
+        loss_transition_pose_quality: 过渡阶段构象质量损失权重。
+        loss_refine_trans: 细化阶段平移损失权重。
+        loss_refine_rot: 细化阶段旋转损失权重。
+        loss_refine_torsion: 细化阶段扭转损失权重。
+        loss_refine_energy: 细化阶段亲和力损失权重。
+        loss_refine_clash: 细化阶段位阻损失权重。
+        loss_refine_pose_quality: 细化阶段构象质量损失权重。
+        loss_refine_start: 进入细化阶段时对应的训练进度阈值。
+        loss_pose_gate_epoch_start: 构象相关损失开始打开门控的训练进度。
+        loss_pose_gate_epoch_end: 构象相关损失完全打开门控的训练进度。
+        loss_pose_gate_tau_start: 构象门控在初期使用的时间阈值。
+        loss_pose_gate_tau_end: 构象门控在后期使用的时间阈值。
+        loss_pose_gate_temperature: 构象时间门控的温度系数。
+        device: 运行所用设备，如 CPU 或 CUDA 设备。
+        crop_radius: 局部裁剪半径。
+        warmup_epochs: 课程学习预热轮数。
+        rmsd_check_ratio: 验证阶段执行 RMSD 推演的 batch 比例。
+        accumulation_steps: 梯度累积步数。
+        max_nodes_per_batch: 训练阶段每个 batch 允许的最大节点预算。
+        val_max_nodes_per_batch: 验证阶段每个 batch 允许的最大节点预算。
+        test_max_nodes_per_batch: 测试阶段每个 batch 允许的最大节点预算。
+        topn_max_nodes_per_batch: Top-N 评估阶段每个 batch 允许的最大节点预算。
+        edge_budget_factor: 按节点数估计边数预算时使用的放大系数。
+        eval_edge_guard_headroom: 评估阶段为边数保护预留的额外裕量。
+        ema_decay: EMA 模型更新的衰减系数。
+        dataloader_num_workers: DataLoader 使用的 worker 数。
+        dataloader_pin_memory: 是否为 DataLoader 启用 pin_memory。
+        dataloader_persistent_workers: 是否为 DataLoader 启用持久 worker。
+        split_train_frac: 训练集划分比例。
+        split_val_frac: 验证集划分比例。
+        split_test_frac: 测试集划分比例。
+        split_seed: 数据划分使用的随机种子。
+        split_cache_file: 数据划分缓存文件路径。
+        force_resplit: 是否忽略已有划分缓存并重新划分数据集。
+        ablation_mode: 当前训练使用的消融模式名称。
+        run_test_after_training: 训练结束后是否自动执行测试评估。
+        test_topk_values: 测试阶段统计 Top-N 成功率时使用的 N 列表。
+        test_pose_samples: 测试阶段每个复合物采样的候选构象数。
+        enable_oom_adaptive_batch: 是否启用训练阶段的 OOM 自适应降批。
+        oom_reduce_threshold: 单个 epoch 中触发自动降批所需的 OOM 次数阈值。
+        oom_reduce_factor: 触发 OOM 后缩小节点预算的比例系数。
+        min_max_nodes_per_batch: 训练阶段自动降批后的最小节点预算。
+        enable_val_oom_adaptive_batch: 是否启用验证阶段独立的 OOM 自适应降批。
+        val_oom_reduce_threshold: 验证阶段触发降批所需的 OOM 次数阈值。
+        val_oom_reduce_factor: 验证阶段缩小节点预算的比例系数。
+        min_val_max_nodes_per_batch: 验证阶段自动降批后的最小节点预算。
+        oom_recover_epochs: 连续无 OOM 后尝试恢复预算所需的 epoch 数。
+        oom_recover_factor: 预算恢复时使用的放大系数。
+        center_proposal_weight: 中心提议损失在验证汇总中的权重。
+        center_positive_radius: 中心判定为正样本时使用的距离半径。
+        center_proposal_topk: 中心提议阶段保留的 Top-K 数量。
+        center_refine_topk: 中心细化阶段阶段保留的 Top-K 数量。
+        center_nms_radius: 中心去重时使用的最小间距半径。
+        stage1_pose_samples: 第一阶段局部对接生成的候选构象数。
+        stage2_pose_samples: 第二阶段精排生成的候选构象数。
+        crop_candidate_topk: crop候选阶段保留的 Top-K 数量。
+        crop_min_residues: 局部裁剪后至少保留的残基数量。
+        crop_atom_margin: 基于原子距离扩展残基裁剪范围的边界。
+        disable_jitter_crop: 是否关闭jittercrop。
+        disable_hard_negative_crop: 是否关闭hard负例crop。
+        pose_ranking_pair_weight: 构象rankingpair相关的权重。
+        pose_ranking_margin: 构象rankingmargin。
+        pose_bootstrap_weight: 构象bootstrap相关的权重。
+        pose_bootstrap_frequency: 构象bootstrapfrequency。
+        pose_bootstrap_ode_steps: 构象bootstrapode的步数。
+        enable_fusion_calibration: 是否启用融合calibration。
+        val_ode_steps: valode的步数。
+        checkpoint_selection_mode: checkpoint 选择规则名称。
+        fusion_search_center_weights: 搜索中心融合权重时使用的候选集合。
+        fusion_search_aff_weights: 搜索亲和力融合权重时使用的候选集合。
+        fusion_search_clash_weights: 搜索位阻融合权重时使用的候选集合。
+        blind_pool_refresh_every: blind pool 的刷新间隔。
+        blind_pool_start_epoch: 允许开始刷新 blind pool 的最小训练轮次。
+        blind_pool_max_complexes: 单次刷新 blind pool 时最多处理的复合物数量。
+        blind_pool_cache_bce_weight: blind pool 回放中 BCE 损失的权重。
+        blind_pool_cache_rank_weight: blind pool 回放中排序损失的权重。
+        blind_pool_pairs_per_complex: 每个复合物在 blind pool 中采样的配对数量。
+        esm_path: esm路径。
+        run_name: 本次运行的名称标识。
+        run_log_file: 本次运行对应的日志文件路径。
 
-        lr: 学习率
-        weight_decay: 权重衰减
-        clip_grad: 梯度裁剪阈值
-        hidden_dim: 隐藏层维度
-        num_gnn_blocks: GNN 块数量
-        lig_atom_cont_count: 配体原子连续特征数量
-        lig_mol_cont_count: 配体分子连续特征数量
-        pro_atom_cont_count: 蛋白原子连续特征数量
-        pro_res_cont_count: 蛋白残基连续特征数量
-        esm_dim: ESM embedding 维度
-        device: 训练设备 ("cpu", "cuda", "cuda:0", "cuda:1" 等)，默认为 "auto" (自动检测)
-        crop_radius: 运行时局部裁剪半径 (Å)
-        normalization_stats: 保留兼容参数；运行时会统一改用 train split 统计
-        warmup_epochs: 空间课程学习预热轮数
-        rmsd_check_ratio: 验证集中计算 RMSD 的样本比例 (0.0 ~ 1.0)
-                          例如 0.1 表示随机抽取 10% 的 batch 进行耗时的 RMSD 推演
-        accumulation_steps: 梯度累积步数。当显存较小时，可设为 2/4 模拟更大 batch_size
-        max_nodes_per_batch: 训练集 DynamicBatchSampler 节点预算
-        val_max_nodes_per_batch: 验证集节点预算（None 时使用 min(train_budget, 6000)）
-        test_max_nodes_per_batch: 测试集节点预算（None 时沿用验证预算）
-        topn_max_nodes_per_batch: Top-N 评估节点预算（None 时沿用测试预算）
-        ema_decay: EMA 衰减率，默认 0.999；小规模试跑可设为 0.99 加快吸收
-        dataloader_num_workers: DataLoader worker 数
-        dataloader_pin_memory: 是否启用 pin_memory
-        dataloader_persistent_workers: 是否启用 persistent_workers（仅 num_workers>0 时有效）
-        split_train_frac: 训练集比例（建议 0.7）
-        split_val_frac: 验证集比例（建议 0.1）
-        split_test_frac: 测试集比例（建议 0.2）
-        split_seed: Scaffold 划分随机种子
-        split_cache_file: 划分缓存 JSON 路径；为 None 时自动生成默认路径
-        force_resplit: 是否忽略缓存并强制重新划分
-        ablation_mode: 消融模式（"none" 或 "inter_multiscale_off"）
-        run_test_after_training: 训练结束后是否自动在 test 集上评估并输出报告
-        test_topk_values: Top-N 成功率统计的 N 列表，如 (1,5,10)
-        test_pose_samples: 每个复合物采样的候选 pose 数（应 >= max(test_topk_values)）
-        enable_oom_adaptive_batch: 是否启用 OOM 触发的自动降批保护
-        oom_reduce_threshold: 单个 epoch 触发多少次 OOM 后，下个 epoch 自动降低 batch 节点预算
-        oom_reduce_factor: 自动降批系数，(0,1) 内有效（级联熔断时自动使用 min(factor, 0.7) 更激进的缩减）
-        min_max_nodes_per_batch: 自动降批的下限，避免降得过小影响训练质量
-        enable_val_oom_adaptive_batch: 是否启用验证阶段 OOM 触发的独立降批
-        val_oom_reduce_threshold: 单个 epoch 验证 OOM 达到该阈值后，下轮降低验证预算
-        val_oom_reduce_factor: 验证预算缩减系数，(0,1) 内有效
-        min_val_max_nodes_per_batch: 验证自动降批下限，None 时默认与训练下限一致
-        oom_recover_epochs: 连续多少个无 OOM epoch 后尝试回升 batch 预算
-        oom_recover_factor: 回升系数 (>1)，如 1.1 表示每次回升 10%
+    Returns:
+        None: 训练完成后不返回值，相关结果会写入日志、checkpoint 和报告文件。
+
+    Raises:
+        ValueError: 当关键训练配置缺失、设备非法或数据划分参数不合法时抛出。
+        RuntimeError: 当训练、验证或候选池回放过程中出现不可恢复错误时抛出。
     """
 
-    # 1. 准备环境
     if device == "auto":
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        raise ValueError(
+            "Device must be provided explicitly. Please configure `device` in "
+            "configs/train.toml or pass it from the caller."
+        )
+    device = torch.device(device)
 
-    else:
-        device = torch.device(device)
-        
     os.makedirs(save_dir, exist_ok=True)
     logger.info(f"Using device: {device}")
     if run_name is not None:
@@ -1097,18 +426,28 @@ def train(
     except Exception:
         pass
 
-    # 2. 准备数据
     logger.info("Initializing Dataset...")
     collator = GraphCollator(follow_batch=["ligand_atom", "protein_atom"])
 
-    interaction_profile = "atom_only" if ablation_mode == "inter_multiscale_off" else "full"
+    interaction_profile = resolve_interaction_profile(ablation_mode=ablation_mode)
 
-    dataset = ProteinLigandDataset(
+    dataset = build_dataset(
         root=data_root,
         index_file=index_file,
         esm_root=esm_path,
-        esm="auto",
+        esm=esm,
+        esm_model_name=esm_model_name,
+        esm_device=str(device),
         esm_dim=esm_dim,
+        r_cutoff_intra=r_cutoff_intra,
+        max_neighbors_intra=max_neighbors_intra,
+        atom_neighbor_cap=atom_neighbor_cap,
+        residue_neighbor_cap=residue_neighbor_cap,
+        residue_radius_scale=residue_radius_scale,
+        residue_radius_bias=residue_radius_bias,
+        ligand_atom_fallback_k=ligand_atom_fallback_k,
+        protein_atom_fallback_k=protein_atom_fallback_k,
+        protein_residue_fallback_k=protein_residue_fallback_k,
         interaction_profile=interaction_profile,
     )
     graph_builder = dataset.graph_builder
@@ -1120,12 +459,10 @@ def train(
         )
 
     if split_cache_file is None:
-        split_dir = Path(data_root) / "splits"
-        split_name = (
-            f"scaffold_{int(split_train_frac*100)}_"
-            f"{int(split_val_frac*100)}_{int(split_test_frac*100)}_seed{split_seed}.json"
+        raise ValueError(
+            "split_cache_file must be configured explicitly. Please set it in "
+            "configs/train.toml or pass it from the caller."
         )
-        split_cache_file = str(split_dir / split_name)
 
     logger.info("Splitting dataset by Scaffold with persisted indices...")
     splitter = ScaffoldSplitter(include_chirality=False, seed=split_seed)
@@ -1208,10 +545,7 @@ def train(
     if not train_indices:
         raise ValueError("Train split is empty; cannot compute train-only normalization stats.")
 
-    if normalization_stats:
-        logger.warning("Ignoring externally supplied normalization_stats; using train-split-only statistics.")
-
-    normalization_stats, train_affinity_stats = _compute_train_split_normalization_stats(
+    normalization_stats, train_affinity_stats = compute_train_split_normalization_stats(
         dataset,
         train_indices,
         split_cache_file=split_cache_file,
@@ -1234,147 +568,27 @@ def train(
     from torch_geometric.loader import DynamicBatchSampler
 
     if accumulation_steps < 1:
-        logger.warning(f"Invalid accumulation_steps={accumulation_steps}, fallback to 1.")
-        accumulation_steps = 1
+        raise ValueError(f"Invalid accumulation_steps={accumulation_steps}.")
 
     if not (0.0 < oom_reduce_factor < 1.0):
-        logger.warning(f"Invalid oom_reduce_factor={oom_reduce_factor}, fallback to 0.8.")
-        oom_reduce_factor = 0.8
+        raise ValueError(f"Invalid oom_reduce_factor={oom_reduce_factor}.")
+
+    if val_max_nodes_per_batch is None:
+        raise ValueError("val_max_nodes_per_batch must be configured explicitly.")
+    if test_max_nodes_per_batch is None:
+        raise ValueError("test_max_nodes_per_batch must be configured explicitly.")
+    if topn_max_nodes_per_batch is None:
+        raise ValueError("topn_max_nodes_per_batch must be configured explicitly.")
+    if min_val_max_nodes_per_batch is None:
+        raise ValueError("min_val_max_nodes_per_batch must be configured explicitly.")
 
     configured_train_max_nodes_per_batch = max(1, int(max_nodes_per_batch))
-    configured_val_max_nodes_per_batch = (
-        max(1, int(val_max_nodes_per_batch))
-        if val_max_nodes_per_batch is not None
-        else min(configured_train_max_nodes_per_batch, 6000)
-    )
-    configured_test_max_nodes_per_batch = (
-        max(1, int(test_max_nodes_per_batch))
-        if test_max_nodes_per_batch is not None
-        else configured_val_max_nodes_per_batch
-    )
-    configured_topn_max_nodes_per_batch = (
-        max(1, int(topn_max_nodes_per_batch))
-        if topn_max_nodes_per_batch is not None
-        else configured_test_max_nodes_per_batch
-    )
-    # [修复] 降低边预算因子
-    # 旧值 60 + protein_atom k=128 bug 导致 batch 静态边已接近显存上限，
-    # 而编码器 forward 中还会通过 radius() 动态创建跨图边（对 Sampler 不可见），
-    # 使实际 GPU 边数远超预算 → OOM。
-    # 修复 k→32 后静态边/图大幅下降，Sampler 会装入更多图，
-    # 必须同步下调因子为动态边预留 ~40-50% 显存 headroom。
-    # 注意：batch 变小不影响精度——accumulation_steps=8 保证了有效梯度规模。
-    train_edge_budget_factor = 40
-    eval_edge_guard_headroom = 1.5
+    configured_val_max_nodes_per_batch = max(1, int(val_max_nodes_per_batch))
+    configured_test_max_nodes_per_batch = max(1, int(test_max_nodes_per_batch))
+    configured_topn_max_nodes_per_batch = max(1, int(topn_max_nodes_per_batch))
+    train_edge_budget_factor = max(1, int(edge_budget_factor))
+    eval_edge_guard_headroom = max(1.0, float(eval_edge_guard_headroom))
 
-    def _safe_metric(value: Any, default: float, *, higher_is_better: bool = True) -> float:
-        try:
-            metric = float(value)
-        except Exception:
-            return default
-
-        if math.isnan(metric) or math.isinf(metric):
-            return default
-
-        return metric
-
-    def _build_selection_metrics(metrics: dict[str, Any]) -> dict[str, float]:
-        success_2a = _safe_metric(metrics.get("reranked_top1_success_2a", metrics.get("success_2a")), 0.0)
-        success_5a = _safe_metric(metrics.get("reranked_top5_success_2a", metrics.get("success_5a")), 0.0)
-        oracle_top5_success_2a = _safe_metric(metrics.get("oracle_top5_success_2a"), 0.0)
-        mean_rmsd = _safe_metric(
-            metrics.get("reranked_top1_mean_best_rmsd", metrics.get("mean_rmsd_final")),
-            1e9,
-            higher_is_better=False,
-        )
-        val_loss = _safe_metric(metrics.get("local_val_loss", metrics.get("val_loss")), 1e9, higher_is_better=False)
-        center_recall = _safe_metric(metrics.get("center_recall@8"), 0.0)
-        proposal_gap = _safe_metric(metrics.get("proposal_gap"), 100.0, higher_is_better=False)
-        ranking_gap = _safe_metric(metrics.get("ranking_gap"), 100.0, higher_is_better=False)
-        composite_score = (
-            1.75 * success_2a
-            + 0.35 * success_5a
-            + 0.20 * oracle_top5_success_2a
-            + 0.10 * center_recall
-            - 0.75 * mean_rmsd
-            - 0.15 * proposal_gap
-            - 0.20 * ranking_gap
-        )
-        blind_combo_score = 1.0 * success_2a + 0.35 * oracle_top5_success_2a - 0.10 * ranking_gap
-
-        return {
-            "composite_score": composite_score,
-            "blind_combo_score": blind_combo_score,
-            "success_2a": success_2a,
-            "success_5a": success_5a,
-            "oracle_top5_success_2a": oracle_top5_success_2a,
-            "mean_rmsd": mean_rmsd,
-            "val_loss": val_loss,
-            "center_recall@8": center_recall,
-            "proposal_gap": proposal_gap,
-            "ranking_gap": ranking_gap,
-        }
-
-    def _resolve_selection_rule() -> tuple[str, bool, str]:
-        mapping = {
-            "composite": ("composite_score", True, "Composite"),
-            "reranked_top1_success_2a": ("success_2a", True, "Rerank@1<2A"),
-            "reranked_top5_success_2a": ("success_5a", True, "Rerank@5<2A"),
-            "reranked_top1_plus_oracle_top5": ("blind_combo_score", True, "Rerank@1 + Oracle@5"),
-        }
-        if checkpoint_selection_mode not in mapping:
-            raise ValueError(
-                "checkpoint_selection_mode must be one of "
-                f"{tuple(mapping.keys())}, got {checkpoint_selection_mode!r}"
-            )
-        return mapping[checkpoint_selection_mode]
-
-    def _is_better_checkpoint(
-        candidate: dict[str, float],
-        incumbent: dict[str, float] | None,
-        *,
-        primary_key: str,
-        primary_higher_is_better: bool,
-        tol: float = 1e-6,
-    ) -> bool:
-        if incumbent is None:
-            return True
-
-        candidate_primary = candidate[primary_key]
-        incumbent_primary = incumbent[primary_key]
-
-        if primary_higher_is_better:
-            if candidate_primary > incumbent_primary + tol:
-                return True
-            if candidate_primary < incumbent_primary - tol:
-                return False
-        else:
-            if candidate_primary < incumbent_primary - tol:
-                return True
-            if candidate_primary > incumbent_primary + tol:
-                return False
-
-        if candidate["success_2a"] > incumbent["success_2a"] + tol:
-            return True
-        if candidate["success_2a"] < incumbent["success_2a"] - tol:
-            return False
-
-        if candidate["success_5a"] > incumbent["success_5a"] + tol:
-            return True
-        if candidate["success_5a"] < incumbent["success_5a"] - tol:
-            return False
-
-        if candidate["mean_rmsd"] < incumbent["mean_rmsd"] - tol:
-            return True
-        if candidate["mean_rmsd"] > incumbent["mean_rmsd"] + tol:
-            return False
-
-        if candidate["val_loss"] < incumbent["val_loss"] - tol:
-            return True
-        if candidate["val_loss"] > incumbent["val_loss"] + tol:
-            return False
-
-        return False
 
     def _annotate_loss_context(batch_obj: Any, *, current_epoch: int, total_epochs_count: int, warmup_epochs_count: int, training: bool) -> None:
         apply_loss_context(
@@ -1385,58 +599,9 @@ def train(
             training=training,
         )
 
-    def _compose_checkpoint(
-        *,
-        epoch_idx: int,
-        avg_train_loss_value: float,
-        val_metrics_obj: dict[str, Any],
-        selection_metrics: dict[str, float],
-    ) -> dict[str, Any]:
-        model_config = build_model_config(
-            hidden_dim=hidden_dim,
-            time_dim=hidden_dim,
-            num_gnn_blocks=num_gnn_blocks,
-            lig_atom_cont_count=lig_atom_cont_count,
-            lig_mol_cont_count=lig_mol_cont_count,
-            pro_atom_cont_count=pro_atom_cont_count,
-            pro_res_cont_count=pro_res_cont_count,
-            esm_dim=esm_dim,
-            interaction_profile=interaction_profile,
-            num_rbf=num_rbf,
-            r_cutoff=r_cutoff,
-            force_cutoff=force_cutoff,
-            dynamic_inter_cutoff=dynamic_inter_cutoff,
-            dynamic_inter_knn_k=dynamic_inter_knn_k,
-            dynamic_residue_cutoff=dynamic_residue_cutoff,
-            dynamic_residue_knn_k=dynamic_residue_knn_k,
-        )
-        return {
-            "epoch": epoch_idx,
-            "run_name": run_name,
-            "run_log_file": run_log_file,
-            "model_config": model_config,
-            "feature_signature": build_feature_signature(esm_dim=esm_dim),
-            "model_state_dict": model.state_dict(),
-            "ema_model_state_dict": ema_model.module.state_dict() if ema_model is not None else model.state_dict(),
-            "loss_state_dict": criterion.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "best_val_loss": best_val_loss,
-            "best_rmsd": best_rmsd,
-            "avg_train_loss": avg_train_loss_value,
-            "val_metrics": dict(val_metrics_obj),
-            "selection_metrics": dict(selection_metrics),
-            "fusion_weights": dict(current_fusion_weights),
-            "normalization_stats": normalization_stats,
-        }
 
     effective_min_train_nodes_per_batch = max(1, int(min_max_nodes_per_batch))
-    effective_min_val_nodes_per_batch = max(
-        1,
-        int(min_val_max_nodes_per_batch)
-        if min_val_max_nodes_per_batch is not None
-        else int(min_max_nodes_per_batch),
-    )
+    effective_min_val_nodes_per_batch = max(1, int(min_val_max_nodes_per_batch))
 
     if effective_min_train_nodes_per_batch > configured_train_max_nodes_per_batch:
         logger.warning(
@@ -1453,18 +618,17 @@ def train(
         effective_min_val_nodes_per_batch = configured_val_max_nodes_per_batch
 
     if not (0.0 < val_oom_reduce_factor < 1.0):
-        logger.warning(f"Invalid val_oom_reduce_factor={val_oom_reduce_factor}, fallback to 0.8.")
-        val_oom_reduce_factor = 0.8
+        raise ValueError(
+            f"Invalid val_oom_reduce_factor={val_oom_reduce_factor}."
+        )
 
     current_train_max_nodes_per_batch = configured_train_max_nodes_per_batch
     current_val_max_nodes_per_batch = configured_val_max_nodes_per_batch
     persistent_workers = bool(dataloader_persistent_workers and dataloader_num_workers > 0)
 
-    # 用于追踪旧 loader 引用，确保重建时显式销毁 persistent_workers
     _prev_loaders: list[DataLoader] = []
 
     def _build_loaders(train_max_nodes: int, val_max_nodes: int) -> tuple[DataLoader, DataLoader]:
-        # 显式销毁旧 loader，释放 persistent_workers 进程
         for old_loader in _prev_loaders:
             del old_loader
         _prev_loaders.clear()
@@ -1492,9 +656,6 @@ def train(
             batch_sampler=train_sampler,
         )
 
-        # [修复] 验证集也使用 edge 模式进行批处理
-        # 旧逻辑使用 mode="node"，导致节点数受控但边数完全不可控，
-        # 几乎 100% 的验证 batch 都因超出 edge_guard_limit 而被 preflight skip
         val_sampler = DynamicBatchSampler(
             cast(Any, val_set),
             max_num=val_edge_budget,
@@ -1535,19 +696,17 @@ def train(
         current_val_max_nodes_per_batch,
     )
 
-    # [新增逻辑] 动态计算 Batch 数量 (DynamicBatchSampler 没有固定的 len)
     try:
         total_val_batches = len(val_loader)
 
     except ValueError:
         total_val_batches = max(1, len(val_set) // 4)
-        
+
     rmsd_check_batches = int(total_val_batches * rmsd_check_ratio)
-    
-    # 确保至少检查 1 个 batch (如果 ratio > 0)
+
     if rmsd_check_ratio > 0 and rmsd_check_batches < 1:
         rmsd_check_batches = 1
-    
+
     logger.info(f"Validation Sampling: Check RMSD for {rmsd_check_batches}/{total_val_batches} batches ({rmsd_check_ratio*100:.1f}%)")
     logger.info(
         "Evaluation budgets: "
@@ -1557,10 +716,9 @@ def train(
         f"topn_edges={max(1, int(configured_topn_max_nodes_per_batch * train_edge_budget_factor))}."
     )
 
-    # 3. 准备模型组件
     logger.info("Initializing Model & Flow Components...")
 
-    model = EHFNet(
+    model = build_model(
         hidden_dim=hidden_dim,
         time_dim=hidden_dim,
         num_gnn_blocks=num_gnn_blocks,
@@ -1570,9 +728,24 @@ def train(
         pro_res_cont_count=pro_res_cont_count,
         interaction_profile=interaction_profile,
         normalization_stats=normalization_stats,
+        m_dim_scalar=m_dim_scalar,
+        dropout_rate=dropout_rate,
         num_rbf=num_rbf,
         r_cutoff=r_cutoff,
         force_cutoff=force_cutoff,
+        frame_refine_threshold=frame_refine_threshold,
+        frame_refine_temperature=frame_refine_temperature,
+        energy_guide_threshold=energy_guide_threshold,
+        energy_guide_temperature=energy_guide_temperature,
+        clash_threshold=clash_threshold,
+        clash_push_threshold=clash_push_threshold,
+        clash_push_force=clash_push_force,
+        score_clamp_min=score_clamp_min,
+        score_clamp_max=score_clamp_max,
+        force_limit=force_limit,
+        max_neighbors=prediction_max_neighbors,
+        min_max_neighbors=prediction_min_max_neighbors,
+        knn_fallback_k=prediction_knn_fallback_k,
         dynamic_inter_cutoff=dynamic_inter_cutoff,
         dynamic_inter_knn_k=dynamic_inter_knn_k,
         dynamic_residue_cutoff=dynamic_residue_cutoff,
@@ -1580,27 +753,70 @@ def train(
     ).to(device)
 
     matcher = ConditionalFlowMatcher(
-        sigma_min=1e-3,
+        sigma_min=flow_sigma_min,
+        spatial_sigma_min=flow_spatial_sigma_min,
+        spatial_sigma_max=flow_spatial_sigma_max,
         warmup_epochs=warmup_epochs,
+        fd_dt=flow_fd_dt,
+        rotation_angle_min=flow_rotation_angle_min,
+        rotation_angle_max=flow_rotation_angle_max,
+        torsion_scale_min=flow_torsion_scale_min,
+        torsion_scale_max=flow_torsion_scale_max,
     )
-    criterion = FlowMatchingLoss().to(device)
-    # 速度分解由 matcher 内部完成，trainer 不持有分解器
-
-    # 4. 优化器
+    criterion = FlowMatchingLoss(
+        characteristic_scale=loss_characteristic_scale,
+        weight_trans=loss_weight_trans,
+        weight_rot=loss_weight_rot,
+        weight_torsion=loss_weight_torsion,
+        weight_energy=loss_weight_energy,
+        weight_clash=loss_weight_clash,
+        weight_pose_quality=loss_weight_pose_quality,
+        curriculum_weights={
+            "coarse": {
+                "trans": loss_coarse_trans,
+                "rot": loss_coarse_rot,
+                "torsion": loss_coarse_torsion,
+                "energy": loss_coarse_energy,
+                "clash": loss_coarse_clash,
+                "pose_quality": loss_coarse_pose_quality,
+            },
+            "transition": {
+                "trans": loss_transition_trans,
+                "rot": loss_transition_rot,
+                "torsion": loss_transition_torsion,
+                "energy": loss_transition_energy,
+                "clash": loss_transition_clash,
+                "pose_quality": loss_transition_pose_quality,
+            },
+            "refine": {
+                "trans": loss_refine_trans,
+                "rot": loss_refine_rot,
+                "torsion": loss_refine_torsion,
+                "energy": loss_refine_energy,
+                "clash": loss_refine_clash,
+                "pose_quality": loss_refine_pose_quality,
+            },
+        },
+        refine_start=loss_refine_start,
+        pose_gate_epoch_start=loss_pose_gate_epoch_start,
+        pose_gate_epoch_end=loss_pose_gate_epoch_end,
+        pose_gate_tau_start=loss_pose_gate_tau_start,
+        pose_gate_tau_end=loss_pose_gate_tau_end,
+        pose_gate_temperature=loss_pose_gate_temperature,
+    ).to(device)
     optimizer = optim.AdamW(
         model.parameters(),
         lr=lr,
         weight_decay=weight_decay,
     )
 
-    # Warmup + 余弦退火（Step 级），防止初期梯度冲击 + 中后期平滑收敛
     try:
         total_train_batches = len(train_loader)
     except ValueError:
         total_train_batches = max(1, len(train_set) // 4)
     updates_per_epoch = math.ceil(total_train_batches / accumulation_steps)
     total_steps = epochs * updates_per_epoch
-    warmup_steps = max(1, warmup_epochs) * updates_per_epoch  # LR warmup 与 Curriculum 同步
+    warmup_steps = max(1, warmup_epochs) * updates_per_epoch
     scheduler_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
     scheduler_cosine = CosineAnnealingLR(
         optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=1e-6
@@ -1616,7 +832,6 @@ def train(
 
     ema_model: AveragedModel | None = None
 
-    # 5. 训练循环
     best_val_loss = float("inf")
     best_rmsd = float("inf")
     best_composite_metrics: dict[str, float] | None = None
@@ -1625,16 +840,16 @@ def train(
     best_selected_metrics: dict[str, float] | None = None
     current_fusion_weights = dict(DEFAULT_FUSION_WEIGHTS)
     total_oom_batches = 0
-    consecutive_clean_epochs = 0  # 连续无 OOM 的 epoch 计数，用于回升决策
+    consecutive_clean_epochs = 0
     consecutive_clean_val_epochs = 0
     oom_blacklisted_pdb_ids: set[str] = set()
     oom_counts_by_pdb: dict[str, int] = {}
     OOM_BLACKLIST_THRESHOLD = 2
     clone_safety_checked = False
-    selected_primary_key, selected_higher_is_better, selected_metric_label = _resolve_selection_rule()
+    selected_primary_key, selected_higher_is_better, selected_metric_label = resolve_selection_rule(checkpoint_selection_mode)
     blind_pool_cache_dir = os.path.join(save_dir, "blind_pool_cache")
     os.makedirs(blind_pool_cache_dir, exist_ok=True)
-    blind_pool_compatibility = build_blind_pool_compatibility(
+    blind_pool_signature = build_blind_pool_signature(
         esm_dim=esm_dim,
         processed_dir=dataset.processed_dir,
         index_file=dataset.index_file,
@@ -1642,7 +857,7 @@ def train(
     )
     cached_blind_pool: list[dict[str, Any]] = load_blind_pool(
         blind_pool_cache_dir,
-        expected_compatibility=blind_pool_compatibility,
+        expected_signature=blind_pool_signature,
     )
     if cached_blind_pool:
         logger.info("Loaded existing blind pool: %d complexes.", len(cached_blind_pool))
@@ -1690,21 +905,20 @@ def train(
 
         train_loss_meter = 0.0
         pbar = tqdm(total=len(train_set), desc=f"Epoch {epoch+1}/{epochs} [Train]", unit="graphs")
-        
+
         actual_batches = 0
         epoch_oom_batches = 0
         epoch_edge_guard_skips = 0
-        accumulated_graphs = 0   # 当前累积周期内的总图数
-        accumulated_batches = 0  # 当前累积周期内成功处理的 batch 数（跳过的 batch 不计入）
-        consecutive_oom = 0     # 连续 OOM 计数，用于级联熔断
-        CIRCUIT_BREAKER_LIMIT = 10  # 连续 OOM 达到此值则熔断当前 epoch
+        accumulated_graphs = 0
+        accumulated_batches = 0
+        consecutive_oom = 0
+        CIRCUIT_BREAKER_LIMIT = 10
         ENERGY_NAN_FAILFAST_LIMIT = 8
-        epoch_fused = False     # 本 epoch 是否被熔断
+        epoch_fused = False
         consecutive_energy_nan_skips = 0
-        optimizer.zero_grad()   # 在循环外初始化梯度清零
-        epoch_proposal_losses: list[float] = []
+        optimizer.zero_grad()
         epoch_local_losses: list[float] = []
-        epoch_proposal_residues: list[float] = []
+        epoch_source_residues: list[float] = []
         epoch_local_residues: list[float] = []
         epoch_rank_pair_counts = {
             "same_center": 0,
@@ -1741,61 +955,94 @@ def train(
                 )
                 consecutive_oom = 0
                 continue
-            
-            # 【全覆盖 OOM 安全网】
-            # 包裹 batch.to(device) → 采样 → 前向 → 损失 → 反向 的完整流程
-            # OOM 可能发生在任何 GPU 操作点：数据迁移、EGNN 消息传递、梯度计算
+
+            source_batch: Any | None = None
+            local_batch: Any | None = None
+            predictions: Any | None = None
+            loss_dict: dict[str, torch.Tensor] | None = None
+            loss: torch.Tensor | None = None
+            loss_sum: torch.Tensor | None = None
+            targets: dict[str, torch.Tensor] | None = None
+            x_1: torch.Tensor | None = None
+            x_t: torch.Tensor | None = None
+            t: torch.Tensor | None = None
+            ligand_centers: torch.Tensor | None = None
+            proposal_logits: torch.Tensor | None = None
+            residue_prior_feat: torch.Tensor | None = None
+            proposal_logits_cpu: torch.Tensor | None = None
+            center_guidance_logits_cpu: torch.Tensor | None = None
+            proposal_top_scores: torch.Tensor | None = None
+            proposal_top_scores_cpu: torch.Tensor | None = None
+            residue_pos_for_crop: torch.Tensor | None = None
+            residue_batch_for_crop: torch.Tensor | None = None
+            residue_prior_feat_cpu: torch.Tensor | None = None
+            residue_pos_cpu: torch.Tensor | None = None
+            residue_batch_cpu: torch.Tensor | None = None
+            crop_centers: torch.Tensor | None = None
+            crop_centers_cpu: torch.Tensor | None = None
+            wrong_centers: torch.Tensor | None = None
+            wrong_centers_cpu: torch.Tensor | None = None
+            wrong_center_scores: torch.Tensor | None = None
+            wrong_center_scores_cpu: torch.Tensor | None = None
+            wrong_center_valid: torch.Tensor | None = None
+            wrong_center_valid_cpu: torch.Tensor | None = None
+            bootstrap_centers: torch.Tensor | None = None
+            bootstrap_centers_cpu: torch.Tensor | None = None
+
             try:
                 source_batch = batch
                 if not clone_safety_checked:
                     clone_safety_checked = True
+                center_value_ready = bool(cached_blind_pool)
                 ligand_centers = scatter_mean(
                     source_batch["ligand_atom"].pos,
                     source_batch["ligand_atom"].batch,
                     dim=0,
                     dim_size=num_graphs,
                 )
-                proposal_loss = compute_proposal_loss(
-                    model,
-                    source_batch,
-                    device=device,
-                    positive_radius=center_positive_radius,
-                )
-                proposal_logits, residue_pos_for_crop, residue_batch_for_crop, _ = predict_center_proposal_logits(
+                proposal_logits, residue_pos_for_crop, residue_batch_for_crop, residue_prior_feat = predict_center_proposal_logits(
                     model,
                     source_batch,
                     device=device,
                 )
                 train_progress = 1.0 if epochs <= 1 else epoch / max(1, epochs - 1)
                 proposal_logits_cpu = proposal_logits.detach().cpu().view(-1)
+                residue_prior_feat_cpu = residue_prior_feat.detach().cpu()
+                center_guidance_logits_cpu = compute_center_guidance_scores(
+                    proposal_logits_cpu,
+                    residue_prior_feat_cpu,
+                    use_learned_scores=center_value_ready,
+                )
                 residue_pos_cpu = residue_pos_for_crop.detach().cpu()
                 residue_batch_cpu = residue_batch_for_crop.detach().cpu()
                 wrong_centers_cpu, wrong_center_scores_cpu, wrong_center_valid_cpu = select_wrong_center_candidates(
                     ligand_centers.detach().cpu(),
-                    proposal_logits_cpu,
+                    center_guidance_logits_cpu,
                     residue_pos_cpu,
                     residue_batch_cpu,
                     positive_radius=center_positive_radius,
                     bucket_topk=crop_candidate_topk,
                     weighted_sampling=True,
+                    allow_negative_centers=center_value_ready,
                 )
                 bootstrap_centers_cpu = select_bootstrap_blind_centers(
                     ligand_centers.detach().cpu(),
-                    proposal_logits_cpu,
+                    center_guidance_logits_cpu,
                     residue_pos_cpu,
                     residue_batch_cpu,
                     positive_radius=center_positive_radius,
                     bucket_topk=crop_candidate_topk,
+                    allow_negative_centers=center_value_ready,
                 )
-                proposal_top_scores_cpu = torch.full((num_graphs,), -1e9, dtype=proposal_logits_cpu.dtype)
+                proposal_top_scores_cpu = torch.full((num_graphs,), -1e9, dtype=center_guidance_logits_cpu.dtype)
                 for graph_idx in range(num_graphs):
                     graph_mask = residue_batch_cpu == graph_idx
-                    graph_logits = proposal_logits_cpu[graph_mask]
+                    graph_logits = center_guidance_logits_cpu[graph_mask]
                     if graph_logits.numel() > 0:
                         proposal_top_scores_cpu[graph_idx] = graph_logits.max()
                 crop_centers_cpu, crop_modes = select_training_crop_centers(
                     ligand_centers.detach().cpu(),
-                    proposal_logits_cpu,
+                    center_guidance_logits_cpu,
                     residue_pos_cpu,
                     residue_batch_cpu,
                     progress=train_progress,
@@ -1804,11 +1051,14 @@ def train(
                     weighted_sampling=True,
                     disable_jitter=disable_jitter_crop,
                     disable_hard_negative=disable_hard_negative_crop,
+                    allow_proposal_buckets=center_value_ready,
                 )
                 local_batch = build_local_batch_from_centers(
                     source_batch,
                     centers=crop_centers_cpu,
                     crop_radius=float(crop_radius),
+                    crop_min_residues=crop_min_residues,
+                    crop_atom_margin=crop_atom_margin,
                     graph_builder=graph_builder,
                     collator=collator,
                 )
@@ -1819,8 +1069,7 @@ def train(
                 wrong_centers = wrong_centers_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
                 bootstrap_centers = bootstrap_centers_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
                 proposal_top_scores = proposal_top_scores_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
-                epoch_proposal_losses.append(float(proposal_loss.detach().item()))
-                epoch_proposal_residues.append(
+                epoch_source_residues.append(
                     float(source_batch["protein_residue"].pos.size(0)) / max(1, num_graphs)
                 )
                 epoch_local_residues.append(
@@ -1834,8 +1083,6 @@ def train(
                     training=True,
                 )
 
-                # 流匹配训练步骤
-                # 生成训练目标不需要梯度
                 with torch.no_grad():
                     x_1 = batch["ligand_atom"].pos
                     t, x_t, targets = matcher.sample_location_and_target(
@@ -1849,12 +1096,12 @@ def train(
                 batch["ligand_atom"].pos = x_t
                 batch.t = t
 
-                # FP32 前向传播
                 predictions = model(batch, t)
 
-                # 补充结合能 target
                 targets["binding_affinity_target"] = batch.get("y_energy", None)
-                targets["pose_quality_target"] = compute_pose_quality_target(x_t, x_1, batch["ligand_atom"].batch)
+                targets["pose_quality_target"] = compute_pose_quality_target(
+                    x_t, x_1, batch_idx=batch["ligand_atom"].batch
+                )
 
                 loss_dict = criterion(predictions, targets, batch)
                 epoch_local_losses.append(float(loss_dict["total"].detach().item()))
@@ -1875,7 +1122,6 @@ def train(
                     try:
                         rank_terms: list[torch.Tensor] = []
                         current_rank_logit = select_pose_ranking_logit(predictions)
-                        # same-center 好/坏 pose pair
                         same_center_batch = batch.clone()
                         with torch.no_grad():
                             t_same = torch.clamp(
@@ -1894,7 +1140,9 @@ def train(
                         same_center_batch["ligand_atom"].pos = x_t_same
                         same_center_batch.t = t_same
                         same_center_pred = model(same_center_batch, t_same)
-                        pose_quality_same = compute_pose_quality_target(x_t_same, x_1, batch["ligand_atom"].batch)
+                        pose_quality_same = compute_pose_quality_target(
+                            x_t_same, x_1, batch_idx=batch["ligand_atom"].batch
+                        )
                         same_center_rank_logit = select_pose_ranking_logit(same_center_pred)
                         loss_same, count_same = pairwise_ranking_loss_from_pairs(
                             current_rank_logit,
@@ -1907,12 +1155,13 @@ def train(
                             rank_terms.append(loss_same)
                             epoch_rank_pair_counts["same_center"] += count_same
 
-                        # wrong-center but clash small / center-high / affinity-not-bad
                         if bool(wrong_center_valid.any()):
                             wrong_local_batch = build_local_batch_from_centers(
                                 source_batch,
                                 centers=wrong_centers_cpu,
                                 crop_radius=float(crop_radius),
+                                crop_min_residues=crop_min_residues,
+                                crop_atom_margin=crop_atom_margin,
                                 graph_builder=graph_builder,
                                 collator=collator,
                             ).to(device)
@@ -1938,7 +1187,7 @@ def train(
                             pose_quality_wrong = compute_pose_quality_target(
                                 x_t_wrong,
                                 x_1_wrong,
-                                wrong_local_batch["ligand_atom"].batch,
+                                batch_idx=wrong_local_batch["ligand_atom"].batch,
                             )
                             anchor_clash = predictions.get("steric_clash_batch")
                             wrong_clash = wrong_pred.get("steric_clash_batch")
@@ -2038,21 +1287,21 @@ def train(
                         graph_builder=graph_builder,
                         collator=collator,
                         crop_radius=float(crop_radius),
+                        crop_min_residues=crop_min_residues,
+                        crop_atom_margin=crop_atom_margin,
                     )
                     loss_dict["loss_pose_bootstrap"] = loss_pose_bootstrap.detach()
 
-                loss_dict["loss_center_proposal"] = proposal_loss.detach()
-                loss_dict["weight_center_proposal"] = torch.tensor(center_proposal_weight, device=device)
+                loss_dict["loss_center_value"] = torch.tensor(0.0, device=device)
+                loss_dict["weight_center_value"] = torch.tensor(center_proposal_weight, device=device)
                 loss_dict["weight_pose_rank"] = torch.tensor(pose_ranking_pair_weight, device=device)
                 loss_dict["weight_pose_bootstrap"] = torch.tensor(pose_bootstrap_weight, device=device)
                 loss = (
                     loss_dict["total"]
-                    + center_proposal_weight * proposal_loss
                     + pose_ranking_pair_weight * loss_pose_rank
                     + pose_bootstrap_weight * loss_pose_bootstrap
                 )
 
-                # 防御性检查
                 if loss.grad_fn is None:
                     logger.warning(f"Batch {batch_idx}: loss has no grad_fn, skipping.")
                     continue
@@ -2063,7 +1312,6 @@ def train(
                         logger.warning(f"  {k}: {v}")
                     continue
 
-                # 样本级梯度累积
                 loss_sum = loss * num_graphs
                 loss_sum.backward()
 
@@ -2072,34 +1320,50 @@ def train(
                 total_oom_batches += 1
                 consecutive_oom += 1
 
-                # 【分级 CUDA 恢复】
-                # Level 1: 基础清理（首次 OOM）
                 optimizer.zero_grad(set_to_none=True)
                 accumulated_graphs = 0
-                # 必须删除所有引用 GPU tensor 的局部变量，否则碎片无法回收
-                batch = source_batch = local_batch = None  # type: ignore[assignment]
-                predictions = loss_dict = loss = loss_sum = None  # type: ignore[assignment]
-                targets = x_1 = x_t = t = None  # type: ignore[assignment]
-                proposal_loss = ligand_centers = proposal_logits = None  # type: ignore[assignment]
-                proposal_logits_cpu = proposal_top_scores = proposal_top_scores_cpu = None  # type: ignore[assignment]
-                residue_pos_for_crop = residue_batch_for_crop = None  # type: ignore[assignment]
-                residue_pos_cpu = residue_batch_cpu = None  # type: ignore[assignment]
-                crop_centers = crop_centers_cpu = None  # type: ignore[assignment]
-                wrong_centers = wrong_centers_cpu = None  # type: ignore[assignment]
-                wrong_center_scores = wrong_center_scores_cpu = None  # type: ignore[assignment]
-                wrong_center_valid = wrong_center_valid_cpu = None  # type: ignore[assignment]
-                bootstrap_centers = bootstrap_centers_cpu = None  # type: ignore[assignment]
+                batch = None
+                source_batch = None
+                local_batch = None
+                predictions = None
+                loss_dict = None
+                loss = None
+                loss_sum = None
+                targets = None
+                x_1 = None
+                x_t = None
+                t = None
+                ligand_centers = None
+                proposal_logits = None
+                residue_prior_feat = None
+                proposal_logits_cpu = None
+                center_guidance_logits_cpu = None
+                proposal_top_scores = None
+                proposal_top_scores_cpu = None
+                residue_pos_for_crop = None
+                residue_batch_for_crop = None
+                residue_prior_feat_cpu = None
+                residue_pos_cpu = None
+                residue_batch_cpu = None
+                crop_centers = None
+                crop_centers_cpu = None
+                wrong_centers = None
+                wrong_centers_cpu = None
+                wrong_center_scores = None
+                wrong_center_scores_cpu = None
+                wrong_center_valid = None
+                wrong_center_valid_cpu = None
+                bootstrap_centers = None
+                bootstrap_centers_cpu = None
                 gc.collect()
                 torch.cuda.empty_cache()
 
-                # Level 2: 深度恢复（连续 OOM >= 3）
                 if consecutive_oom >= 3:
                     torch.cuda.synchronize()
                     torch.cuda.reset_peak_memory_stats()
                     gc.collect()
                     torch.cuda.empty_cache()
 
-                # Level 3: 模型参数 CPU 往返（连续 OOM >= 5）—— 彻底重组显存布局
                 if consecutive_oom == 5:
                     logger.warning(
                         f"Batch {batch_idx}: {consecutive_oom} consecutive OOMs, "
@@ -2122,7 +1386,6 @@ def train(
                         f"total blacklisted={len(oom_blacklisted_pdb_ids)}."
                     )
 
-                # 【级联熔断器】连续 OOM 达到阈值，立即退出当前 epoch
                 if consecutive_oom >= CIRCUIT_BREAKER_LIMIT:
                     logger.error(
                         f"Epoch {epoch+1}: circuit breaker triggered after {consecutive_oom} "
@@ -2138,32 +1401,26 @@ def train(
                     )
                 continue
 
-            # OOM 恢复：成功处理一个 batch 后重置连续 OOM 计数
             consecutive_oom = 0
             actual_batches += 1
             accumulated_graphs += num_graphs
             accumulated_batches += 1
 
-            # 仅在完成一个完整累积周期后才更新参数（基于实际成功处理的 batch 数，跳过的 batch 不计入）
             is_last_in_cycle = accumulated_batches >= accumulation_steps and accumulated_graphs > 0
 
             if is_last_in_cycle:
-                
-                # 将累积梯度除以真实图总数，得到无偏的样本级平均梯度
                 for param in model.parameters():
 
                     if param.grad is not None:
                         param.grad /= accumulated_graphs
 
                 grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-                # Inf/NaN 梯度直接跳过，防止权重被污染
 
                 if torch.isnan(grad_norm) or torch.isinf(grad_norm):
                     logger.warning(f"Batch {batch_idx}: grad_norm={grad_norm:.4g}, skipping optimizer step.")
 
                 else:
                     optimizer.step()
-                    # 惰性构建 EMA（首次 step 后 lazy 参数已全部初始化）
                     if ema_model is None:
                         ema_model = AveragedModel(
                             model,
@@ -2172,12 +1429,10 @@ def train(
                     ema_model.update_parameters(model)
                     scheduler.step()
 
-                # 清零梯度和计数器，开始新的累积周期
                 optimizer.zero_grad()
                 accumulated_graphs = 0
                 accumulated_batches = 0
 
-            # 记录日志
             train_loss_meter += loss.item()
             pbar.set_postfix(
                 {
@@ -2199,17 +1454,16 @@ def train(
             del wrong_centers, wrong_centers_cpu, wrong_center_scores, wrong_center_scores_cpu
             del wrong_center_valid, wrong_center_valid_cpu, bootstrap_centers, bootstrap_centers_cpu
 
-        # 循环结束，如果有剩余积累的梯度，进行最后一次 step
         if accumulated_graphs > 0:
             for param in model.parameters():
                 if param.grad is not None:
                     param.grad /= accumulated_graphs
 
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-            
+
             if not (torch.isnan(grad_norm) or torch.isinf(grad_norm)):
                 optimizer.step()
-                
+
                 if ema_model is None:
                     ema_model = AveragedModel(
                         model,
@@ -2217,7 +1471,7 @@ def train(
                     )
                 ema_model.update_parameters(model)
                 scheduler.step()
-            
+
             optimizer.zero_grad()
 
         pbar.close()
@@ -2225,22 +1479,17 @@ def train(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         avg_train_loss = train_loss_meter / max(1, actual_batches)
-        if epoch_proposal_losses and epoch_local_losses:
-            proposal_mean = float(np.mean(epoch_proposal_losses))
-            proposal_std = float(np.std(epoch_proposal_losses))
+        if epoch_local_losses:
             local_mean = float(np.mean(epoch_local_losses))
             local_std = float(np.std(epoch_local_losses))
-            proposal_scale_ratio = proposal_mean / max(local_mean, 1e-8)
             logger.info(
-                "Loss scale stats | proposal=%.4f±%.4f | local=%.4f±%.4f | ratio=%.4f | "
-                "proposal_res/graph=%.1f | local_res/graph=%.1f",
-                proposal_mean,
-                proposal_std,
+                "Local crop stats | local=%.4f±%.4f | source_res/graph=%.1f | "
+                "local_res/graph=%.1f | center_guidance=%s",
                 local_mean,
                 local_std,
-                proposal_scale_ratio,
-                float(np.mean(epoch_proposal_residues)) if epoch_proposal_residues else 0.0,
+                float(np.mean(epoch_source_residues)) if epoch_source_residues else 0.0,
                 float(np.mean(epoch_local_residues)) if epoch_local_residues else 0.0,
+                "learned_center_value" if cached_blind_pool else "prior_bootstrap",
             )
         logger.info(
             "Ranking stats | same_center=%d | wrong_center_low_clash=%d | misleading_center=%d | "
@@ -2266,15 +1515,12 @@ def train(
                 + "."
             )
 
-        # 【自适应降批】熔断 epoch 或 OOM 超阈值时降低节点预算
-        # 熔断意味着级联发生，必须立即响应
         should_reduce = (
             enable_oom_adaptive_batch
             and (epoch_fused or epoch_oom_batches >= oom_reduce_threshold)
             and current_train_max_nodes_per_batch > effective_min_train_nodes_per_batch
         )
         if should_reduce:
-            # 熔断时使用更激进的缩减（0.7x），普通 OOM 使用标准缩减
             factor = min(oom_reduce_factor, 0.7) if epoch_fused else oom_reduce_factor
             reduced_max_nodes = max(
                 int(current_train_max_nodes_per_batch * factor),
@@ -2305,9 +1551,8 @@ def train(
                 logger.info(
                     f"Updated validation sampling: {rmsd_check_batches}/{total_val_batches} batches for RMSD."
                 )
-                consecutive_clean_epochs = 0  # 降批后重置回升计数
+                consecutive_clean_epochs = 0
 
-        # 【回升机制】连续无 OOM 时逐步恢复 batch 预算
         if epoch_oom_batches == 0:
             consecutive_clean_epochs += 1
 
@@ -2345,42 +1590,14 @@ def train(
                 if rmsd_check_ratio > 0 and rmsd_check_batches < 1:
                     rmsd_check_batches = 1
 
-                consecutive_clean_epochs = 0  # 回升后重置计数
+                consecutive_clean_epochs = 0
 
-        # 验证
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # [新增] 训练结束，验证开始前的清理
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-        local_metrics_raw = compute_validation_loss(
-            model=ema_model if ema_model is not None else model,
-            matcher=matcher,
-            criterion=criterion,
-            loader=val_loader,
-            device=device,
-            epoch=epoch,
-            total_epochs=epochs,
-            max_rmsd_batches=rmsd_check_batches,
-            dataset=dataset,
-            warmup_epochs=warmup_epochs,
-            graph_builder=graph_builder,
-            collator=collator,
-            crop_radius=float(crop_radius),
-            center_proposal_weight=center_proposal_weight,
-            center_positive_radius=center_positive_radius,
-            # [修复] edge_guard 应基于实际的 val_edge_budget 并预留动态边余量
-            # 旧算法用 val_max_nodes * 60 = 360K，但批内实际边数远超该值
-            # 现在改为 val_edge_budget * 1.5，为前向传播动态边预留 50% headroom
-            edge_guard_limit=max(1, int(
-                current_val_max_nodes_per_batch * train_edge_budget_factor * 1.5
-            )),
-            ode_steps=val_ode_steps,
-        )
-        local_metrics = dict(local_metrics_raw) if isinstance(local_metrics_raw, dict) else {"val_loss": float(local_metrics_raw)}
 
         blind_eval = evaluate_topn_success(
             model=ema_model if ema_model is not None else model,
@@ -2403,6 +1620,8 @@ def train(
                 current_val_max_nodes_per_batch * train_edge_budget_factor * 1.5
             )),
             center_hit_radius=center_positive_radius,
+            crop_min_residues=crop_min_residues,
+            crop_atom_margin=crop_atom_margin,
             fusion_weights=current_fusion_weights,
             return_candidate_records=True,
         )
@@ -2427,22 +1646,18 @@ def train(
         blind_metrics["fusion_aff_weight"] = float(current_fusion_weights.get("aff_weight", 0.0))
         blind_metrics["fusion_clash_weight"] = float(current_fusion_weights.get("clash_weight", 0.0))
         blind_metrics["fusion_bias"] = float(current_fusion_weights["bias"])
-        
-        # [新增] 验证结束，下一轮开始前的清理
+
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # 提取指标
-        avg_val_loss_scalar = float(local_metrics.get("val_loss", float("nan")))
-        mean_rmsd = float(blind_metrics.get("reranked_top1_mean_best_rmsd", local_metrics.get("mean_rmsd_final", float("inf"))))
-        val_metrics = {f"local_{k}": v for k, v in local_metrics.items()}
-        val_metrics.update(blind_metrics)
+        avg_val_loss_scalar = float(blind_metrics.get("reranked_top1_mean_best_rmsd", float("nan")))
+        mean_rmsd = float(blind_metrics.get("reranked_top1_mean_best_rmsd", float("inf")))
+        val_metrics = dict(blind_metrics)
         val_metrics["val_loss"] = avg_val_loss_scalar
-        val_metrics["mean_rmsd_final"] = float(local_metrics.get("mean_rmsd_final", float("inf")))
-        val_metrics["local_val_loss"] = avg_val_loss_scalar
+        val_metrics["mean_rmsd_final"] = mean_rmsd
 
-        val_oom_batches = int(val_metrics.get("local_oom_batches", 0)) if isinstance(val_metrics, dict) else 0
+        val_oom_batches = 0
 
         if (
             enable_val_oom_adaptive_batch
@@ -2493,11 +1708,10 @@ def train(
         if not (math.isnan(avg_val_loss_scalar) or math.isinf(avg_val_loss_scalar)):
             best_val_loss = min(best_val_loss, avg_val_loss_scalar)
 
-        # ReduceLROnPlateau 已移除，scheduler 已在 Step 级自动推进
 
         logger.info(
             f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | "
-            f"Val-Local Loss: {avg_val_loss_scalar:.4f} | "
+            f"Blind TieBreak Loss: {avg_val_loss_scalar:.4f} | "
             f"Val-Blind Top1 RMSD: {mean_rmsd:.4f} | "
             f"Oracle@1<2A: {val_metrics.get('oracle_top1_success_2a', 0.0):.2f} | "
             f"Rerank@1<2A: {val_metrics.get('reranked_top1_success_2a', 0.0):.2f} | "
@@ -2507,7 +1721,7 @@ def train(
             f"OOM-blacklisted samples: {len(oom_blacklisted_pdb_ids)}"
         )
 
-        selection_metrics = _build_selection_metrics(val_metrics)
+        selection_metrics = build_selection_metrics(val_metrics)
         logger.info(
             "Checkpoint selection metrics | "
             f"Composite: {selection_metrics['composite_score']:.4f} | "
@@ -2519,7 +1733,7 @@ def train(
             f"ProposalGap: {selection_metrics['proposal_gap']:.2f} | "
             f"RankingGap: {selection_metrics['ranking_gap']:.2f} | "
             f"Mean RMSD: {selection_metrics['mean_rmsd']:.4f} | "
-            f"Val Loss: {selection_metrics['val_loss']:.4f}"
+            f"TieBreak Loss: {selection_metrics['val_loss']:.4f}"
         )
         logger.info(
             "Checkpoint selection mode | mode=%s | primary=%s | value=%.4f",
@@ -2528,20 +1742,68 @@ def train(
             selection_metrics[selected_primary_key],
         )
 
-        checkpoint = _compose_checkpoint(
+        checkpoint = compose_checkpoint(
             epoch_idx=epoch,
             avg_train_loss_value=avg_train_loss,
             val_metrics_obj=val_metrics,
             selection_metrics=selection_metrics,
+            model=model,
+            ema_model=ema_model,
+            criterion=criterion,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            best_val_loss=best_val_loss,
+            best_rmsd=best_rmsd,
+            current_fusion_weights=current_fusion_weights,
+            normalization_stats=normalization_stats,
+            run_name=run_name,
+            run_log_file=run_log_file,
+            esm_dim=esm_dim,
+            interaction_profile=interaction_profile,
+            hidden_dim=hidden_dim,
+            num_gnn_blocks=num_gnn_blocks,
+            m_dim_scalar=m_dim_scalar,
+            dropout_rate=dropout_rate,
+            lig_atom_cont_count=lig_atom_cont_count,
+            lig_mol_cont_count=lig_mol_cont_count,
+            pro_atom_cont_count=pro_atom_cont_count,
+            pro_res_cont_count=pro_res_cont_count,
+            num_rbf=num_rbf,
+            r_cutoff=r_cutoff,
+            force_cutoff=force_cutoff,
+            frame_refine_threshold=frame_refine_threshold,
+            frame_refine_temperature=frame_refine_temperature,
+            energy_guide_threshold=energy_guide_threshold,
+            energy_guide_temperature=energy_guide_temperature,
+            clash_threshold=clash_threshold,
+            clash_push_threshold=clash_push_threshold,
+            clash_push_force=clash_push_force,
+            score_clamp_min=score_clamp_min,
+            score_clamp_max=score_clamp_max,
+            force_limit=force_limit,
+            prediction_max_neighbors=prediction_max_neighbors,
+            prediction_min_max_neighbors=prediction_min_max_neighbors,
+            prediction_knn_fallback_k=prediction_knn_fallback_k,
+            r_cutoff_intra=r_cutoff_intra,
+            max_neighbors_intra=max_neighbors_intra,
+            atom_neighbor_cap=atom_neighbor_cap,
+            residue_neighbor_cap=residue_neighbor_cap,
+            residue_radius_scale=residue_radius_scale,
+            residue_radius_bias=residue_radius_bias,
+            ligand_atom_fallback_k=ligand_atom_fallback_k,
+            protein_atom_fallback_k=protein_atom_fallback_k,
+            protein_residue_fallback_k=protein_residue_fallback_k,
+            dynamic_inter_cutoff=dynamic_inter_cutoff,
+            dynamic_inter_knn_k=dynamic_inter_knn_k,
+            dynamic_residue_cutoff=dynamic_residue_cutoff,
+            dynamic_residue_knn_k=dynamic_residue_knn_k,
         )
 
-        # 1. 始终保存最新模型（作为保底）
         torch.save(checkpoint, os.path.join(save_dir, "latest_model.pt"))
 
-        # 2. Best model：Curriculum 结束后按多指标分别保存
         is_warmup = epoch < warmup_epochs
         if not is_warmup:
-            if _is_better_checkpoint(
+            if is_better_checkpoint(
                 selection_metrics,
                 best_selected_metrics,
                 primary_key=selected_primary_key,
@@ -2559,7 +1821,7 @@ def train(
                     selection_metrics["success_2a"],
                     selection_metrics["oracle_top5_success_2a"],
                 )
-            if _is_better_checkpoint(
+            if is_better_checkpoint(
                 selection_metrics,
                 best_composite_metrics,
                 primary_key="composite_score",
@@ -2575,7 +1837,7 @@ def train(
                     f"Mean RMSD={selection_metrics['mean_rmsd']:.4f}."
                 )
 
-            if _is_better_checkpoint(
+            if is_better_checkpoint(
                 selection_metrics,
                 best_success2a_metrics,
                 primary_key="success_2a",
@@ -2590,7 +1852,7 @@ def train(
                     f"Mean RMSD={selection_metrics['mean_rmsd']:.4f}."
                 )
 
-            if _is_better_checkpoint(
+            if is_better_checkpoint(
                 selection_metrics,
                 best_rmsd_metrics,
                 primary_key="mean_rmsd",
@@ -2602,11 +1864,9 @@ def train(
                 torch.save(checkpoint, os.path.join(save_dir, "best_rmsd_model.pt"))
                 logger.info(f"Saved best Mean RMSD model: {best_rmsd:.4f}")
 
-        # 3. 每 10 轮保存一个永久备份
         if (epoch + 1) % 10 == 0:
             torch.save(checkpoint, os.path.join(save_dir, f"model_epoch_{epoch+1}.pt"))
 
-        # 4. 半离线 Blind Candidate Pool 刷新
         if should_refresh_pool(
             epoch,
             refresh_every=blind_pool_refresh_every,
@@ -2633,8 +1893,11 @@ def train(
                     ode_steps=val_ode_steps,
                     warmup_epochs=warmup_epochs,
                     center_hit_radius=center_positive_radius,
+                    crop_min_residues=crop_min_residues,
+                    crop_atom_margin=crop_atom_margin,
                     max_complexes=blind_pool_max_complexes,
                     fusion_weights=current_fusion_weights,
+                    use_learned_center_scores=bool(cached_blind_pool),
                     pool_epoch=epoch,
                     generator_ckpt_id=f"epoch_{epoch}",
                 )
@@ -2643,7 +1906,7 @@ def train(
                     save_blind_pool(
                         new_pool, blind_pool_cache_dir, epoch=epoch,
                         meta={
-                            "compatibility": blind_pool_compatibility,
+                            "signature": blind_pool_signature,
                             "center_proposal_topk": center_proposal_topk,
                             "center_refine_topk": center_refine_topk,
                             "stage1_pose_samples": stage1_pose_samples,
@@ -2663,13 +1926,14 @@ def train(
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-        # 5. Replay-based reranker training: 当前模型重新打分缓存候选
         if cached_blind_pool and blind_pool_cache_rank_weight > 0:
             try:
                 import random as _rng
                 replay_dataset = BlindCandidateReplayDataset(
                     cached_blind_pool,
                     candidates_per_complex=max(4, blind_pool_pairs_per_complex * 2),
+                    positive_rmsd_threshold=2.0,
+                    hard_negative_clash_threshold=5.0,
                 )
                 if len(replay_dataset) > 0:
                     model.train()
@@ -2685,17 +1949,19 @@ def train(
                         collator=collator,
                         device=device,
                         crop_radius=float(crop_radius),
+                        crop_min_residues=crop_min_residues,
+                        crop_atom_margin=crop_atom_margin,
                         margin=pose_ranking_margin,
                         lambda_bce=blind_pool_cache_bce_weight,
                         lambda_pair=blind_pool_cache_rank_weight,
                         lambda_list=0.5,
-                        lambda_center_value=0.3,
+                        lambda_center_value=center_proposal_weight,
                         use_pose_rank_head=True,
                     )
 
                     replay_total = replay_losses["rerank_total"]
                     center_val_loss = replay_losses.get("center_value_loss", torch.tensor(0.0, device=device))
-                    combined_replay_loss = replay_total + 0.3 * center_val_loss
+                    combined_replay_loss = replay_total + center_proposal_weight * center_val_loss
 
                     if combined_replay_loss.requires_grad and combined_replay_loss.item() > 0:
                         optimizer.zero_grad()
@@ -2724,7 +1990,6 @@ def train(
 
         best_selected_updated_this_epoch = False
 
-    # 6. 训练完成后的独立测试集评估（用于最终报告/专利材料）
     if run_test_after_training:
         if len(test_set) == 0:
             logger.warning("Test set is empty; skipping final test evaluation.")
@@ -2745,34 +2010,8 @@ def train(
                         break
 
             test_loader = _build_eval_loader(test_set, configured_test_max_nodes_per_batch)
-            test_metrics_raw = compute_validation_loss(
-                model=model,
-                matcher=matcher,
-                criterion=criterion,
-                loader=test_loader,
-                device=device,
-                epoch=epochs,
-                total_epochs=epochs,
-                max_rmsd_batches=max(10_000_000, len(test_set)),
-                dataset=dataset,
-                warmup_epochs=warmup_epochs,
-                graph_builder=graph_builder,
-                collator=collator,
-                crop_radius=float(crop_radius),
-                center_proposal_weight=center_proposal_weight,
-                center_positive_radius=center_positive_radius,
-                edge_guard_limit=max(1, int(
-                    configured_test_max_nodes_per_batch * train_edge_budget_factor * eval_edge_guard_headroom
-                )),
-                ode_steps=val_ode_steps,
-            )
-            if isinstance(test_metrics_raw, dict):
-                test_metrics = {f"local_{k}": v for k, v in dict(test_metrics_raw).items()}
-                test_metrics["val_loss"] = float(test_metrics_raw.get("val_loss", float("nan")))
-            else:
-                test_metrics = {"val_loss": float(test_metrics_raw)}
-
             topn_loader = _build_eval_loader(test_set, configured_topn_max_nodes_per_batch)
+            test_metrics: dict[str, float] = {}
 
             topn_eval = evaluate_topn_success(
                 model=model,
@@ -2795,6 +2034,8 @@ def train(
                     configured_topn_max_nodes_per_batch * train_edge_budget_factor * eval_edge_guard_headroom
                 )),
                 center_hit_radius=center_positive_radius,
+                crop_min_residues=crop_min_residues,
+                crop_atom_margin=crop_atom_margin,
                 fusion_weights=current_fusion_weights,
                 return_candidate_records=True,
             )
@@ -2811,6 +2052,7 @@ def train(
             topn_metrics["fusion_bias"] = float(current_fusion_weights["bias"])
             topn_metrics["topn_edge_guard_skips"] = float(topn_eval.get("topn_edge_guard_skips", 0.0))
             topn_metrics["topn_pose_samples"] = float(topn_eval.get("topn_pose_samples", 0.0))
+            topn_metrics["val_loss"] = float(topn_metrics.get("reranked_top1_mean_best_rmsd", float("nan")))
             test_metrics.update(topn_metrics)
 
             report_dir = os.path.join(save_dir, "reports")
@@ -2821,410 +2063,3 @@ def train(
 
             logger.info(f"Saved final test report to {report_path}")
             logger.info(f"[Test Summary] {test_metrics}")
-
-
-@torch.no_grad()
-def compute_validation_loss(
-    *,
-    model: torch.nn.Module,
-    matcher: ConditionalFlowMatcher,
-    criterion: FlowMatchingLoss,
-    loader: DataLoader,
-    device: torch.device,
-    epoch: int | None = None,
-    total_epochs: int = 1,
-    max_rmsd_batches: int = 10,
-    dataset: ProteinLigandDataset | None = None,
-    warmup_epochs: int = 20,
-    graph_builder: Any | None = None,
-    collator: GraphCollator | None = None,
-    crop_radius: float = 10.0,
-    center_proposal_weight: float = 0.15,
-    center_positive_radius: float = 4.0,
-    edge_guard_limit: int | None = None,
-    ode_steps: int = 50,
-) -> dict | float:
-    """
-    验证函数：计算 Loss 并统计全量 RMSD 指标
-    """
-    model.eval()
-    total_loss = 0.0
-    all_rmsd_init: list[torch.Tensor] = []
-    all_rmsd_final: list[torch.Tensor] = []
-    all_centroid_dist: list[torch.Tensor] = []   # 质心距离
-    affinity_preds: list[torch.Tensor] = []
-    affinity_targets: list[torch.Tensor] = []
-    
-    valid_batches = 0
-    oom_batches = 0
-    edge_guard_skips = 0
-    
-    # 固定随机种子 (保持验证集生成的一致性)
-    if epoch is not None:
-        torch.manual_seed(42 + epoch)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(42 + epoch)
-
-    # 使用 tqdm 显示验证进度，按精确样本数统计
-    val_total_graphs = len(cast(Any, loader).dataset) if hasattr(loader, "dataset") else 0
-    pbar = tqdm(total=val_total_graphs, desc=f"Epoch {(epoch or 0) + 1} [Val]", leave=False, unit="graphs")
-
-    if graph_builder is None or collator is None:
-        raise ValueError("graph_builder and collator are required for runtime local cropping.")
-
-    for i, batch in enumerate(loader):
-        num_graphs = int(batch["ligand_atom"].batch.max().item()) + 1
-        pbar.update(num_graphs)
-
-        if edge_guard_limit is not None:
-            total_edges_cpu = 0
-            edge_types = getattr(batch, "edge_types", None)
-            if edge_types:
-                for edge_type in edge_types:
-                    edge_store = batch[edge_type]
-                    edge_index = getattr(edge_store, "edge_index", None)
-                    if edge_index is not None and edge_index.ndim == 2:
-                        total_edges_cpu += int(edge_index.size(1))
-
-            if total_edges_cpu > edge_guard_limit:
-                edge_guard_skips += 1
-                logger.warning(
-                    f"Validation batch {i}: preflight skip due to edge-heavy batch "
-                    f"(total_edges={total_edges_cpu} > limit={edge_guard_limit})."
-                )
-                continue
-
-        try:
-            ligand_centers = scatter_mean(
-                batch["ligand_atom"].pos,
-                batch["ligand_atom"].batch,
-                dim=0,
-                dim_size=num_graphs,
-            )
-            proposal_loss = compute_proposal_loss(
-                model,
-                batch,
-                device=device,
-                positive_radius=center_positive_radius,
-            )
-            local_batch = build_local_batch_from_centers(
-                batch,
-                centers=ligand_centers,
-                crop_radius=crop_radius,
-                graph_builder=graph_builder,
-                collator=collator,
-            )
-            batch = local_batch.to(device)
-            crop_centers = ligand_centers.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
-            apply_loss_context(
-                batch,
-                current_epoch=epoch if epoch is not None else total_epochs - 1,
-                total_epochs_count=total_epochs,
-                warmup_epochs_count=warmup_epochs,
-                training=False,
-            )
-            x_1 = batch["ligand_atom"].pos
-
-            # 1. 计算 Loss (用于早停和模型选择)
-            t, x_t, targets = matcher.sample_location_and_target(
-                x_1=x_1,
-                data=batch,
-                current_epoch=epoch if epoch is not None else 0,
-                total_epochs=total_epochs,
-                placement_centers=crop_centers,
-            )
-
-            batch["ligand_atom"].pos = x_t
-            batch.t = t  # 注入时间步，供 Loss 时间掩码使用
-
-            predictions = model(batch, t)
-
-            # matcher 已返回分解好的 SE(3) 目标，直接补全结合能
-            targets["binding_affinity_target"] = batch.get("y_energy", None)
-            targets["pose_quality_target"] = compute_pose_quality_target(x_t, x_1, batch["ligand_atom"].batch)
-
-            loss_dict = criterion(predictions, targets, batch)
-            loss = loss_dict["total"] + center_proposal_weight * proposal_loss
-            
-            # 过滤爆炸 Loss
-            if not torch.isnan(loss) and not torch.isinf(loss) and loss.item() < 1e6:
-                total_loss += loss.item()
-                valid_batches += 1
-                
-            # [新增] 收集亲和力预测 (用于计算 RMSE/Pearson/Spearman)
-            # 与 losses.py 保持一致：仅在 t > 0.8 时收集，避免噪声位姿下的能量预测污染统计
-            if not torch.isnan(loss) and not torch.isinf(loss) and loss.item() < 1e6:
-                # 遵循 losses.py 中的物理约束阈值
-                if t is not None:
-                    valid_mask = t > 0.8
-                else:
-                    valid_mask = torch.ones_like(batch.get("y_energy", torch.zeros(1)), dtype=torch.bool)
-                
-                if valid_mask.any():
-                    pred_aff = predictions.get("binding_affinity", None)
-                    if pred_aff is not None:
-                        # 仅选取 t > 0.5 的预测值
-                        pred_aff_valid = pred_aff[valid_mask]
-                        # 双重检查：预测值本身也不能含 NaN
-                        if not torch.isnan(pred_aff_valid).any():
-                            affinity_preds.append(pred_aff_valid.cpu())
-                            # target 统一为 raw（若已提供 raw 则直接用，否则做一次反归一化）
-                            if hasattr(batch, "y_energy_raw"):
-                                target_raw_valid = batch.y_energy_raw[valid_mask]
-                                affinity_targets.append(target_raw_valid.cpu())
-                            else:
-                                y_norm = batch.get("y_energy", None)
-                                if y_norm is not None and dataset is not None:
-                                    target_raw_valid = dataset.denormalize_affinity(y_norm[valid_mask].cpu())
-                                    affinity_targets.append(target_raw_valid)
-            
-            # 2. 全量 RMSD 推演
-            # -----------------------------------------------------------
-            if i < max_rmsd_batches:
-                try:
-                    # 克隆数据用于推演
-                    infer_batch = batch.clone()
-                    infer_batch["ligand_atom"].pos = x_1 
-                    
-                    # 验证始终使用全难度扰动（与最终推理条件一致）
-                    x_0_infer = matcher._generate_random_pose(
-                        x_ref=x_1,
-                        batch=infer_batch["ligand_atom"].batch,
-                        B=int(infer_batch["ligand_atom"].batch.max().item()) + 1,
-                        masses=infer_batch["ligand_atom"].masses,
-                        torsion_indices=getattr(infer_batch, "torsion_indices", None),
-                        torsion_moving_mask=getattr(infer_batch, "torsion_moving_mask", None),
-                        seed_pos=infer_batch["ligand_atom"].get("start_pos", None),
-                        protein_pos=infer_batch["protein_atom"].pos,
-                        protein_batch=getattr(infer_batch["protein_atom"], "batch", None),
-                        placement_centers=crop_centers,
-                        epoch=warmup_epochs,
-                    )
-                    
-                    # 记录初始 RMSD
-                    sq_diff_init = ((x_0_infer - x_1) ** 2).sum(dim=-1)
-                    msd_init = scatter_mean(sq_diff_init, infer_batch["ligand_atom"].batch, dim=0)
-                    rmsd_init = torch.sqrt(msd_init)
-                    # [修改] 强制转 CPU，切断 GPU 显存占用
-                    all_rmsd_init.append(rmsd_init.detach().cpu())
-
-                    infer_batch["ligand_atom"].pos = x_0_infer
-                    final_pos, _ = matcher.ode_solve(
-                        model=model,
-                        data=infer_batch,
-                        steps=ode_steps,
-                        method="euler",
-                        store_trajectory=False,
-                    )
-                    
-                    # 记录最终 RMSD
-                    sq_diff_final = ((final_pos - x_1) ** 2).sum(dim=-1)
-                    msd_final = scatter_mean(sq_diff_final, infer_batch["ligand_atom"].batch, dim=0)
-                    rmsd_final = torch.sqrt(msd_final)
-                    all_rmsd_final.append(rmsd_final.detach().cpu())
-
-                    # 记录质心距离（Centroid Distance）
-                    B_infer = int(infer_batch["ligand_atom"].batch.max().item()) + 1
-                    pred_centroid = scatter_mean(final_pos, infer_batch["ligand_atom"].batch, dim=0, dim_size=B_infer)
-                    true_centroid = scatter_mean(x_1, infer_batch["ligand_atom"].batch, dim=0, dim_size=B_infer)
-                    centroid_dist = torch.norm(pred_centroid - true_centroid, dim=-1)  # [B_infer]
-                    all_centroid_dist.append(centroid_dist.detach().cpu())
-
-                    del infer_batch, x_0_infer, final_pos, sq_diff_init, msd_init, rmsd_init
-                    del sq_diff_final, msd_final, rmsd_final, pred_centroid, true_centroid, centroid_dist
-                    
-                except Exception as e:
-                    logger.warning(f"RMSD inference failed for batch {i}: {e}")
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-            # -----------------------------------------------------------
-
-        except torch.cuda.OutOfMemoryError:
-            oom_batches += 1
-            logger.warning(f"Validation batch {i}: CUDA OOM, skipping and clearing cache.")
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            continue
-
-        except Exception as e:
-            logger.warning(f"Validation batch failed: {e}")
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            continue
-
-        del predictions, targets, loss_dict, loss, x_1, x_t, t, batch, proposal_loss, ligand_centers, local_batch, crop_centers
-
-    # ========== 综合评估指标计算 ==========
-    metrics: dict[str, float] = {}
-
-    # --- 亲和力预测指标 ---
-    pearson_r = 0.0
-    spearman_rho = 0.0
-    rmse_val = float("inf")
-    mae_val = float("inf")
-
-    if len(affinity_preds) > 0 and dataset is not None:
-        cat_preds = torch.cat(affinity_preds).view(-1)
-        cat_targets = torch.cat(affinity_targets).view(-1)
-        
-        # 模型输出是 norm，验证时仅在这里做一次反归一化
-        raw_preds: torch.Tensor = dataset.denormalize_affinity(cat_preds)
-        
-        mse_val = F.mse_loss(raw_preds, cat_targets)
-        rmse_val = torch.sqrt(mse_val).item()
-        mae_val = F.l1_loss(raw_preds, cat_targets).item()
-
-        # Pearson R（线性相关性，对应 CASF-2016 Scoring Power）
-        # Spearman ρ（排序一致性，对应 CASF-2016 Ranking Power）
-        pred_np = raw_preds.numpy()
-        target_np = cat_targets.numpy()
-        if len(pred_np) > 2 and np.std(pred_np) > 1e-6:
-            pearson_res = scipy_stats.pearsonr(pred_np, target_np)
-            spearman_res = scipy_stats.spearmanr(pred_np, target_np)
-            pearson_r = float(cast(Any, pearson_res)[0])
-            spearman_rho = float(cast(Any, spearman_res)[0])
-        
-        logger.info(f"[Validation Affinity] RMSE: {rmse_val:.4f} pKd | MAE: {mae_val:.4f} pKd")
-        logger.info(f"  Pearson R: {pearson_r:.4f} | Spearman ρ: {spearman_rho:.4f}")
-
-    metrics["affinity_rmse"] = rmse_val
-    metrics["affinity_mae"] = mae_val
-    metrics["pearson_r"] = pearson_r
-    metrics["spearman_rho"] = spearman_rho
-
-    # --- 对接精度指标 ---
-    mean_final = float("inf")
-    median_final = float("inf")
-    success_2a = 0.0
-    success_5a = 0.0
-    mean_centroid = float("inf")
-    median_centroid = float("inf")
-
-    if len(all_rmsd_final) > 0:
-        cat_rmsd_init = torch.cat(all_rmsd_init)
-        cat_rmsd_final = torch.cat(all_rmsd_final)
-        
-        mean_init = cat_rmsd_init.mean().item()
-        mean_final = cat_rmsd_final.mean().item()
-        median_final = cat_rmsd_final.median().item()
-        
-        # 成功率（多阈值）
-        success_2a = (cat_rmsd_final < 2.0).float().mean().item() * 100
-        success_5a = (cat_rmsd_final < 5.0).float().mean().item() * 100
-
-        # 质心距离
-        if len(all_centroid_dist) > 0:
-            cat_centroid = torch.cat(all_centroid_dist)
-            mean_centroid = cat_centroid.mean().item()
-            median_centroid = cat_centroid.median().item()
-        
-        logger.info("-" * 60)
-        logger.info(f"[Validation Full Stats] Epoch {(epoch or 0) + 1}")
-        logger.info(f"  Mean RMSD: {mean_init:.2f} -> {mean_final:.2f} Å | Median: {median_final:.2f} Å")
-        logger.info(f"  Success Rate (<2Å): {success_2a:.2f}% | (<5Å): {success_5a:.2f}%")
-        logger.info(f"  Centroid Distance: Mean {mean_centroid:.2f} Å | Median {median_centroid:.2f} Å")
-        logger.info("-" * 60)
-
-    metrics["mean_rmsd_final"] = mean_final
-    metrics["median_rmsd_final"] = median_final
-    metrics["success_2a"] = success_2a
-    metrics["success_5a"] = success_5a
-    metrics["single_shot_success_2a"] = success_2a
-    metrics["single_shot_success_5a"] = success_5a
-    metrics["centroid_dist_mean"] = mean_centroid
-    metrics["centroid_dist_median"] = median_centroid
-    metrics["oom_batches"] = float(oom_batches)
-    metrics["valid_batches"] = float(valid_batches)
-    metrics["edge_guard_skips"] = float(edge_guard_skips)
-
-    if valid_batches == 0:
-        metrics["val_loss"] = float("nan")
-        return metrics
-
-    # 显式清理现场
-    del all_rmsd_init, all_rmsd_final, all_centroid_dist
-    del affinity_preds, affinity_targets
-    
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-
-    metrics["val_loss"] = total_loss / valid_batches
-    return metrics
-
-
-@torch.no_grad()
-def evaluate_topn_success(
-    *,
-    model: torch.nn.Module,
-    matcher: ConditionalFlowMatcher,
-    loader: DataLoader,
-    device: torch.device,
-    graph_builder: Any,
-    collator: GraphCollator,
-    topk_values: tuple[int, ...] = (1, 5, 10),
-    num_pose_samples: int = 10,
-    center_topk: int = 8,
-    refine_topk: int = 3,
-    center_nms_radius: float = 6.0,
-    stage1_pose_samples: int = 2,
-    stage2_pose_samples: int = 4,
-    crop_radius: float = 10.0,
-    ode_steps: int = 50,
-    warmup_epochs: int = 20,
-    edge_guard_limit: int | None = None,
-    center_hit_radius: float = 4.0,
-    fusion_weights: dict[str, float] | None = None,
-    return_candidate_records: bool = False,
-) -> dict[str, Any]:
-    """基于统一候选生成引擎的 Top-N 对接成功率评估。"""
-
-    topk_unique = tuple(sorted({int(k) for k in topk_values if int(k) > 0}))
-    if not topk_unique:
-        raise ValueError("topk_values must contain at least one positive integer")
-
-    candidate_records = generate_candidates_from_loader(
-        model=model,
-        matcher=matcher,
-        loader=loader,
-        device=device,
-        graph_builder=graph_builder,
-        collator=collator,
-        center_topk=center_topk,
-        refine_topk=refine_topk,
-        center_nms_radius=center_nms_radius,
-        stage1_pose_samples=stage1_pose_samples,
-        stage2_pose_samples=stage2_pose_samples,
-        crop_radius=crop_radius,
-        ode_steps=ode_steps,
-        warmup_epochs=warmup_epochs,
-        center_hit_radius=center_hit_radius,
-        fusion_weights=fusion_weights,
-        edge_guard_limit=edge_guard_limit,
-    )
-
-    total_graphs = len(candidate_records)
-    total_pose_budget = center_topk * stage1_pose_samples + refine_topk * stage2_pose_samples
-
-    if total_graphs == 0:
-        result: dict[str, Any] = {"topn_total_graphs": 0.0}
-        if return_candidate_records:
-            result["candidate_records"] = []
-        return result
-
-    metrics: dict[str, Any] = {
-        "topn_total_graphs": float(total_graphs),
-        "topn_pose_samples": float(total_pose_budget),
-        "topn_edge_guard_skips": 0.0,
-    }
-    metrics.update(
-        summarize_blind_candidate_records(
-            candidate_records,
-            topk_values=topk_unique,
-            fusion_weights=fusion_weights,
-        )
-    )
-    if return_candidate_records:
-        metrics["candidate_records"] = candidate_records
-    return metrics

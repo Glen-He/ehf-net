@@ -1,16 +1,17 @@
 """
-流匹配损失函数
+训练损失模块。
 
-移除同方差不确定性加权，采用静态几何尺度平衡。
-直接在 SE(3) x T^m 切空间计算 Huber Loss。
+负责计算流匹配训练中的各项损失，
+并管理课程权重与时间门控逻辑。
 """
 
+
 import logging
+from typing import Any
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from typing import Any
 from torch import Tensor
 
 
@@ -19,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 class FlowMatchingLoss(nn.Module):
     """
-    流匹配损失函数
+    流匹配损失函数。
 
     直接对平移、旋转、扭转的切向量进行监督。
     包含时间步 t 掩码机制，确保物理头仅在有效范围内优化。
@@ -27,24 +28,40 @@ class FlowMatchingLoss(nn.Module):
 
     def __init__(
         self,
-        characteristic_scale: float = 5.0,
-        weight_trans: float = 1.0,
-        weight_rot: float = 1.0,
-        weight_torsion: float = 0.2,
-        weight_energy: float = 0.05,
-        weight_clash: float = 0.001,  # 初始极小权重：clash_batch 量级 O(10²)，须防止压垮 SE(3) 损失
-        weight_pose_quality: float = 0.1,
+        characteristic_scale: float,
+        weight_trans: float,
+        *,
+        weight_rot: float,
+        weight_torsion: float,
+        weight_energy: float,
+        weight_clash: float,
+        weight_pose_quality: float,
+        curriculum_weights: dict[str, dict[str, float]],
+        refine_start: float,
+        pose_gate_epoch_start: float,
+        pose_gate_epoch_end: float,
+        pose_gate_tau_start: float,
+        pose_gate_tau_end: float,
+        pose_gate_temperature: float,
     ) -> None:
         """
-        初始化损失函数。
+        初始化流匹配损失函数。
 
         Args:
-            characteristic_scale: 特征长度尺度 L (Å)，用于平衡旋转和平移的量纲。
+            characteristic_scale: 平衡平移与旋转量纲的特征长度尺度。
             weight_trans: 平移损失权重。
             weight_rot: 旋转损失权重。
-            weight_torsion: 扭转角损失权重。
-            weight_energy: 结合能损失权重。
-            weight_clash: 位阻惩罚权重，初始极小防止压垮 SE(3) 损失。
+            weight_torsion: 扭转损失权重。
+            weight_energy: 亲和力损失权重。
+            weight_clash: 位阻损失权重。
+            weight_pose_quality: 构象质量损失权重。
+            curriculum_weights: 课程学习各阶段的损失权重配置。
+            refine_start: 进入细化阶段时对应的训练进度阈值。
+            pose_gate_epoch_start: 构象相关损失开始打开门控的训练进度。
+            pose_gate_epoch_end: 构象相关损失完全打开门控的训练进度。
+            pose_gate_tau_start: 构象门控在初期使用的时间阈值。
+            pose_gate_tau_end: 构象门控在后期使用的时间阈值。
+            pose_gate_temperature: 构象时间门控的温度系数。
         """
         super().__init__()
 
@@ -59,32 +76,13 @@ class FlowMatchingLoss(nn.Module):
             "pose_quality": weight_pose_quality,
         }
 
-        self.curriculum_weights = {
-            "coarse": {
-                "trans": 1.2,
-                "rot": 0.8,
-                "torsion": 0.05,
-                "energy": 0.0,
-                "clash": 0.0,
-                "pose_quality": 0.02,
-            },
-            "transition": {
-                "trans": 1.0,
-                "rot": 1.0,
-                "torsion": 0.25,
-                "energy": 0.08,
-                "clash": 0.01,
-                "pose_quality": 0.10,
-            },
-            "refine": {
-                "trans": 0.8,
-                "rot": 1.2,
-                "torsion": 0.6,
-                "energy": 0.20,
-                "clash": 0.03,
-                "pose_quality": 0.20,
-            },
-        }
+        self.curriculum_weights = curriculum_weights
+        self.refine_start = float(refine_start)
+        self.pose_gate_epoch_start = float(pose_gate_epoch_start)
+        self.pose_gate_epoch_end = float(pose_gate_epoch_end)
+        self.pose_gate_tau_start = float(pose_gate_tau_start)
+        self.pose_gate_tau_end = float(pose_gate_tau_end)
+        self.pose_gate_temperature = float(pose_gate_temperature)
         self._energy_nan_warn_count = 0
 
     @staticmethod
@@ -92,7 +90,23 @@ class FlowMatchingLoss(nn.Module):
         return max(0.0, min(1.0, float(value)))
 
     @staticmethod
-    def _lerp_dict(start: dict[str, float], end: dict[str, float], alpha: float) -> dict[str, float]:
+    def _lerp_dict(
+        start: dict[str, float],
+        end: dict[str, float],
+        *,
+        alpha: float,
+    ) -> dict[str, float]:
+        """
+        按 alpha 在 start 与 end 之间线性插值，键集合以 start 为准。
+
+        Args:
+            start: 起始权重字典。
+            end: 终止权重字典。
+            alpha: 插值系数，[0, 1] 外会被截断。
+
+        Returns:
+            dict[str, float]: 插值后的权重字典。
+        """
         alpha = max(0.0, min(1.0, float(alpha)))
         return {
             key: float(start[key] + (end[key] - start[key]) * alpha)
@@ -100,7 +114,7 @@ class FlowMatchingLoss(nn.Module):
         }
 
     @staticmethod
-    def _smoothstep(edge0: float, edge1: float, value: float) -> float:
+    def _smoothstep(edge0: float, edge1: float, *, value: float) -> float:
         if edge1 <= edge0:
             return 1.0 if value >= edge1 else 0.0
         t = (value - edge0) / (edge1 - edge0)
@@ -110,14 +124,14 @@ class FlowMatchingLoss(nn.Module):
     def _get_loss_schedule(self, data: Any) -> dict[str, float]:
         progress = self._clamp_progress(getattr(data, "loss_progress", 0.0))
         warmup_end = self._clamp_progress(getattr(data, "loss_warmup_end", 0.2))
-        refine_start = 0.70
+        refine_start = self._clamp_progress(self.refine_start)
 
         if progress <= warmup_end:
             alpha = 1.0 if warmup_end <= 1e-8 else progress / max(warmup_end, 1e-8)
             schedule = self._lerp_dict(
                 self.curriculum_weights["coarse"],
                 self.curriculum_weights["transition"],
-                alpha,
+                alpha=alpha,
             )
         elif progress <= refine_start:
             schedule = dict(self.curriculum_weights["transition"])
@@ -126,21 +140,29 @@ class FlowMatchingLoss(nn.Module):
             schedule = self._lerp_dict(
                 self.curriculum_weights["transition"],
                 self.curriculum_weights["refine"],
-                alpha,
+                alpha=alpha,
             )
 
-        # 用户传入的 self.weights 作为 curriculum 的全局倍率
         return {k: schedule[k] * self.weights.get(k, 1.0) for k in schedule}
 
     def _get_pose_focus_gate(self, data: Any, t_val: Tensor | None, *, device: torch.device, dtype: torch.dtype) -> Tensor:
         progress = self._clamp_progress(getattr(data, "loss_progress", 0.0))
-        epoch_gate = self._smoothstep(0.15, 0.85, progress)
+        epoch_gate = self._smoothstep(
+            self.pose_gate_epoch_start,
+            self.pose_gate_epoch_end,
+            value=progress,
+        )
 
         if t_val is None:
             return torch.tensor(epoch_gate, device=device, dtype=dtype)
 
-        tau = 0.90 - 0.25 * progress
-        pose_gate = torch.sigmoid((t_val.to(dtype=dtype) - tau) / 0.07)
+        tau = self.pose_gate_tau_start + (
+            self.pose_gate_tau_end - self.pose_gate_tau_start
+        ) * progress
+        pose_gate = torch.sigmoid(
+            (t_val.to(dtype=dtype) - tau)
+            / max(self.pose_gate_temperature, 1e-6)
+        )
         return pose_gate * epoch_gate
 
     def forward(
@@ -153,12 +175,15 @@ class FlowMatchingLoss(nn.Module):
         计算损失。
 
         Args:
-            predictions: 预测结果字典。
-            targets: 目标值字典。
-            data: 数据批次对象。
+            predictions: 模型前向传播返回的预测结果字典。
+            targets: 与预测字段对齐的监督目标张量字典。
+            data: 当前处理的图数据对象。
 
         Returns:
-            损失字典。
+            dict[str, Tensor]: 返回各项损失分量及总损失组成的结果字典。
+
+        Raises:
+            ValueError: 当输入参数或运行时状态不满足要求时抛出。
         """
 
         loss_dict: dict[str, Tensor] = {}
@@ -171,7 +196,6 @@ class FlowMatchingLoss(nn.Module):
         device = pred_trans.device
         schedule = self._get_loss_schedule(data)
 
-        # 1. 平移损失
         gt_trans = targets.get("v_trans_target")
 
         if gt_trans is None:
@@ -180,7 +204,6 @@ class FlowMatchingLoss(nn.Module):
         loss_trans = F.huber_loss(pred_trans, gt_trans, delta=1.0)
         loss_dict["loss_trans"] = loss_trans.detach()
 
-        # 2. 旋转损失
         pred_rot = predictions.get("v_rotation")
         gt_rot = targets.get("v_rot_target")
 
@@ -190,7 +213,6 @@ class FlowMatchingLoss(nn.Module):
         loss_rot = F.huber_loss(pred_rot * self.L, gt_rot * self.L, delta=1.0)
         loss_dict["loss_rot"] = loss_rot.detach()
 
-        # 3. 扭转损失（周期性余弦损失）
         loss_torsion = torch.tensor(0.0, device=device)
         pred_tor = predictions.get("v_torsion")
         gt_tor = targets.get("v_torsion_target")
@@ -203,18 +225,14 @@ class FlowMatchingLoss(nn.Module):
             if gt_tor.dim() == 1:
                 gt_tor = gt_tor.view(-1, 1)
 
-            # 物理周期性损失：1 - cos(pred - target)
-            # 自动处理 -π/+π 等价性，输出严格有界 [0, 2]，杜绝梯度爆炸
             cos_diff = 1.0 - torch.cos(pred_tor - gt_tor)
             loss_torsion = torch.mean(cos_diff) * (self.L / 2.0)
 
-        # NaN 守卫（理论上 cos_diff 有界，但防御性保留）
         if torch.isnan(loss_torsion.detach()):
             loss_torsion = torch.tensor(0.0, device=device)
 
         loss_dict["loss_torsion"] = loss_torsion.detach()
 
-        # 4. 物理亲和力损失 (带时间掩码)
         loss_energy = torch.tensor(0.0, device=device)
         energy_nan_skipped = torch.tensor(0.0, device=device)
         pred_affinity = predictions.get("binding_affinity")
@@ -222,7 +240,6 @@ class FlowMatchingLoss(nn.Module):
 
         if pred_affinity is not None and gt_affinity is not None:
 
-            # NaN 守卫：预测头在训练初期可能因权重随机而输出 NaN，直接跳过避免污染梯度
             if not torch.isfinite(pred_affinity).all() or not torch.isfinite(gt_affinity).all():
                 energy_nan_skipped = torch.tensor(1.0, device=device)
                 self._energy_nan_warn_count += 1
@@ -252,7 +269,6 @@ class FlowMatchingLoss(nn.Module):
                     if gate_sum > 1e-8:
                         loss_energy = (per_sample_energy * pose_focus_gate).sum() / gate_sum
                 else:
-                    # 兼容性回退：无时间步信息时直接计算
                     loss_energy = F.huber_loss(
                         pred_affinity.view(-1), gt_affinity.view(-1), delta=2.0
                     )
@@ -260,9 +276,6 @@ class FlowMatchingLoss(nn.Module):
         loss_dict["loss_energy"] = loss_energy.detach()
         loss_dict["energy_nan_skipped"] = energy_nan_skipped.detach()
 
-        # 5. 位阻惩罚损失（时间感知动态惩罚 Time-Aware Dynamic Penalty）
-        # 使用 t⁴ 平滑曲线取代硬阈值 t>0.8，让惩罚在后期（配体已进入口袋）时急剧上升，
-        # 同时避免阈值跳变导致的梯度不连续震荡
         loss_clash = torch.tensor(0.0, device=device)
         clash_batch = predictions.get("steric_clash_batch")
 
@@ -320,7 +333,6 @@ class FlowMatchingLoss(nn.Module):
         loss_dict["weight_clash"] = torch.tensor(schedule["clash"], device=device)
         loss_dict["weight_pose_quality"] = torch.tensor(schedule["pose_quality"], device=device)
 
-        # 6. 总损失
         total_loss = (
             schedule["trans"] * loss_trans
             + schedule["rot"] * loss_rot

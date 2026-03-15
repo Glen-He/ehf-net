@@ -1,15 +1,17 @@
 """
-节点嵌入层
+嵌入层工具。
 
-提供各类节点（原子、分子、残基、口袋）的嵌入层实现。
+负责时间、原子、残基和分子级特征嵌入，
+为编码器提供统一的隐藏表示输入。
 """
+
 
 import math
 import torch
 
 from torch import nn, Tensor
 
-from ehfnet.encoders.feature_specs import (
+from ehfnet.data.featurizers import (
     CatFeature,
     LIGAND_ATOM_CAT_SCHEMA,
     PROTEIN_ATOM_CAT_SCHEMA,
@@ -25,16 +27,22 @@ from ehfnet.encoders.feature_specs import (
 
 class TimeEmbedding(nn.Module):
     """
-    时间嵌入模块
+    时间嵌入模块。
 
-    将标量时间 t 映射到高维向量，采用固定正弦/余弦频率嵌入 + MLP。
+    将连续时间步映射为高维隐藏表示，
+    为流匹配训练和推理中的时间条件建模提供统一输入。
     """
 
     def __init__(self, dim: int, hidden_dim: int) -> None:
         """
+        初始化对象。
+
         Args:
-            dim: 正弦嵌入的维度（必须是偶数）
-            hidden_dim: MLP 的输出维度
+            dim: 维度。
+            hidden_dim: 隐藏层维度。
+
+        Raises:
+            ValueError: 当输入参数或运行时状态不满足要求时抛出。
         """
         super().__init__()
 
@@ -43,17 +51,13 @@ class TimeEmbedding(nn.Module):
 
         half_dim = dim // 2
 
-        # 计算频率：10000^(-2k/d)
-        # 为了数值稳定性，使用对数空间：exp(-log(10000) * (k / half_dim))
         exponent = -math.log(10000.0) * torch.arange(half_dim, dtype=torch.float32)
         exponent = exponent / half_dim
         freqs = torch.exp(exponent)
 
-        # register_buffer 保存常量，不参与训练
         self.register_buffer("freqs", freqs.unsqueeze(0))
         self.freqs: Tensor
 
-        # 将固定嵌入投影到隐藏维度的 MLP
         self.mlp = nn.Sequential(
             nn.Linear(dim, hidden_dim),
             nn.SiLU(),
@@ -65,29 +69,23 @@ class TimeEmbedding(nn.Module):
         前向传播
 
         Args:
-            t: 时间标量 [B]，通常在 [0, 1] 范围内
+            t: 时间步标量或向量，形状 [B] 或 [N]。
 
         Returns:
-            时间嵌入向量 [B, hidden_dim]
+            Tensor: 时间嵌入向量，形状 [B, hidden_dim]。
         """
-        # t: [B] -> [B, 1]
         t = t.unsqueeze(-1)
-
-        # args: [B, half_dim]
         args = t * self.freqs
-
-        # sinusoid: [B, dim]
         sinusoid = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
-
-        # 投影到 hidden_dim
         return self.mlp(sinusoid)
 
 
 class AtomEmbedding(nn.Module):
     """
-    通用原子嵌入基类
+    通用原子嵌入基类。
 
-    组合分类特征（Embedding）与连续特征（Linear），并拼接坐标。
+    负责融合分类特征、连续特征与坐标相关输入，
+    为配体原子和蛋白原子嵌入提供共享实现。
     """
 
     def __init__(
@@ -100,16 +98,24 @@ class AtomEmbedding(nn.Module):
         scalar_feature_count: int | None = None,
     ) -> None:
         """
+        初始化通用原子嵌入层。
+
+        配置分类特征嵌入、连续特征投影和归一化逻辑，
+        作为配体与蛋白原子嵌入的共享基础实现。
+
         Args:
-            cat_schema: 分类特征配置列表
-            cont_feature_count: 连续特征数量
-            hidden_dim: 隐藏层维度
-            stats: 统计数据字典，包含 mean 和 std (用于标准化)
+            cat_schema: catschema。
+            cont_feature_count: cont特征的数量。
+            hidden_dim: 隐藏层维度。
+            stats: 统计量。
+            scalar_feature_count: scalar特征的数量。
+
+        Raises:
+            ValueError: 当输入参数或运行时状态不满足要求时抛出。
         """
 
         super().__init__()
 
-        # 分类特征嵌入
         self.embedding_layers = nn.ModuleList()
         total_categorical_dim = 0
 
@@ -120,7 +126,7 @@ class AtomEmbedding(nn.Module):
                 )
             )
             total_categorical_dim += feat.embed_dim
-        
+
         self.scalar_feature_count = (
             cont_feature_count if scalar_feature_count is None else int(scalar_feature_count)
         )
@@ -170,7 +176,6 @@ class AtomEmbedding(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # 这是一个可学习的向量，给每种类型的原子打上一个“身份标签”
         self.source_type_embedding = nn.Parameter(torch.randn(1, hidden_dim) * 0.02)
 
         self.output_dim = 3 + hidden_dim
@@ -182,9 +187,9 @@ class AtomEmbedding(nn.Module):
         前向传播
 
         Args:
-            x_cat: 离散特征 [N, num_cat_features]
-            x_cont: 连续特征 [N, num_cont_features]
-            pos: 原子坐标 [N, 3]
+            x_cat: xcat。
+            x_cont: xcont。
+            pos: 节点坐标张量。
 
         Returns:
             拼接坐标后的原子特征 [N, 3 + hidden_dim]
@@ -211,22 +216,37 @@ class AtomEmbedding(nn.Module):
 
         full_features = torch.cat(feature_list, dim=-1)
         projected_features = self.projection_mlp(full_features)
-        
-        # 添加来源类型标签（每个子类实例有独立的参数）
-        projected_features = projected_features + self.source_type_embedding
 
-        # 输出形状：[N, 3 + hidden_dim]
+        projected_features = projected_features + self.source_type_embedding
         return torch.cat([pos, projected_features], dim=-1)
 
 
 class LigandAtomEmbedding(AtomEmbedding):
     """
-    配体原子嵌入
+    配体原子嵌入层。
 
-    基于 AtomEmbedding，对配体原子特征进行编码。
+    基于通用原子嵌入逻辑编码配体原子特征，
+    为主干编码器提供配体侧节点初始表示。
     """
 
-    def __init__(self, cont_feature_count: int, hidden_dim: int, stats: dict | None = None) -> None:
+    def __init__(
+        self,
+        cont_feature_count: int,
+        hidden_dim: int,
+        *,
+        stats: dict | None = None,
+    ) -> None:
+        """
+        初始化配体原子嵌入层。
+
+        基于通用原子嵌入层配置配体特征输入，
+        为配体原子节点生成初始隐藏表示。
+
+        Args:
+            cont_feature_count: 连续特征数量。
+            hidden_dim: 隐藏层维度。
+            stats: 归一化统计量，含 mean/std。
+        """
         super().__init__(
             LIGAND_ATOM_CAT_SCHEMA,
             cont_feature_count,
@@ -238,12 +258,30 @@ class LigandAtomEmbedding(AtomEmbedding):
 
 class ProteinAtomEmbedding(AtomEmbedding):
     """
-    蛋白质原子嵌入
+    蛋白原子嵌入层。
 
-    基于 AtomEmbedding，对蛋白质原子特征进行编码。
+    基于通用原子嵌入逻辑编码蛋白原子特征，
+    为蛋白原子层消息传递提供初始表示。
     """
 
-    def __init__(self, cont_feature_count: int, hidden_dim: int, stats: dict | None = None) -> None:
+    def __init__(
+        self,
+        cont_feature_count: int,
+        hidden_dim: int,
+        *,
+        stats: dict | None = None,
+    ) -> None:
+        """
+        初始化蛋白原子嵌入层。
+
+        基于通用原子嵌入层配置蛋白特征输入，
+        为蛋白原子节点生成初始隐藏表示。
+
+        Args:
+            cont_feature_count: 连续特征数量。
+            hidden_dim: 隐藏层维度。
+            stats: 归一化统计量，含 mean/std。
+        """
         super().__init__(
             PROTEIN_ATOM_CAT_SCHEMA,
             cont_feature_count,
@@ -255,21 +293,33 @@ class ProteinAtomEmbedding(AtomEmbedding):
 
 class LigandMoleculeEmbedding(nn.Module):
     """
-    配体分子嵌入
+    配体分子嵌入层。
 
-    仅对连续特征进行线性投影。
+    对配体分子级连续特征进行投影编码，
+    为分子级全局节点提供可与其他层级交互的隐藏表示。
     """
 
-    def __init__(self, cont_feature_count: int, hidden_dim: int, stats: dict | None = None) -> None:
+    def __init__(
+        self,
+        cont_feature_count: int,
+        hidden_dim: int,
+        *,
+        stats: dict | None = None,
+    ) -> None:
         """
+        初始化配体分子嵌入层。
+
         Args:
-            cont_feature_count: 连续特征数量
-            hidden_dim: 隐藏层维度
-            stats: 统计数据字典
+            cont_feature_count: 连续特征数量。
+            hidden_dim: 隐藏层维度。
+            stats: 归一化统计量，含 mean/std。
+
+        Raises:
+            ValueError: 当 stats 维度与 cont_feature_count 不匹配时抛出。
         """
         super().__init__()
         self.output_dim = hidden_dim
-        
+
         if stats is not None:
             mean = stats["mean"]
             std = stats["std"] + 1e-6
@@ -293,13 +343,12 @@ class LigandMoleculeEmbedding(nn.Module):
         前向传播
 
         Args:
-            x_cont: 连续特征 [M, num_cont_features]
+            x_cont: 配体分子连续特征，形状 [M, cont_feature_count]。
 
         Returns:
-            投影后的分子特征 [M, hidden_dim]
+            Tensor: 投影后的分子特征，形状 [M, hidden_dim]。
         """
 
-        # 标准化连续特征 (Z-Score)
         if hasattr(self, "mean"):
             x_cont = (x_cont - self.mean) / self.std
 
@@ -308,19 +357,30 @@ class LigandMoleculeEmbedding(nn.Module):
 
 class ProteinResidueEmbedding(nn.Module):
     """
-    蛋白质残基嵌入
+    蛋白残基嵌入层。
 
-    将 residue 的几何/有效性/segment 特征与 ESM 特征分支编码后再融合。
+    融合残基几何特征、有效性特征与 ESM 特征分支，
+    生成残基层消息传递和中心提议使用的输入表示。
     """
 
-    def __init__(self, cont_feature_count: int, hidden_dim: int, stats: dict | None = None) -> None:
+    def __init__(
+        self,
+        cont_feature_count: int,
+        hidden_dim: int,
+        *,
+        stats: dict | None = None,
+    ) -> None:
         """
-        Args:
-            cont_feature_count: 连续特征数量（包含扭转角 sin/cos + ESM embeddings）
-            hidden_dim: 隐藏层维度
-            stats: 统计数据字典
-        """
+        初始化蛋白残基嵌入层。
 
+        Args:
+            cont_feature_count: 连续特征数量（含 ESM 维度）。
+            hidden_dim: 隐藏层维度。
+            stats: 归一化统计量，含 mean/std。
+
+        Raises:
+            ValueError: 当输入参数或运行时状态不满足要求时抛出。
+        """
         super().__init__()
 
         residue_cont_dim = len(PROTEIN_RESIDUE_CONT_SCHEMA)
@@ -340,7 +400,6 @@ class ProteinResidueEmbedding(nn.Module):
             torch.randn((esm_dim,), dtype=torch.float32) * 0.02
         )
 
-        # 分类特征嵌入
         config_list = PROTEIN_RESIDUE_CAT_SCHEMA
 
         self.embedding_layers = nn.ModuleList()
@@ -353,11 +412,7 @@ class ProteinResidueEmbedding(nn.Module):
                 )
             )
             total_categorical_dim += feat.embed_dim
-        
-        # residue branch 不再做 dataset z-score：
-        # - torsion 已在 [-1, 1]
-        # - observed/segment flags 是结构语义，不应按数据集分布缩放
-        # - ESM 保持独立分支，避免破坏预训练空间
+
         _ = stats
 
         self.residue_cont_norm = nn.LayerNorm(residue_cont_dim)
@@ -395,11 +450,15 @@ class ProteinResidueEmbedding(nn.Module):
         前向传播
 
         Args:
-            x_cat: 离散特征 [R, num_cat_features]
-            x_cont: 连续特征 [R, num_cont_features]
+            x_cat: xcat。
+            x_cont: xcont。
+            esm_missing_mask: esmmissingmask。
 
         Returns:
-            投影后的残基特征 [R, hidden_dim]
+            Tensor: 返回融合类别特征、连续特征和 ESM 分支后的残基嵌入表示。
+
+        Raises:
+            ValueError: 当输入参数或运行时状态不满足要求时抛出。
         """
 
         if x_cont.size(1) != self._residue_cont_dim + self._esm_dim:
@@ -448,18 +507,21 @@ class ProteinResidueEmbedding(nn.Module):
         return self.projection_mlp(full_features)
 
 
-class ProteinPocketEmbedding(nn.Module):
+class ProteinContextEmbedding(nn.Module):
     """
-    蛋白质口袋（整体）嵌入
+    蛋白上下文嵌入层。
 
-    将显式 pocket summary 特征投影到隐藏空间，并叠加可学习 token。
+    将局部上下文 summary 特征映射到隐藏空间，
+    为局部对接阶段的 context 节点提供统一表示。
     """
 
     def __init__(self, cont_feature_count: int, hidden_dim: int) -> None:
         """
+        初始化对象。
+
         Args:
-            cont_feature_count: pocket 连续特征维度
-            hidden_dim: 隐藏层维度
+            cont_feature_count: cont特征的数量。
+            hidden_dim: 隐藏层维度。
         """
 
         super().__init__()
@@ -469,7 +531,7 @@ class ProteinPocketEmbedding(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        self.initial_pocket_emb = nn.Parameter(torch.randn(1, hidden_dim) * 0.02)
+        self.initial_context_emb = nn.Parameter(torch.randn(1, hidden_dim) * 0.02)
         self.output_dim = hidden_dim
 
 
@@ -478,11 +540,11 @@ class ProteinPocketEmbedding(nn.Module):
         前向传播
 
         Args:
-            x_cont: 口袋连续特征 [N_pocket, D]
+            x_cont: xcont。
 
         Returns:
-            口袋节点嵌入 [num_nodes, hidden_dim]
+            局部上下文节点嵌入 [num_nodes, hidden_dim]
         """
 
         projected = self.projection_mlp(self.cont_norm(x_cont))
-        return projected + self.initial_pocket_emb.expand(x_cont.size(0), -1)
+        return projected + self.initial_context_emb.expand(x_cont.size(0), -1)

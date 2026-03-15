@@ -1,14 +1,14 @@
 """
-数据准备脚本
+数据整理命令入口。
 
-用法：原始数据放在 data/raw/<dataset>/（ligand/、protein/、index.csv），脚本只读不改；
-organize 把「能成功复制的」条目写入 data/processed/<dataset>/（cleaned/ + index.csv），后续预处理与训练都在 processed 下。
+负责把 raw 数据集整理为 processed 目录结构，
+并校验索引文件与基础文件布局是否完整。
 """
 
-from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 from pathlib import Path
 
 import pandas as pd
@@ -23,11 +23,11 @@ INDEX_ID_COL = "Concatenated ID"
 INDEX_AFFINITY_COL = "Log Binding Affinity"
 
 
-# ----- organize -----
+# ----- 数据整理步骤 -----
 def _copy_with_lowercase_sdf_header(src: Path, dest: Path) -> None:
-    """复制文件到 dest；若为 .sdf 则首行写为小写后写入，否则直接复制。不修改 src。"""
-    import shutil
-
+    """
+    复制文件到 dest；若为 .sdf 则首行写为小写后写入，否则直接复制，不修改 src。
+    """
     if src.suffix.lower() == ".sdf":
         with open(src, "r", encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
@@ -40,15 +40,27 @@ def _copy_with_lowercase_sdf_header(src: Path, dest: Path) -> None:
 
 
 def cmd_organize(args: argparse.Namespace) -> None:
-    """从 raw 只读，在 processed 下生成新文件。不删除、不修改 raw 下任何内容。"""
-    import shutil
+    """
+    整理原始数据到 processed 目录。
 
+    只读取 `raw` 目录中的源文件并在 `processed` 下生成新文件，
+    不会修改或删除原始数据，适合作为首次整理入口。
+
+    Args:
+        args: 命令行解析后的参数对象，包含当前命令所需的配置。
+
+    Raises:
+        FileNotFoundError: 当依赖文件不存在时抛出。
+        ValueError: 当输入参数或运行时状态不满足要求时抛出。
+    """
     raw_root = Path(args.raw_root).resolve()
     target_root = Path(args.target_root).resolve()
     index_file = Path(args.index_file).resolve()
-    # 保证不删、不改 raw：仅从 raw 读，只写 target_root 下
-    assert raw_root != target_root, "raw 与 processed 必须不同目录"
-    assert index_file.parent == raw_root, "index 须在 raw 目录下"
+    # 保证不删、不改原始目录：仅从 `raw_root` 读取，只写入 `target_root`。
+    if raw_root == target_root:
+        raise ValueError("raw_root and target_root must be different directories")
+    if index_file.parent != raw_root:
+        raise ValueError("index file must be located under raw_root")
     target_subdir = target_root / "cleaned"
     target_subdir.mkdir(parents=True, exist_ok=True)
 
@@ -58,7 +70,8 @@ def cmd_organize(args: argparse.Namespace) -> None:
     df = pd.read_csv(index_file)
     if INDEX_ID_COL not in df.columns or INDEX_AFFINITY_COL not in df.columns:
         raise ValueError(
-            f"index.csv 必须包含表头: {INDEX_ID_COL}, {INDEX_AFFINITY_COL}。当前: {df.columns.tolist()}"
+            f"index.csv must contain the headers: {INDEX_ID_COL}, {INDEX_AFFINITY_COL}. "
+            f"Current columns: {df.columns.tolist()}"
         )
     df = df.rename(columns={INDEX_ID_COL: "pdb_id", INDEX_AFFINITY_COL: "affinity"})
 
@@ -98,9 +111,10 @@ def cmd_organize(args: argparse.Namespace) -> None:
         target_pdb_dir = target_subdir / pdb_id
         target_pdb_dir.mkdir(parents=True, exist_ok=True)
         try:
-            # 仅写入 target_root 下，绝不写 raw
+            # 仅写入 `target_root`，绝不回写原始目录。
             dest_ligand = target_pdb_dir / (f"{pdb_id}_ligand{src_ligand.suffix}".lower())
-            assert str(dest_ligand.resolve()).startswith(str(target_root)), "dest 必须在 processed 下"
+            if not dest_ligand.resolve().is_relative_to(target_root):
+                raise RuntimeError("destination path must stay under target_root")
             _copy_with_lowercase_sdf_header(src_ligand, dest_ligand)
             dest_protein = target_pdb_dir / f"{pdb_id}_protein.pdb"
             shutil.copy2(src_protein, dest_protein)
@@ -122,26 +136,32 @@ STEP_ORDER = ("organize",)
 
 
 def main() -> None:
+    """
+    数据整理入口函数。
+
+    负责解析数据集名称和整理步骤，校验 raw 目录结构，
+    并将原始数据复制整理到统一的 processed 目录布局。
+    """
     parser = argparse.ArgumentParser(
-        description="数据准备：data/raw/<dataset>/ 下须有 ligand/、protein/、index.csv；结果写入 data/processed/<dataset>/。",
+        description="Prepare processed data from data/raw/<dataset>/ into data/processed/<dataset>/.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "dataset",
         type=str,
-        help="数据集名称（与 data/raw/<dataset>/、data/processed/<dataset>/ 对应），如 hiqbind、pdbbind",
+        help="Dataset name mapped to data/raw/<dataset>/ and data/processed/<dataset>/, e.g. hiqbind or pdbbind",
     )
     parser.add_argument(
         "--steps",
         type=str,
         default="organize",
-        help="步骤，或 all；当前仅支持 organize（复制到 processed 并做小写文件名与 SDF 首行）",
+        help="Step name or 'all'. Currently only 'organize' is supported.",
     )
 
     args = parser.parse_args()
     dataset = args.dataset.strip().lower()
     if not dataset:
-        parser.error("dataset 不能为空")
+        parser.error("dataset must not be empty")
 
     raw_root = PROJECT_ROOT / "data" / "raw" / dataset
     target_root = PROJECT_ROOT / "data" / "processed" / dataset
@@ -152,18 +172,27 @@ def main() -> None:
         steps_to_run = [s.strip().lower() for s in args.steps.split(",") if s.strip()]
         for s in steps_to_run:
             if s not in STEP_ORDER:
-                parser.error(f"未知步骤: {s}，可选: {','.join(STEP_ORDER)}")
+                parser.error(f"Unknown step: {s}. Available steps: {','.join(STEP_ORDER)}")
 
     index_csv = raw_root / "index.csv"
 
     if "organize" in steps_to_run:
         if not raw_root.exists():
-            parser.error(f"原始数据目录不存在: {raw_root}，请将 ligand/、protein/、index.csv 放在该目录下")
+            parser.error(
+                f"Raw data directory not found: {raw_root}. "
+                "Expected ligand/, protein/, and index.csv under this directory."
+            )
         for sub in ("ligand", "protein"):
             if not (raw_root / sub).is_dir():
-                parser.error(f"缺少目录 {raw_root / sub}，data/raw/<dataset>/ 下须包含 ligand/ 与 protein/")
+                parser.error(
+                    f"Missing directory: {raw_root / sub}. "
+                    "data/raw/<dataset>/ must contain both ligand/ and protein/."
+                )
         if not index_csv.exists():
-            parser.error(f"索引文件不存在: {index_csv}（表头须为 Concatenated ID, Log Binding Affinity）")
+            parser.error(
+                f"Index file not found: {index_csv}. "
+                "Required headers: Concatenated ID, Log Binding Affinity."
+            )
 
     for step in steps_to_run:
         logger.info("===== %s =====", step)

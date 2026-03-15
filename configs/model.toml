@@ -1,10 +1,12 @@
 # EHFNet 模型内部参数
 # 训练相关参数在 train.toml 中配置
 
+[architecture]
+m_dim_scalar = 16
+dropout_rate = 0.0
+
 [rbf]
 num_rbf = 50
-rbf_start = 0.0
-rbf_stop = 10.0
 
 [geometry]
 frame_refine_threshold = 0.55
@@ -26,11 +28,61 @@ dynamic_inter_knn_k = 8
 dynamic_residue_cutoff = 14.0
 dynamic_residue_knn_k = 6
 force_cutoff = 6.0
-intra_atom_radius = 5.0
-intra_max_neighbors = 32
+r_cutoff_intra = 5.0
+max_neighbors_intra = 64
+atom_neighbor_cap = 32
+residue_neighbor_cap = 32
+residue_radius_scale = 1.6
+residue_radius_bias = 3.0
+ligand_atom_fallback_k = 1
+protein_atom_fallback_k = 1
+protein_residue_fallback_k = 4
 
 [prediction]
 r_cutoff = 10.0
 max_neighbors = 256
 min_max_neighbors = 64
 knn_fallback_k = 8
+
+[flow_matching]
+flow_sigma_min = 0.001
+flow_spatial_sigma_min = 1.0
+flow_spatial_sigma_max = 6.0
+flow_fd_dt = 0.05
+flow_rotation_angle_min = 0.2
+flow_rotation_angle_max = 3.141592653589793
+flow_torsion_scale_min = 0.1
+flow_torsion_scale_max = 1.0
+
+[loss]
+loss_characteristic_scale = 5.0
+loss_weight_trans = 1.0
+loss_weight_rot = 1.0
+loss_weight_torsion = 0.2
+loss_weight_energy = 0.05
+loss_weight_clash = 0.001
+loss_weight_pose_quality = 0.1
+loss_coarse_trans = 1.2
+loss_coarse_rot = 0.8
+loss_coarse_torsion = 0.05
+loss_coarse_energy = 0.0
+loss_coarse_clash = 0.0
+loss_coarse_pose_quality = 0.02
+loss_transition_trans = 1.0
+loss_transition_rot = 1.0
+loss_transition_torsion = 0.25
+loss_transition_energy = 0.08
+loss_transition_clash = 0.01
+loss_transition_pose_quality = 0.10
+loss_refine_trans = 0.8
+loss_refine_rot = 1.2
+loss_refine_torsion = 0.6
+loss_refine_energy = 0.20
+loss_refine_clash = 0.03
+loss_refine_pose_quality = 0.20
+loss_refine_start = 0.70
+loss_pose_gate_epoch_start = 0.15
+loss_pose_gate_epoch_end = 0.85
+loss_pose_gate_tau_start = 0.90
+loss_pose_gate_tau_end = 0.65
+loss_pose_gate_temperature = 0.07

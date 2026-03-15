@@ -1,53 +1,48 @@
 """
-预测头模块
+统一预测头。
 
-物理一致的统一预测头，基于能量-力-速度链条。
+负责输出亲和力、位阻、pose 质量和几何更新相关预测，
+是模型读出层的核心实现。
 """
+
 
 import logging
 import math
-import torch
 
+import torch
 from torch import nn, Tensor
 from torch_cluster import radius
-from torch_scatter import scatter_add
 from torch_geometric.utils import softmax
+from torch_scatter import scatter_add
+
+from ehfnet.models.layers import GaussianRBF
 
 logger = logging.getLogger(__name__)
 
 
-# 物理常量
 class PredictionConstants:
     """
-    预测头相关常量
+    预测头常量集合。
+
+    集中管理预测头内部使用的固定超参数和维度约定，
+    避免相关数值散落在不同预测分支实现中。
     """
 
-    # RBF 参数
-    NUM_RBF = 50                    # 径向基函数数量
-    RBF_START = 0.0                 # Å
-    RBF_STOP = 10.0                 # Å, 非键相互作用截断距离
-
-    # 邻居搜索
-    BASE_MAX_NEIGHBORS = 256        # 基础最大邻居数（提升以减少高密度样本截断）
-    MIN_MAX_NEIGHBORS = 64          # 最小最大邻居数
-
-    # 数值稳定性
-    MIN_DISTANCE = 1e-4             # Å, 最小距离阈值（提升 FP16 兼容性）
-    EPSILON = 1e-4                  # 通用数值保护（提升 FP16 兼容性）
-
-    # 物理参数
-    BASELINE_BINDING_ENERGY = -7.0  # kcal/mol, 典型结合能
-    FORCE_CUTOFF = 6.0              # Å, 力场局部相互作用半径
-    FORCE_LIMIT = 20.0              # 力幅值软饱和上限
-
-
-# 与 frame_conv 共享同一 RBF 实现
-from ehfnet.models.layers.rbf import GaussianRBF
+    NUM_RBF = 50
+    RBF_START = 0.0
+    RBF_STOP = 10.0
+    BASE_MAX_NEIGHBORS = 256
+    MIN_MAX_NEIGHBORS = 64
+    MIN_DISTANCE = 1e-4
+    EPSILON = 1e-4
+    BASELINE_BINDING_ENERGY = -7.0
+    FORCE_CUTOFF = 6.0
+    FORCE_LIMIT = 20.0
 
 
 class CosineCutoff(nn.Module):
     """
-    平滑截断函数
+    平滑截断函数。
 
     在 r = r_cutoff 时平滑衰减到 0。
     公式：f(r) = 0.5 * [cos(π * r / r_cutoff) + 1]  当 r < r_cutoff
@@ -56,8 +51,10 @@ class CosineCutoff(nn.Module):
 
     def __init__(self, cutoff: float) -> None:
         """
+        初始化对象。
+
         Args:
-            cutoff: 截断距离（单位：Å）
+            cutoff: 截断阈值。
         """
 
         super().__init__()
@@ -69,19 +66,14 @@ class CosineCutoff(nn.Module):
         前向传播
 
         Args:
-            dist: 距离张量 [...]
+            dist: dist。
 
         Returns:
             截断权重 [...]，范围 [0, 1]
         """
 
-        # 避免数值问题：dist 应在 [0, cutoff] 范围内
         dist_safe = torch.clamp(dist, min=0.0, max=self.cutoff)
-
-        # 余弦截断
         cutoff_values = 0.5 * (torch.cos(math.pi * dist_safe / self.cutoff) + 1.0)
-
-        # 超过 cutoff 的设为 0
         cutoff_values = torch.where(
             dist < self.cutoff, cutoff_values, torch.zeros_like(cutoff_values)
         )
@@ -110,23 +102,35 @@ class PredictionHead(nn.Module):
         num_rbf: int = PredictionConstants.NUM_RBF,
         r_cutoff: float = PredictionConstants.RBF_STOP,
         dropout_rate: float = 0.1,
-        affinity_stats: dict | None = None,
         max_neighbors: int = PredictionConstants.BASE_MAX_NEIGHBORS,
+        min_max_neighbors: int = PredictionConstants.MIN_MAX_NEIGHBORS,
         force_cutoff: float = PredictionConstants.FORCE_CUTOFF,
         force_limit: float = PredictionConstants.FORCE_LIMIT,
         knn_fallback_k: int = 8,
+        clash_threshold: float = 2.0,
+        clash_push_threshold: float = 2.2,
+        clash_push_force: float = 6.0,
+        score_clamp_min: float = -50.0,
+        score_clamp_max: float = 50.0,
     ) -> None:
         """
+        初始化对象。
+
         Args:
-            hidden_dim: 隐藏层维度
-            num_rbf: RBF 基函数数量
-            r_cutoff: 截断距离（单位：Å）
-            dropout_rate: Dropout 比例
-            affinity_stats: 保留兼容参数（当前不在模型内做反归一化）
-            max_neighbors: 跨图邻居上限，过小会导致高密度样本信息截断
-            force_cutoff: 力分支局部交互半径（Å）
-            force_limit: 力幅值软饱和上限
-            knn_fallback_k: 半径边缺失时的最近邻回退数量
+            hidden_dim: 隐藏层维度。
+            num_rbf: RBF 基函数数量。
+            r_cutoff: 几何邻域构建的距离截断半径。
+            dropout_rate: Dropout 比例。
+            max_neighbors: 预测头阶段每个节点保留的最大邻居数。
+            min_max_neighbors: 预测头动态邻居数的下限。
+            force_cutoff: 力相关分支使用的局部截断半径。
+            force_limit: 力大小的软限制。
+            knn_fallback_k: 回退到 kNN 时使用的邻居数。
+            clash_threshold: 位阻判定阈值。
+            clash_push_threshold: 位阻推开分支使用的距离阈值。
+            clash_push_force: 位阻推开分支的力缩放系数。
+            score_clamp_min: 分数裁剪下界。
+            score_clamp_max: 分数裁剪上界。
         """
 
         super().__init__()
@@ -136,21 +140,19 @@ class PredictionHead(nn.Module):
         self.r_cutoff = float(r_cutoff)
         self.scale = hidden_dim**-0.5
         self.base_max_neighbors = int(max_neighbors)
+        self.min_max_neighbors = max(1, int(min_max_neighbors))
         self.force_cutoff = float(min(force_cutoff, self.r_cutoff))
         self.force_limit = float(force_limit)
         self.knn_fallback_k = max(1, int(knn_fallback_k))
-        
-        # 兼容保留：亲和力统计由 trainer/数据集侧用于反归一化评估
-        _ = affinity_stats
+        self.clash_threshold = float(clash_threshold)
+        self.clash_push_threshold = float(clash_push_threshold)
+        self.clash_push_force = float(clash_push_force)
+        self.score_clamp_min = float(score_clamp_min)
+        self.score_clamp_max = float(score_clamp_max)
 
-        # 动态调整邻居数：保证高密度样本不被过度截断
         self.adaptive_max_neighbors = True
-
-        # 共享模块
         self.cutoff_fn = CosineCutoff(cutoff=self.r_cutoff)
-
-        # 距离 RBF 编码 + 边特征 MLP
-        self.distance_expansion = GaussianRBF(0.0, self.r_cutoff, num_rbf)
+        self.distance_expansion = GaussianRBF(0.0, self.r_cutoff, num_gaussians=num_rbf)
         self.edge_mlp = nn.Sequential(
             nn.Linear(num_rbf, hidden_dim),
             nn.SiLU(),
@@ -158,7 +160,6 @@ class PredictionHead(nn.Module):
             nn.Linear(hidden_dim, hidden_dim),
         )
 
-        # 能量预测分支
         self.q_atom = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.k_atom = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.v_atom = nn.Linear(hidden_dim, hidden_dim, bias=False)
@@ -237,16 +238,16 @@ class PredictionHead(nn.Module):
         前向传播
 
         Args:
-            lig_atom_feat: 配体原子特征 [N_lig, H]
-            lig_atom_pos: 配体原子坐标 [N_lig, 3]
-            lig_batch: 配体原子批次索引 [N_lig]
-            pro_atom_feat: 蛋白原子特征 [N_pro, H]
-            pro_atom_pos: 蛋白原子坐标 [N_pro, 3]
-            pro_atom_batch: 蛋白原子批次索引 [N_pro]
-            lig_mol_feat: 配体分子特征 [B, H]
+            lig_atom_feat: 配体原子特征。
+            lig_atom_pos: 配体原子坐标张量。
+            lig_batch: 配体所属的 batch 索引。
+            pro_atom_feat: 蛋白原子特征。
+            pro_atom_pos: 蛋白原子坐标张量。
+            pro_atom_batch: 蛋白原子所属的 batch 索引。
+            lig_mol_feat: 配体分子特征。
 
         Returns:
-            binding_affinity、steric_clash_batch、局部相互作用上下文与 force-like 信号的字典
+            dict[str, Tensor]: 含 binding_affinity、steric_clash_batch、局部相互作用上下文与类力信号的字典。
         """
 
         device = lig_atom_feat.device
@@ -260,7 +261,6 @@ class PredictionHead(nn.Module):
             dim_size=B,
         ).clamp(min=1.0)
 
-        # 边界情况
         if N_lig == 0 or N_pro == 0:
 
             return {
@@ -272,12 +272,10 @@ class PredictionHead(nn.Module):
                 "ligand_force": torch.zeros((N_lig, 3), device=device, dtype=lig_atom_feat.dtype),
             }
 
-        # 1. 邻居搜索
         if self.adaptive_max_neighbors:
-            # 对高密度口袋场景提高上限，减少半径图邻接被截断
             max_k = min(
                 self.base_max_neighbors,
-                max(PredictionConstants.MIN_MAX_NEIGHBORS, N_pro // 4),
+                max(self.min_max_neighbors, N_pro // 4),
             )
 
         else:
@@ -292,7 +290,6 @@ class PredictionHead(nn.Module):
             max_num_neighbors=max_k,
         )
 
-        # 半径边为空时，使用批内 kNN 回退，保证配体原子至少有跨图连接
         if edge_index.size(1) == 0:
             edge_index = self._build_knn_edges(
                 lig_pos=lig_atom_pos,
@@ -302,7 +299,6 @@ class PredictionHead(nn.Module):
                 k=self.knn_fallback_k,
             )
 
-        # 若半径图遗漏了部分配体原子，也为遗漏原子补 1-NN 边
         if edge_index.size(1) > 0:
             covered_lig = torch.unique(edge_index[0])
             all_lig = torch.arange(N_lig, device=device)
@@ -338,19 +334,11 @@ class PredictionHead(nn.Module):
         i_idx = edge_index[0]
         j_idx = edge_index[1]
 
-        # 2. 计算几何特征（升为 FP32 确保 AMP 下数值稳定）
         lig_pos_sel = lig_atom_pos[i_idx].float()
         pro_pos_sel = pro_atom_pos[j_idx].float()
-        # [修复] 用手动 sqrt(sum²+ε) 代替 torch.norm：
-        # torch.norm 在距离=0 处梯度为 x/‖x‖，分母为零 → grad_norm=nan；
-        # 加上 1e-8 偏移量使导数始终有界，彻底消除 nan 梯度。
         sq_dist = torch.sum((lig_pos_sel - pro_pos_sel) ** 2, dim=-1)
         dist = torch.sqrt(sq_dist + 1e-8)
-        # 软位阻排斥惩罚 (Soft Steric Clash)
-        # 阈值 2.0 Å ≈ 两个碳原子范德华半径之和的保守估计
-        # ReLU 保证只有小于阈值的距离才产生惩罚；平方保证梯度平滑无跳跃
-        _clash_threshold = 2.0
-        clash_edge = torch.nn.functional.relu(_clash_threshold - dist).pow(2)   # [E]
+        clash_edge = torch.nn.functional.relu(self.clash_threshold - dist).pow(2)
         edge_count_per_atom = scatter_add(
             torch.ones_like(dist, dtype=torch.float32),
             i_idx,
@@ -376,7 +364,6 @@ class PredictionHead(nn.Module):
         )
         cutoff_weights = self.cutoff_fn(dist)
 
-        # 当全部边都落在 cutoff 外时，启用长程衰减权重，避免“有边无信号”
         if torch.all(cutoff_weights <= PredictionConstants.EPSILON):
             cutoff_weights = torch.exp(-dist / max(self.r_cutoff, PredictionConstants.EPSILON))
 
@@ -389,11 +376,9 @@ class PredictionHead(nn.Module):
         rel_vec = pro_pos_sel - lig_pos_sel
         rel_dir = rel_vec / dist.unsqueeze(-1).clamp(min=PredictionConstants.MIN_DISTANCE)
 
-        # 3. 能量预测
         E_ij_raw = self.pairwise_energy_mlp(pair_input).squeeze(-1)
         E_ij = E_ij_raw * cutoff_weights
 
-        # force_mlp 仅在 dist < force_cutoff 的近程边上运行，远程边不贡献学习力
         force_mask = dist < self.force_cutoff
         if force_mask.any():
             force_edge_raw = self.force_mlp(pair_input[force_mask]).squeeze(-1)
@@ -407,10 +392,9 @@ class PredictionHead(nn.Module):
             learned_force_mag = torch.zeros(
                 edge_index.size(1), device=device, dtype=pair_input.dtype
             )
-        clash_push = torch.nn.functional.relu(2.2 - dist) * 6.0
+        clash_push = torch.nn.functional.relu(self.clash_push_threshold - dist) * self.clash_push_force
         force_edge = (learned_force_mag.unsqueeze(-1) * rel_dir) - (clash_push.unsqueeze(-1) * rel_dir)
 
-        # 先在配体原子维度按有效边权做归一化，再在样本维度做均值归一化
         edge_mass_per_atom = scatter_add(cutoff_weights, i_idx, dim=0, dim_size=N_lig)
         edge_mass_per_atom = edge_mass_per_atom.float().clamp(min=PredictionConstants.EPSILON)
         E_lig_atom = scatter_add(E_ij.float(), i_idx, dim=0, dim_size=N_lig) / edge_mass_per_atom
@@ -418,7 +402,6 @@ class PredictionHead(nn.Module):
         E_physical_sum = scatter_add(E_lig_atom, lig_batch, dim=0, dim_size=B)
         E_physical = E_physical_sum / atom_counts.clamp(min=1.0)
 
-        # 交叉注意力
         lig_atoms_with_neighbors = torch.unique(i_idx, sorted=False)
         pro_atoms_with_neighbors = torch.unique(j_idx, sorted=False)
 
@@ -458,25 +441,20 @@ class PredictionHead(nn.Module):
         force_atom = scatter_add(force_edge, i_idx, dim=0, dim_size=N_lig)
         force_atom = force_atom / edge_mass_per_atom.unsqueeze(-1).clamp(min=PredictionConstants.EPSILON)
 
-        # 归一化聚合
         context_sum = scatter_add(context_atom, lig_batch, dim=0, dim_size=B)
         context_global = context_sum / atom_counts.clamp(min=1).unsqueeze(-1)
         force_norm_sum = scatter_add(force_atom.norm(dim=-1), lig_batch, dim=0, dim_size=B)
         force_norm_global = force_norm_sum / atom_counts.clamp(min=1.0)
 
-        # 全局修正
         global_input = torch.cat([lig_mol_feat, context_global], dim=-1)
         E_correction = self.global_correction_mlp(global_input).squeeze(-1)
-
-        # 最终能量 (Score)
-        # 神经网络输出归一化分数（与 y_energy 对齐）
         score_norm = E_physical + E_correction
+        score_norm = torch.clamp(
+            score_norm,
+            min=min(self.score_clamp_min, self.score_clamp_max),
+            max=max(self.score_clamp_min, self.score_clamp_max),
+        )
 
-        # 物理软截断：E_physical 和 E_correction 在初期权重随机时均可爆炸
-        # 真实 pKd 范围 [2, 15]，将原始分数限制在 [-50, 50] 防止 Huber Loss 被击穿
-        score_norm = torch.clamp(score_norm, min=-50.0, max=50.0)
-
-        # 模型端不做反归一化：保持训练目标与输出标度一致
         binding_affinity = score_norm.unsqueeze(-1)
 
         lig_centroid = scatter_add(
@@ -548,6 +526,9 @@ class PredictionHead(nn.Module):
     ) -> Tensor:
         """
         构建批内 ligand->protein 的 kNN 边，返回格式与 radius 一致：[lig_idx, pro_idx]
+
+        Returns:
+            Tensor: 返回计算得到的张量结果。
         """
 
         device = lig_pos.device
