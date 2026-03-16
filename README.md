@@ -7,15 +7,14 @@
 
 **EHFNet (Equivariant Hierarchical Flow Network)** 是一个基于**条件流匹配 (Conditional Flow Matching)** 的蛋白质-配体分子对接模型。模型在 $\mathrm{SE}(3) \times \mathbb{T}^m$ 流形上学习从随机初始构象到真实结合态的连续速度场，通过刚体运动（平移 + 旋转）与柔性扭转角的联合优化生成对接构象。
 
-> **Note:** This project is under active development. APIs and model architectures are subject to change.
 
 ## Highlights
 
 - **SE(3) × T^m 流形建模**：统一学习刚体平移、旋转与扭转速度场。
 - **层次化异构图编码**：原子与残基双尺度交互，兼顾几何细节与全局语义。
-- **动态边预算批采样**：基于 `max_nodes_per_batch × edge_budget_factor` 的边预算控制显存上限，训练与验证均使用 edge 模式。
+- **成本感知批采样**：基于样本级节点/边/扭转画像打包 batch，并使用静态成本预算驱动吞吐。
 - **工程化训练策略**：Spatial Curriculum、EMA、梯度累积与裁剪协同提升收敛质量。
-- **OOM 级联熔断器**：连续 OOM 时分级恢复（基础清理→深度重置→CPU 往返），级联时自动熔断当前 epoch。
+- **稳健显存控制**：统一采用高静态预算、真实 OOM 后收缩与 batch 二分重试，降低长尾样本带来的 OOM 波动。
 
 ## Method
 
@@ -68,17 +67,43 @@ $R_{\mathrm{frame}} \in \mathrm{SO}(3)$ 由当前坐标 SVD 主轴确定（detac
 
 *扭转*：以旋转键两端原子特征拼接输入，MLP 直接输出标量（旋转不变量），无需坐标投影。
 
-**辅助任务：** 亲和力预测头（ $t > 0.8$ 时激活）+ 位阻惩罚（基于 $t^4$ 时间感知动态权重）。
+**辅助任务：**
+- 亲和力预测头与位阻惩罚共享同一套时间门控，由训练进度与当前时间步 `t` 共同调节。
+- 训练时，亲和力损失、位阻损失和构象质量损失都通过平滑时间门控逐步打开，而不是使用固定的硬阈值。
+- 验证时，亲和力误差统计仅在 `t > 0.8` 的样本上汇总，以聚焦接近终态区域的预测质量。
 
 **训练策略：**
 - 空间课程学习（Spatial Curriculum）：前 `warmup_epochs` 从局部扰动逐步扩展到全局搜索
 - 严格样本级梯度累积（Sample-level Accumulation）
-- 显存防暴（OOM Guard）：动态捕获 VRAM 溢出并分级清理（Level 1~3）
-- OOM 级联熔断器：连续 OOM 达阈值时立即中断 epoch，避免数千次无效重试
-- 自适应节点预算：OOM 频发时自动降低 `max_nodes_per_batch`，连续稳定后可逐步回升
+- 成本感知批采样：按样本级成本画像构建 batch
+- 静态预算主导：默认尽量吃满预算，只在真实 OOM 后收缩
+- OOM 二分重试：成本超限或触发 OOM 时优先拆分 batch，而不是直接整批跳过
+- 自适应成本预算：OOM 频发时自动降低阶段预算，连续稳定后可逐步回升
 - CUDA 显存碎片率控制（内置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`）
 - EMA 权重平滑（用于验证和推理）
 - 综合指标体系：支持输出 Median RMSD、Centroid Distance、Pearson/Spearman 相关性指标
+
+### Ranking Strategy
+
+- **默认最终重排**：最终 pose 排序默认采用单一 `pose_rank_score` 与 `center` 置信分支的线性融合；`affinity` 与 `clash` 作为弱辅助信号默认参与重排，权重分别为 `0.08` 与 `0.12`。
+- **两阶段选择**：stage-1 先按每个中心下的最佳 pose 分数筛选 refinement centers；stage-2 再对所有候选 pose 执行统一重排并统计 Top-N 指标。
+- **默认主排序头**：`pose_rank_score` 是唯一的 pose 质量/排序输出，同时承担质量校准与最终排序职责。
+- **设计动机**：`pose` 分支负责同一复合物内部的几何排序，`center` 分支提供 proposal 先验；二者分工明确，避免将复合物级亲和力标签直接当作 pose 级排序标签。
+
+### Auxiliary Supervision
+
+- **RMSD-first 主链路**：默认先强化 `translation / rotation / torsion` 几何主损失，再在中后期逐步引入 ranking、bootstrap 和 blind-pool replay；训练期排序软标签与验证指标统一基于 symmetry-aware RMSD。
+- **单一 `pose_rank_score` 头**：仍然统一承担构象质量估计与最终排序，但默认只在几何主链基本收敛后再逐步放大监督强度。
+- **亲和力与位阻分支**：二者共享同一套平滑时间门控，仅在训练后期和较大 `t` 区域逐步增强权重；验证时亲和力误差只在 `t > 0.8` 的样本上统计。
+- **blind-pool replay**：定位为后置 reranker 增强阶段；除 pose 排序损失外，还包含 center-value supervision，用于把 proposal 质量与后续 pose 成功率重新耦合。
+
+### Validation Protocol
+
+- **日常监控**：默认对验证集做 `30%` partial lightweight validation；验证、bootstrap 与 blind 推理统一使用 `ode_method`，默认值为 `euler`。
+- **周期全量验证**：每隔 `val_full_every` 个 epoch 执行一次 `100%` full lightweight validation。
+- **尾段高覆盖验证**：最后 `val_full_last_epochs` 个 epoch 始终执行 `100%` full lightweight validation，但积分方法仍遵循同一个 `ode_method` 配置。
+- **checkpoint 选择**：训练中所有 checkpoint 选择均基于 lightweight validation，默认使用 `rmsd_priority` 规则，优先考虑 `Success@2A / Success@5A / Mean RMSD`；完整 blind Top-N 仅在训练结束后运行。
+- **子集抽样方式**：partial validation 每轮按固定随机种子重采样确定性子集，用于兼顾覆盖率与反馈速度。
 
 ## Installation
 
@@ -225,7 +250,7 @@ uv run python scripts/preprocess.py clean --data-root data/processed/hiqbind --t
 
 ### 推荐配置（24GB 单卡）
 
-采用 **边预算模式**（`DynamicBatchSampler mode="edge"`），实际单批边数上限 = `max_nodes_per_batch × edge_budget_factor`，训练与验证均按边数控制批大小。`edge_budget_factor` 与 `eval_edge_guard_headroom` 在 `configs/train.toml` 中配置。
+采用 **成本感知批处理模式**：训练启动时会为每个样本缓存节点/边/扭转画像，动态估计跨图边成本，并据此打包 batch。主链路使用高静态预算；只有在真实 OOM 或不可分超预算样本出现时，才会触发 batch 二分重试与阶段预算收缩。
 `--accumulation_steps` 用于在不增加峰值显存的情况下提升等效 batch。
 训练入口会在导入 `torch` 前读取 `configs/train.toml` 的 `[runtime].torch_cuda_alloc_conf`，并在未显式设置环境变量时注入 `PYTORCH_CUDA_ALLOC_CONF`。
 若传入 `--smoke`（或在 `configs/train.toml` 的 `[logging]` 中设置 `smoke = true`），训练正式日志会写到 `logs/smoke/train/`；默认仍写到 `logs/train/`。
@@ -260,14 +285,24 @@ uv run python train.py \
 
 常改训练参数已整理到 `configs/train.toml`，模型/图拓扑/flow-matching/loss 相关参数已整理到 `configs/model.toml`；这些模型内部参数需要在配置中显式给出，不再依赖代码层隐式兜底。命令行参数会覆盖配置文件。
 
+训练阶段默认采用“分层轻量验证 + 最终完整测试”拆分：
+
+- 默认每个 epoch 只在验证集上抽取 `30%` 子集做 partial 轻量验证；
+- 每隔 `10` 个 epoch 会对验证集执行一次 `100%` full 轻量验证；
+- 最后 `10` 个 epoch 会始终执行 `100%` full 轻量验证；
+- 验证、bootstrap 与 blind 推理统一使用单一 `ode_method` 配置，默认是 `euler`；
+- 轻量验证默认汇总的是 symmetry-aware single-shot RMSD、single-shot success 和少量亲和力指标；
+- blind pool 刷新与最终 blind Top-N 测试使用独立成本预算，日志也会分别报告；
+- 完整 blind Top-N 评测只在训练结束后的最终测试阶段执行一次。
+
 ```bash
 uv run python train.py \
     --data_root data/processed/hiqbind \
     --epochs 100 \
-    --max_nodes_per_batch 20000 \
-    --val_max_nodes_per_batch 6000 \
-    --test_max_nodes_per_batch 5000 \
-    --topn_max_nodes_per_batch 4000 \
+    --train_cost_budget 1300000 \
+    --val_cost_budget 1300000 \
+    --blind_pool_cost_budget 1600000 \
+    --final_topn_cost_budget 1600000 \
     --accumulation_steps 8 \
     --lr 1e-4 \
     --hidden_dim 128 \
@@ -275,7 +310,10 @@ uv run python train.py \
     --crop_radius 10 \
     --warmup_epochs 20 \
     --ema_decay 0.999 \
-    --rmsd_ratio 0.2 \
+    --val_subset_ratio 0.3 \
+    --val_full_every 10 \
+    --val_full_last_epochs 10 \
+    --ode_method euler \
     --split_train_frac 0.7 \
     --split_val_frac 0.1 \
     --split_test_frac 0.2 \
@@ -283,21 +321,26 @@ uv run python train.py \
     --ablation_mode none \
     --run_test_after_training \
     --test_topk 1,5,10 \
-    --test_pose_samples 10 \
     --center_proposal_topk 8 \
     --center_refine_topk 3 \
     --stage1_pose_samples 2 \
     --stage2_pose_samples 4 \
-    --enable_oom_adaptive_batch \
+    --enable_train_budget_callback \
     --oom_reduce_threshold 3 \
     --oom_reduce_factor 0.85 \
-    --min_max_nodes_per_batch 12000 \
-    --enable_val_oom_adaptive_batch \
+    --min_train_cost_budget 480000 \
+    --enable_val_budget_callback \
     --val_oom_reduce_threshold 3 \
     --val_oom_reduce_factor 0.85 \
-    --min_val_max_nodes_per_batch 3000 \
-    --oom_recover_epochs 3 \
-    --oom_recover_factor 1.1 \
+    --min_val_cost_budget 120000 \
+    --train_budget_window_size 8 \
+    --train_budget_recover_window_count 2 \
+    --train_budget_recover_step 80000 \
+    --train_offender_cooldown 6 \
+    --val_budget_window_size 4 \
+    --val_budget_recover_window_count 2 \
+    --val_budget_recover_step 80000 \
+    --val_offender_cooldown 4 \
     --device cuda:0
 ```
 
@@ -310,10 +353,10 @@ nohup uv run python train.py \
     --data_root data/processed/hiqbind \
     --smoke \
     --epochs 100 \
-    --max_nodes_per_batch 20000 \
-    --val_max_nodes_per_batch 6000 \
-    --test_max_nodes_per_batch 5000 \
-    --topn_max_nodes_per_batch 4000 \
+    --train_cost_budget 1300000 \
+    --val_cost_budget 1300000 \
+    --blind_pool_cost_budget 1600000 \
+    --final_topn_cost_budget 1600000 \
     --accumulation_steps 8 \
     --lr 1e-4 \
     --hidden_dim 128 \
@@ -321,17 +364,26 @@ nohup uv run python train.py \
     --crop_radius 10 \
     --warmup_epochs 20 \
     --ema_decay 0.999 \
-    --rmsd_ratio 0.2 \
-    --enable_oom_adaptive_batch \
+    --val_subset_ratio 0.3 \
+    --val_full_every 10 \
+    --val_full_last_epochs 10 \
+    --ode_method euler \
+    --enable_train_budget_callback \
     --oom_reduce_threshold 3 \
     --oom_reduce_factor 0.85 \
-    --min_max_nodes_per_batch 12000 \
-    --enable_val_oom_adaptive_batch \
+    --min_train_cost_budget 480000 \
+    --enable_val_budget_callback \
     --val_oom_reduce_threshold 3 \
     --val_oom_reduce_factor 0.85 \
-    --min_val_max_nodes_per_batch 3000 \
-    --oom_recover_epochs 3 \
-    --oom_recover_factor 1.1 \
+    --min_val_cost_budget 120000 \
+    --train_budget_window_size 8 \
+    --train_budget_recover_window_count 2 \
+    --train_budget_recover_step 80000 \
+    --train_offender_cooldown 6 \
+    --val_budget_window_size 4 \
+    --val_budget_recover_window_count 2 \
+    --val_budget_recover_step 80000 \
+    --val_offender_cooldown 4 \
     --run_suffix "${run_suffix}" \
     > "logs/smoke/nohup/nohup_train_${run_suffix}.log" 2>&1 &
 
@@ -360,23 +412,46 @@ tail -f "logs/smoke/nohup/nohup_train_${run_suffix}.log"
 | `--run_suffix` | str | 自动生成 | 可选运行后缀；用于让训练正式日志、`nohup` 日志和产物目录共享同一次运行标识。 |
 | `--smoke` | flag | `false` | 将文本日志重定向到 `logs/smoke/...`，便于集中清理 smoke 运行日志；不影响 checkpoint 目录。 |
 | `--epochs` | int | 100 | 训练轮数 |
-| `--max_nodes_per_batch` | int | 20000 | 边预算基数。实际单批边上限 = 该值 × `edge_budget_factor`（内部 40）。 |
-| `--val_max_nodes_per_batch` | int | `6000` | 验证集边预算基数。 |
-| `--test_max_nodes_per_batch` | int | `5000` | 最终测试集节点预算。 |
-| `--topn_max_nodes_per_batch` | int | `4000` | Top-N 评估节点预算。 |
+| `--train_cost_budget` | int | 1300000 | 训练阶段的静态成本预算；主链路默认尽量吃满预算，只在真实 OOM 后收缩。 |
+| `--val_cost_budget` | int | `1300000` | 训练期轻量验证使用的静态成本预算。 |
+| `--blind_pool_cost_budget` | int | `1600000` | blind pool 刷新阶段的静态成本预算。 |
+| `--final_topn_cost_budget` | int | `1600000` | 最终 blind Top-N 评估阶段的静态成本预算。 |
 | `--accumulation_steps` | int | 8 | 梯度累积步数，等效扩大 batch size |
 | `--lr` | float | 1e-4 | 学习率 |
 | `--weight_decay` | float | 1e-6 | 权重衰减 |
 | `--clip_grad` | float | 1.0 | 梯度裁剪阈值 |
 | `--warmup_epochs` | int | 20 | 空间课程学习预热轮数 |
 | `--ema_decay` | float | 0.999 | EMA 衰减系数 |
-| `--rmsd_ratio` | float | 0.2 | 验证集中执行 RMSD 推演的样本比例 |
+| `--val_subset_ratio` | float | 0.3 | 默认 partial 轻量验证覆盖的验证集比例 |
+| `--val_full_every` | int | 10 | 每隔多少个 epoch 执行一次 `100%` full 轻量验证，`0` 表示关闭周期全量验证 |
+| `--val_full_last_epochs` | int | 10 | 训练末尾连续执行 `100%` full 轻量验证的 epoch 数 |
+| `--ode_method` | str | `euler` | 验证、bootstrap 与 blind 推理统一使用的 ODE 求解器，可选 `euler` / `rk4` |
+
+### Compute Budget Semantics
+
+- `cost_budget` 不是样本数或图数，而是由节点数、静态/动态图边数与扭转项共同估计得到的计算成本单位。
+- `train_cost_budget` 对应训练主循环，服务于前向、反向与梯度累积的吞吐需求。
+- `val_cost_budget` 对应训练期验证；`partial` 与 `full` 共用同一套静态预算基线，但会保留各自的 OOM 收缩状态。
+- `blind_pool_cost_budget` 只对应 blind pool 刷新；`final_topn_cost_budget` 只对应最终 blind Top-N 推理，两者互不拖累。
+
+### RMSD-First Curriculum
+
+- 配体初始位姿固定采用 `rdkit_decoupled`：从 ligand 文件读取分子拓扑后，由 RDKit 重新嵌入三维构象，再进入后续的平移、旋转与扭转随机化流程；不再保留任何真值构象直通或 `reference_pose` 对照分支。
+- 默认课程会先用 `gt / jitter / proposal_pos` 建立几何主链，再逐步引入 `near_miss` 与 `hard_neg`。
+- `same-center` ranking、`wrong-center` ranking、bootstrap 与 blind-pool replay 都通过显式进度阈值后置开启，不再依赖 “blind pool 一出现就整套切换” 的隐式开关。
+- 训练期 pose soft target、lightweight validation 与最终评估统一使用 symmetry-aware RMSD 作为 RMSD 口径，不再保留 direct RMSD 分支。
+- 在线排序也拆成独立控制：`same-center` 由微批大小控制显存峰值，`wrong-center` 继续用独立预算回调控制额外排序分支。
+- 不同阶段还会叠加各自的 `phase_multiplier` 与 batch 二分重试，因此相同数值预算在不同阶段并不代表相同的实际 batch 规模。
+| `--max_oom_retry_splits` | int | 3 | batch 触发 OOM 或预算超限后允许递归二分重试的最大深度 |
 | `--hidden_dim` | int | 128 | 隐藏层维度 |
 | `--num_gnn_blocks` | int | 4 | GNN Block 数量（显存不足时可降至 3） |
 | `--crop_radius` | float | 10.0 | 运行时 local crop 半径（Å） |
 | `--esm` | str | `auto` | ESM 处理模式：`auto`=缺缓存时自动计算，`file`=仅读取缓存，`off`=完全关闭 ESM |
 | `--esm_model_name` | str | `esmc_300m` | ESM 主干模型名；修改后需重建图缓存与 ESM 缓存 |
 | `--esm_dim` | int | 960 | ESM Embedding 维度（ESMC-300M 为 960） |
+| `--dynamic_inter_max_neighbors` | int | 48 | 动态 `ligand_atom ↔ protein_atom` 边的单源邻居上限 |
+| `--dynamic_residue_max_neighbors` | int | 32 | 动态 `ligand_atom ↔ protein_residue` 边的单源邻居上限 |
+| `--dynamic_residue_candidate_topk` | int | 96 | 每个复合物在构建动态配体-残基边前保留的候选残基上限 |
 | `--split_train_frac` | float | 0.7 | 训练集比例（Scaffold Split） |
 | `--split_val_frac` | float | 0.1 | 验证集比例（Scaffold Split） |
 | `--split_test_frac` | float | 0.2 | 独立测试集比例（Scaffold Split） |
@@ -386,82 +461,105 @@ tail -f "logs/smoke/nohup/nohup_train_${run_suffix}.log"
 | `--ablation_mode` | str | `none` | 消融模式：`none` / `inter_multiscale_off` |
 | `--run_test_after_training` | flag | 启用 | 训练后自动运行独立 test 评估 |
 | `--test_topk` | str | `1,5,10` | Top-N 成功率统计阈值列表 |
-| `--test_pose_samples` | int | 10 | 每个复合物生成的候选 pose 数 |
 | `--center_proposal_weight` | float | 0.15 | blind-pool replay 中 center value supervision 的损失权重 |
 | `--center_positive_radius` | float | 4.0 | crop curriculum 与 blind center 指标使用的命中半径（Å） |
+| `--center_guidance_learned_start` | float | 0.35 | 中心打分从几何先验切换到学习分数的训练进度阈值 |
 | `--center_proposal_topk` | int | 8 | stage-1 保留的候选中心数量 |
 | `--center_refine_topk` | int | 3 | stage-2 深化对接的中心数量 |
 | `--center_nms_radius` | float | 6.0 | 候选中心去冗余半径（Å） |
 | `--stage1_pose_samples` | int | 2 | 每个中心在 stage-1 的局部采样数 |
 | `--stage2_pose_samples` | int | 4 | 每个中心在 stage-2 的局部采样数 |
+| `--crop_proposal_start` | float | 0.10 | `proposal_pos` 进入中心课程的训练进度阈值 |
+| `--crop_near_miss_start` | float | 0.35 | `near_miss` 进入中心课程的训练进度阈值 |
+| `--crop_hard_negative_start` | float | 0.65 | `hard_neg` 进入中心课程的训练进度阈值 |
 | `--crop_min_residues` | int | 12 | 运行时 local crop 至少保留的蛋白残基数 |
 | `--crop_atom_margin` | float | 2.0 | 运行时 local crop 中原子距离裁剪的额外缓冲半径（Å） |
-| `--pose_ranking_pair_weight` | float | 0.2 | pose confidence 的 pairwise ranking 损失权重 |
+| `--pose_ranking_pair_weight` | float | 0.1 | 单一 `pose_rank_score` 头的 pairwise ranking 损失权重 |
 | `--pose_ranking_margin` | float | 0.5 | pairwise ranking margin |
+| `--ranking_same_center_start` | float | 0.55 | `same-center` pairwise ranking 启用的训练进度阈值 |
+| `--ranking_wrong_center_start` | float | 0.75 | `wrong-center` pairwise ranking 启用的训练进度阈值 |
 | `--pose_bootstrap_weight` | float | 0.05 | model-generated pose bootstrap 损失权重 |
+| `--pose_bootstrap_start` | float | 0.80 | bootstrap ranking 监督启用的训练进度阈值 |
 | `--pose_bootstrap_frequency` | int | 25 | 每 N 个训练 batch 执行一次 bootstrap pose 打分（0 表示关闭） |
 | `--pose_bootstrap_ode_steps` | int | 10 | bootstrap pose 生成使用的 ODE 步数 |
+| `--blind_pool_refresh_on_best_update` | flag | 关闭 | 新最佳 checkpoint 出现时是否立刻额外刷新一次 blind pool；默认关闭，避免 pool 刷新反过来主导训练节奏 |
 | `--blind_pool_pairs_per_complex` | int | 4 | 每个复合物从 blind pool 回放时采样的困难配对基数 |
-| `--enable_fusion_calibration / --disable_fusion_calibration` | flag | 启用 | 是否在 Val-Blind 上网格搜索 pose/center 线性融合权重 |
-| `--val_ode_steps` | int | 50 | 验证和测试的 ODE 积分步数 |
+| `--replay_start_ratio` | float | 0.85 | blind-pool replay 作为后置增强阶段启用的训练进度阈值 |
+| `--val_ode_steps` | int | 50 | 训练期轻量验证与最终 blind 测试共用的 ODE 积分步数 |
 | `--crop_candidate_topk` | int | 8 | crop curriculum 在各 proposal bucket 内做 weighted sampling 时使用的 top-k 池大小 |
 | `--disable_jitter_crop` | flag | 关闭 | 关闭 jitter crop，用于 ablation |
 | `--disable_hard_negative_crop` | flag | 关闭 | 关闭 hard-negative crop，用于 ablation |
-| `--checkpoint_selection_mode` | str | `composite` | blind checkpoint 选择主指标：`composite` / `reranked_top1_success_2a` / `reranked_top5_success_2a` / `reranked_top1_plus_oracle_top5` |
-| `--fusion_search_center_weights` | str | `0,0.15,0.25,0.35,0.5,0.65` | 融合 ablation 中 center 权重搜索网格（逗号分隔） |
-| `--fusion_search_aff_weights` | str | `0` | 融合 ablation 中 affinity 权重搜索网格（逗号分隔） |
-| `--fusion_search_clash_weights` | str | `0` | 融合 ablation 中 clash 权重搜索网格（逗号分隔） |
+| `--checkpoint_selection_mode` | str | `rmsd_priority` | 训练期轻量验证的 checkpoint 选择主指标：`rmsd_priority` / `composite` / `mean_rmsd` / `val_loss` / `single_shot_success_2a` / `single_shot_success_5a` |
 | `--dataloader_num_workers` | int | 4 | DataLoader worker 数 |
 | `--dataloader_pin_memory / --no_dataloader_pin_memory` | flag | 启用 | 是否启用 pinned memory |
 | `--dataloader_persistent_workers / --no_dataloader_persistent_workers` | flag | 启用 | 是否启用 persistent workers |
-| `--enable_oom_adaptive_batch / --disable_oom_adaptive_batch` | flag | 启用 | 是否启用 OOM 自适应节点预算 |
-| `--oom_reduce_threshold` | int | 3 | 单个 epoch 触发多少次 OOM 后降低节点预算 |
-| `--oom_reduce_factor` | float | 0.85 | OOM 降批比例（0~1），级联熔断时自动使用 0.7 |
-| `--min_max_nodes_per_batch` | int | 12000 | 自适应降批下限 |
-| `--enable_val_oom_adaptive_batch / --disable_val_oom_adaptive_batch` | flag | 启用 | 是否启用验证阶段 OOM 自适应节点预算 |
-| `--val_oom_reduce_threshold` | int | 3 | 单个 epoch 验证 OOM 达阈值后降低验证节点预算 |
+| `--enable_train_budget_callback / --disable_train_budget_callback` | flag | 启用 | 是否启用训练阶段的窗口式预算回调 |
+| `--oom_reduce_threshold` | int | 3 | 单个训练窗口触发多少次根 OOM 事件后降低训练成本预算 |
+| `--oom_reduce_factor` | float | 0.85 | OOM 后的训练预算缩放比例（0~1） |
+| `--min_train_cost_budget` | int | 480000 | 训练阶段预算回调允许降到的最小预算 |
+| `--enable_val_budget_callback / --disable_val_budget_callback` | flag | 启用 | 是否启用验证阶段的窗口式预算回调 |
+| `--val_oom_reduce_threshold` | int | 3 | 单个验证窗口 OOM 达阈值后降低验证成本预算 |
 | `--val_oom_reduce_factor` | float | 0.85 | 验证降批比例（0~1） |
-| `--min_val_max_nodes_per_batch` | int | `None` | 验证自适应降批下限，默认跟随 `min_max_nodes_per_batch` |
-| `--oom_recover_epochs` | int | 3 | 连续无 OOM epoch 达到该值后尝试回升预算 |
-| `--oom_recover_factor` | float | 1.1 | 预算回升比例（>1） |
+| `--min_val_cost_budget` | int | `120000` | 验证阶段预算回调允许降到的最小预算 |
+| `--train_budget_window_size` | int | 8 | 训练预算回调使用的根 batch 窗口大小 |
+| `--train_budget_recover_window_count` | int | 2 | 连续多少个干净训练窗口后加性回升预算 |
+| `--train_budget_recover_step` | int | 80000 | 每次训练预算回升的加性步长 |
+| `--train_offender_cooldown` | int | 6 | 训练坏样本的冷却时长，以根 batch 事件计 |
+| `--val_budget_window_size` | int | 4 | 验证预算回调使用的窗口大小 |
+| `--val_budget_recover_window_count` | int | 2 | 连续多少个干净验证窗口后加性回升预算 |
+| `--val_budget_recover_step` | int | 80000 | 每次验证预算回升的加性步长 |
+| `--val_offender_cooldown` | int | 4 | 验证坏样本的冷却时长 |
+| `--same_center_micro_batch_size` | int | 2 | online same-center ranking 的初始微批大小；该分支不再整批二次前向 |
+| `--same_center_budget_window_size` | int | 8 | same-center ranking 微批恢复窗口大小 |
+| `--same_center_budget_recover_window_count` | int | 2 | same-center ranking 回升所需的连续干净窗口数 |
+| `--same_center_budget_recover_step` | int | 1 | same-center ranking 每次回升的微批步长 |
+| `--same_center_offender_cooldown` | int | 6 | same-center ranking 坏样本冷却时长 |
+| `--ranking_budget_window_size` | int | 8 | wrong-center ranking 分支的恢复窗口大小 |
+| `--ranking_budget_recover_window_count` | int | 2 | wrong-center ranking 回升所需的连续干净窗口数 |
+| `--ranking_offender_cooldown` | int | 6 | wrong-center ranking 坏样本冷却时长 |
+| `--ranking_wrong_center_cap` | int | 1 | wrong-center ranking 最大启用级别，`0` 表示退化为 same-center-only |
+| `--replay_micro_batch_size` | int | 4 | replay 候选打分的初始微批大小 |
+| `--replay_budget_window_size` | int | 8 | replay 微批恢复窗口大小 |
+| `--replay_budget_recover_window_count` | int | 2 | replay 微批回升所需的连续干净窗口数 |
+| `--replay_candidate_cooldown` | int | 6 | replay 复杂样本冷却时长 |
+| `--replay_max_candidates_per_complex` | int | 8 | replay 每个复合物保留的最大候选数 |
 
 ### OOM 说明（实践建议）
 
-- 训练与验证均使用 **边预算模式**（`DynamicBatchSampler mode="edge"`），按边数而非节点数控制显存。
-- 编码器前向传播会通过 `radius()` 动态重建跨图边（对 Sampler 不可见），edge_guard 以 1.5× 预留余量。
-- 推荐分离预算：训练保持高预算基数（如 20000）追求吞吐；验证/测试/Top-N 使用更稳的独立预算（如 6000/5000/4000）。
-- **级联熔断器**：连续 10 次 OOM 自动中断当前 epoch，避免数千次无效重试。
-- **分级恢复**：首次 OOM 基础清理→ 连续 3 次深度重置→ 连续 5 次模型 CPU 往返去碎片。
-- **验证自适应降批**：验证 OOM 达阈值后自动降低验证预算，不影响训练预算。
-- 若显存紧张，优先降低 `--max_nodes_per_batch`，其次降低 `--num_gnn_blocks`。
+- 训练、验证和 Top-N 都改为 **成本感知批处理**，不再只按静态节点数估计显存。
+- 编码器会对动态 `ligand_atom ↔ protein_residue` 边先做候选残基预筛，再应用半径/kNN 稀疏连接，显著收缩长尾样本成本。
+- 训练、验证、blind pool 刷新和最终 Top-N 都支持 batch 二分重试；若成本超限或触发 OOM，会优先拆成更小子批次而不是整批放弃。
+- **验证预算回调**：`partial` 与 `full` validation 各自维护独立的预算恢复状态，不影响训练预算，也不会互相拖累。
+- **same-center ranking 微批**：online same-center 排序不再复制整 batch 做第二次前向，而是按图切成独立微批；若微批 OOM，会递归二分直到单图，再由窗口式回调降低后续微批上限。
+- 若显存紧张，优先降低 `--train_cost_budget`，其次降低 `--num_gnn_blocks`。
 - 在共享 GPU 场景，其他进程会挤占显存，建议训练前确认空闲显存。
 
 ## Monitoring
 
-每轮训练结束后自动输出：
+每轮训练结束后自动输出训练期轻量验证结果：
 
 - **分项损失**：`loss_trans` / `loss_rot` / `loss_torsion` / `loss_energy` / `loss_clash`
-- **Val-Blind**：`center_recall@1/@3/@8/@16`、`oracle_top1/top5`、`reranked_top1/top5`、`proposal_gap`、`ranking_gap`
-- **融合校准**：每轮可在 Val-Blind 上自动调节 pose / center 线性融合权重
+- **轻量验证指标**：`val_loss`、`mean_rmsd_final`、`single_shot_success_2a/5a`、`cost_guard_skips`
 - **日志文件**：默认为 `logs/train/train_{timestamp}.log`；若启用 `--smoke`，则为 `logs/smoke/train/train_{timestamp}.log`
 - **运行目录**：`checkpoints/train_{timestamp}/`
 - **最新模型**：`checkpoints/train_{timestamp}/latest_model.pt`
 - **组合最优模型**：`checkpoints/train_{timestamp}/best_composite_model.pt`
-- **2Å 成功率最优模型**：`checkpoints/train_{timestamp}/best_success2a_model.pt`
+- **Single-shot 2Å 成功率最优模型**：`checkpoints/train_{timestamp}/best_single_shot_success2a_model.pt`
 - **Mean RMSD 最优模型**：`checkpoints/train_{timestamp}/best_rmsd_model.pt`
 - **默认别名**：`checkpoints/train_{timestamp}/best_model.pt`（与 best_selected_model.pt 相同）
 
 训练结束后（若启用 `--run_test_after_training`）额外输出：
 
 - **独立测试集报告**：`checkpoints/train_{timestamp}/reports/test_metrics.json`
-- **三段式 blind 指标**：proposal recall、oracle upper bound、rerank 实际效果，以及 proposal/ranking failure decomposition
+- **三段式 blind 指标**：proposal recall、best-of-k upper bound、最终排序实际效果，以及 proposal/local/ranking failure decomposition
 - **Top-N 指标**：`top1/top5/top10` 在 `<2Å` 和 `<5Å` 下的成功率，以及 Top-N 最优 RMSD 的均值
+- **默认重排逻辑**：最终 pose 排序默认采用 `pose_rank_score` 与 `center` 分支的线性融合；亲和力与位阻分支以弱辅助信号形式参与，默认权重分别为 `0.08` 与 `0.12`
 
 ## Ablation Protocol
 
 推荐可用于论文/专利交底的实验矩阵：
 
-### 核心 ablation（4 组）
+### 核心 ablation（3 组）
 
 1. **Proposal-aware crop 组件对比**
     - `--ablation_mode none`（主方案：proposal-aware crop）
@@ -472,25 +570,6 @@ tail -f "logs/smoke/nohup/nohup_train_${run_suffix}.log"
 3. **No bootstrap vs Bootstrap**
     - `--pose_bootstrap_frequency 0`（baseline）
     - `--pose_bootstrap_frequency 25`（主方案）
-4. **Pose-only rank vs Pose + Center rank**
-    - 通过 `--disable_fusion_calibration` 并固定 `center_weight=0`（baseline）
-    - 通过 `--enable_fusion_calibration` 自动搜索最优 `center_weight`（主方案）
-
-### 融合维度 ablation
-
-测试 affinity/clash 信号是否有增益（默认不纳入主方案）：
-
-```bash
-# pose + center + clash
---fusion_search_clash_weights 0,0.02,0.05
-
-# pose + center + affinity
---fusion_search_aff_weights 0,0.05,0.1
-
-# full grid
---fusion_search_aff_weights 0,0.05,0.1 --fusion_search_clash_weights 0,0.02,0.05
-```
-
 ### 多尺度交互 ablation
 
 - `--ablation_mode inter_multiscale_off`

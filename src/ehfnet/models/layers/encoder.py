@@ -90,8 +90,11 @@ class EHFEncoder(nn.Module):
         interaction_profile: str = "full",
         dynamic_inter_cutoff: float = 10.0,
         dynamic_inter_knn_k: int = 8,
+        dynamic_inter_max_neighbors: int = 64,
         dynamic_residue_cutoff: float = 14.0,
         dynamic_residue_knn_k: int = 6,
+        dynamic_residue_max_neighbors: int = 64,
+        dynamic_residue_candidate_topk: int = 0,
     ) -> None:
         """
         初始化对象。
@@ -111,8 +114,11 @@ class EHFEncoder(nn.Module):
             interaction_profile: 跨图交互拓扑配置。
             dynamic_inter_cutoff: 动态跨图原子边的半径阈值。
             dynamic_inter_knn_k: 动态跨图原子边回退到 kNN 时的邻居数。
+            dynamic_inter_max_neighbors: 动态跨图原子边的单源邻居上限。
             dynamic_residue_cutoff: 动态配体-残基边的半径阈值。
             dynamic_residue_knn_k: 动态配体-残基边回退到 kNN 时的邻居数。
+            dynamic_residue_max_neighbors: 动态配体-残基边的单源邻居上限。
+            dynamic_residue_candidate_topk: 动态配体-残基边每个复合物保留的候选残基数。
 
         Raises:
             ValueError: 当输入参数或运行时状态不满足要求时抛出。
@@ -124,8 +130,11 @@ class EHFEncoder(nn.Module):
         self.interaction_profile = interaction_profile
         self.dynamic_inter_cutoff = float(dynamic_inter_cutoff)
         self.dynamic_inter_knn_k = max(1, int(dynamic_inter_knn_k))
+        self.dynamic_inter_max_neighbors = max(1, int(dynamic_inter_max_neighbors))
         self.dynamic_residue_cutoff = float(dynamic_residue_cutoff)
         self.dynamic_residue_knn_k = max(1, int(dynamic_residue_knn_k))
+        self.dynamic_residue_max_neighbors = max(1, int(dynamic_residue_max_neighbors))
+        self.dynamic_residue_candidate_topk = max(0, int(dynamic_residue_candidate_topk))
 
         if self.interaction_profile not in {"full", "atom_only"}:
             raise ValueError(
@@ -631,7 +640,7 @@ class EHFEncoder(nn.Module):
             radius_cutoff=self.dynamic_inter_cutoff,
             knn_k=self.dynamic_inter_knn_k,
             ensure_src_coverage=True,
-            max_num_neighbors=max(64, self.dynamic_inter_knn_k * 4),
+            max_num_neighbors=self.dynamic_inter_max_neighbors,
         )
 
         edge_dict[key_fw] = edge_fw if edge_fw.numel() > 0 else torch.zeros((2, 0), dtype=torch.long, device=device)
@@ -670,17 +679,55 @@ class EHFEncoder(nn.Module):
         device = lig_pos.device
         lig_batch = self._get_node_batch(data, "ligand_atom", num_nodes=lig_pos.size(0), device=device)
         res_batch = self._get_node_batch(data, "protein_residue", num_nodes=res_pos.size(0), device=device)
+        dst_pos = res_pos
+        dst_batch = res_batch
+        residue_index_map: Tensor | None = None
+
+        if self.dynamic_residue_candidate_topk > 0:
+            batch_size = int(lig_batch.max().item()) + 1 if lig_batch.numel() > 0 else 0
+            lig_centers = scatter_mean(
+                lig_pos,
+                lig_batch,
+                dim=0,
+                dim_size=batch_size,
+            )
+            selected_residue_indices: list[Tensor] = []
+            for graph_idx in range(batch_size):
+                residue_indices = torch.where(res_batch == graph_idx)[0]
+                if residue_indices.numel() == 0:
+                    continue
+                if residue_indices.numel() <= self.dynamic_residue_candidate_topk:
+                    selected_residue_indices.append(residue_indices)
+                    continue
+                residue_dist = torch.norm(
+                    res_pos[residue_indices] - lig_centers[graph_idx].unsqueeze(0),
+                    dim=-1,
+                )
+                nearest_local = torch.topk(
+                    residue_dist,
+                    k=self.dynamic_residue_candidate_topk,
+                    largest=False,
+                ).indices
+                selected_residue_indices.append(residue_indices[nearest_local])
+            if selected_residue_indices:
+                residue_index_map = torch.cat(selected_residue_indices, dim=0)
+                residue_index_map = torch.unique(residue_index_map, sorted=True)
+                dst_pos = res_pos[residue_index_map]
+                dst_batch = res_batch[residue_index_map]
 
         edge_fw = build_batched_radius_or_knn_edges(
             src_pos=lig_pos,
             src_batch=lig_batch,
-            dst_pos=res_pos,
-            dst_batch=res_batch,
+            dst_pos=dst_pos,
+            dst_batch=dst_batch,
             radius_cutoff=self.dynamic_residue_cutoff,
             knn_k=self.dynamic_residue_knn_k,
             ensure_src_coverage=True,
-            max_num_neighbors=max(64, self.dynamic_residue_knn_k * 6),
+            max_num_neighbors=self.dynamic_residue_max_neighbors,
         )
+        if residue_index_map is not None and edge_fw.numel() > 0:
+            edge_fw = edge_fw.clone()
+            edge_fw[1] = residue_index_map[edge_fw[1]]
 
         edge_dict[key_fw] = edge_fw if edge_fw.numel() > 0 else torch.zeros((2, 0), dtype=torch.long, device=device)
         edge_dict[key_bw] = edge_dict[key_fw].flip(0) if edge_dict[key_fw].numel() > 0 else edge_dict[key_fw]

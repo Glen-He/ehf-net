@@ -13,6 +13,7 @@ __all__ = [
     "calibrate_linear_fusion_weights",
     "combine_center_pose_score",
     "compute_center_guidance_scores",
+    "evaluate_topn_success",
     "predict_center_proposal_logits",
     "select_diverse_center_indices",
     "summarize_blind_candidate_records",
@@ -34,6 +35,10 @@ _EXPORT_MAP = {
     "compute_center_guidance_scores": (
         "ehfnet.training.inference.center_utils",
         "compute_center_guidance_scores",
+    ),
+    "evaluate_topn_success": (
+        "ehfnet.training.inference.evaluator",
+        "evaluate_topn_success",
     ),
     "predict_center_proposal_logits": (
         "ehfnet.training.inference.center_utils",

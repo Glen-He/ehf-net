@@ -16,8 +16,8 @@ from ehfnet.models import EHFNet
 DEFAULT_FUSION_WEIGHTS: dict[str, float] = {
     "pose_weight": 1.0,
     "center_weight": 0.35,
-    "aff_weight": 0.0,
-    "clash_weight": 0.0,
+    "aff_weight": 0.08,
+    "clash_weight": 0.12,
     "bias": 0.0,
 }
 

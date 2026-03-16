@@ -32,7 +32,6 @@ class EHFNetOutput(TypedDict):
     v_rotation: Tensor
     v_torsion: Tensor
     binding_affinity: Tensor
-    pose_quality: Tensor
     pose_rank_score: Tensor
     steric_clash_batch: Tensor | None
 
@@ -77,8 +76,11 @@ class EHFNet(nn.Module):
         knn_fallback_k: int,
         dynamic_inter_cutoff: float,
         dynamic_inter_knn_k: int,
+        dynamic_inter_max_neighbors: int,
         dynamic_residue_cutoff: float,
         dynamic_residue_knn_k: int,
+        dynamic_residue_max_neighbors: int,
+        dynamic_residue_candidate_topk: int,
     ) -> None:
         """
         初始化 EHFNet 模型。
@@ -116,8 +118,11 @@ class EHFNet(nn.Module):
             knn_fallback_k: 回退到 kNN 时使用的邻居数。
             dynamic_inter_cutoff: 动态跨图原子边的半径阈值。
             dynamic_inter_knn_k: 动态跨图原子边回退到 kNN 时的邻居数。
+            dynamic_inter_max_neighbors: 动态跨图原子边的单源邻居上限。
             dynamic_residue_cutoff: 动态配体-残基边的半径阈值。
             dynamic_residue_knn_k: 动态配体-残基边回退到 kNN 时的邻居数。
+            dynamic_residue_max_neighbors: 动态配体-残基边的单源邻居上限。
+            dynamic_residue_candidate_topk: 动态配体-残基边每个复合物保留的候选残基数。
 
         Raises:
             ValueError: 当输入参数或运行时状态不满足要求时抛出。
@@ -146,8 +151,11 @@ class EHFNet(nn.Module):
             "knn_fallback_k": knn_fallback_k,
             "dynamic_inter_cutoff": dynamic_inter_cutoff,
             "dynamic_inter_knn_k": dynamic_inter_knn_k,
+            "dynamic_inter_max_neighbors": dynamic_inter_max_neighbors,
             "dynamic_residue_cutoff": dynamic_residue_cutoff,
             "dynamic_residue_knn_k": dynamic_residue_knn_k,
+            "dynamic_residue_max_neighbors": dynamic_residue_max_neighbors,
+            "dynamic_residue_candidate_topk": dynamic_residue_candidate_topk,
         }
         missing_args = [name for name, value in required_args.items() if value is None]
         if missing_args:
@@ -175,8 +183,11 @@ class EHFNet(nn.Module):
             num_rbf=num_rbf,
             dynamic_inter_cutoff=dynamic_inter_cutoff,
             dynamic_inter_knn_k=dynamic_inter_knn_k,
+            dynamic_inter_max_neighbors=dynamic_inter_max_neighbors,
             dynamic_residue_cutoff=dynamic_residue_cutoff,
             dynamic_residue_knn_k=dynamic_residue_knn_k,
+            dynamic_residue_max_neighbors=dynamic_residue_max_neighbors,
+            dynamic_residue_candidate_topk=dynamic_residue_candidate_topk,
         )
 
         self.prediction_head = PredictionHead(
@@ -474,7 +485,6 @@ class EHFNet(nn.Module):
             v_torsion = torch.zeros(0, device=device, dtype=lig_mol_feat.dtype)
 
         binding_affinity = predictions["binding_affinity"]
-        pose_quality = predictions["pose_quality"]
         pose_rank_score = predictions["pose_rank_score"]
         steric_clash_batch = predictions.get("steric_clash_batch")
 
@@ -484,7 +494,6 @@ class EHFNet(nn.Module):
             "v_rotation": v_rotation,
             "v_torsion": v_torsion,
             "binding_affinity": binding_affinity,
-            "pose_quality": pose_quality,
             "pose_rank_score": pose_rank_score,
             "steric_clash_batch": steric_clash_batch,
         }

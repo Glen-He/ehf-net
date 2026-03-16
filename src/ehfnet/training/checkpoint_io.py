@@ -51,52 +51,48 @@ def build_selection_metrics(metrics: dict[str, Any]) -> dict[str, float]:
     Returns:
         dict[str, float]: 用于最佳 checkpoint 选择的指标字典。
     """
-    success_2a = safe_metric(metrics.get("reranked_top1_success_2a", metrics.get("success_2a")), 0.0)
-    success_5a = safe_metric(metrics.get("reranked_top5_success_2a", metrics.get("success_5a")), 0.0)
-    oracle_top5_success_2a = safe_metric(metrics.get("oracle_top5_success_2a"), 0.0)
-    mean_rmsd = safe_metric(
-        metrics.get("reranked_top1_mean_best_rmsd", metrics.get("mean_rmsd_final")),
-        1e9,
-        higher_is_better=False,
-    )
-    val_loss = safe_metric(
-        metrics.get("val_loss", metrics.get("reranked_top1_mean_best_rmsd")),
-        1e9,
-        higher_is_better=False,
-    )
-    center_recall = safe_metric(metrics.get("center_recall@8"), 0.0)
-    proposal_gap = safe_metric(metrics.get("proposal_gap"), 100.0, higher_is_better=False)
-    ranking_gap = safe_metric(metrics.get("ranking_gap"), 100.0, higher_is_better=False)
+    single_shot_success_2a = safe_metric(metrics.get("single_shot_success_2a"), 0.0)
+    single_shot_success_5a = safe_metric(metrics.get("single_shot_success_5a"), 0.0)
+    mean_rmsd = safe_metric(metrics.get("mean_rmsd_final"), 1e9, higher_is_better=False)
+    val_loss = safe_metric(metrics.get("val_loss"), 1e9, higher_is_better=False)
     composite_score = (
-        1.75 * success_2a
-        + 0.35 * success_5a
-        + 0.20 * oracle_top5_success_2a
-        + 0.10 * center_recall
+        1.75 * single_shot_success_2a
+        + 0.35 * single_shot_success_5a
         - 0.75 * mean_rmsd
-        - 0.15 * proposal_gap
-        - 0.20 * ranking_gap
+        - 0.20 * val_loss
     )
-    blind_combo_score = 1.0 * success_2a + 0.35 * oracle_top5_success_2a - 0.10 * ranking_gap
+    rmsd_priority_score = (
+        2.50 * single_shot_success_2a
+        + 0.75 * single_shot_success_5a
+        - 1.25 * mean_rmsd
+        - 0.05 * val_loss
+    )
 
     return {
         "composite_score": composite_score,
-        "blind_combo_score": blind_combo_score,
-        "success_2a": success_2a,
-        "success_5a": success_5a,
-        "oracle_top5_success_2a": oracle_top5_success_2a,
+        "rmsd_priority_score": rmsd_priority_score,
+        "single_shot_success_2a": single_shot_success_2a,
+        "single_shot_success_5a": single_shot_success_5a,
         "mean_rmsd": mean_rmsd,
         "val_loss": val_loss,
-        "center_recall@8": center_recall,
-        "proposal_gap": proposal_gap,
-        "ranking_gap": ranking_gap,
     }
 
 
 CHECKPOINT_SELECTION_MODES: dict[str, tuple[str, bool, str]] = {
     "composite": ("composite_score", True, "Composite"),
-    "reranked_top1_success_2a": ("success_2a", True, "Rerank@1<2A"),
-    "reranked_top5_success_2a": ("success_5a", True, "Rerank@5<2A"),
-    "reranked_top1_plus_oracle_top5": ("blind_combo_score", True, "Rerank@1 + Oracle@5"),
+    "rmsd_priority": ("rmsd_priority_score", True, "RMSD Priority"),
+    "mean_rmsd": ("mean_rmsd", False, "Mean RMSD"),
+    "val_loss": ("val_loss", False, "Val Loss"),
+    "single_shot_success_2a": (
+        "single_shot_success_2a",
+        True,
+        "Single-shot Success@2A",
+    ),
+    "single_shot_success_5a": (
+        "single_shot_success_5a",
+        True,
+        "Single-shot Success@5A",
+    ),
 }
 
 
@@ -167,14 +163,14 @@ def is_better_checkpoint(
         if candidate_primary > incumbent_primary + tol:
             return False
 
-    if candidate["success_2a"] > incumbent["success_2a"] + tol:
+    if candidate["single_shot_success_2a"] > incumbent["single_shot_success_2a"] + tol:
         return True
-    if candidate["success_2a"] < incumbent["success_2a"] - tol:
+    if candidate["single_shot_success_2a"] < incumbent["single_shot_success_2a"] - tol:
         return False
 
-    if candidate["success_5a"] > incumbent["success_5a"] + tol:
+    if candidate["single_shot_success_5a"] > incumbent["single_shot_success_5a"] + tol:
         return True
-    if candidate["success_5a"] < incumbent["success_5a"] - tol:
+    if candidate["single_shot_success_5a"] < incumbent["single_shot_success_5a"] - tol:
         return False
 
     if candidate["mean_rmsd"] < incumbent["mean_rmsd"] - tol:
@@ -244,8 +240,11 @@ def compose_checkpoint(
     protein_residue_fallback_k: int,
     dynamic_inter_cutoff: float,
     dynamic_inter_knn_k: int,
+    dynamic_inter_max_neighbors: int,
     dynamic_residue_cutoff: float,
     dynamic_residue_knn_k: int,
+    dynamic_residue_max_neighbors: int,
+    dynamic_residue_candidate_topk: int,
 ) -> dict[str, Any]:
     """
     组装 checkpoint 内容。
@@ -306,8 +305,11 @@ def compose_checkpoint(
         protein_residue_fallback_k: 蛋白残基层图内边回退到 kNN 时的邻居数。
         dynamic_inter_cutoff: 动态跨图原子边的半径阈值。
         dynamic_inter_knn_k: 动态跨图原子边回退到 kNN 时的邻居数。
+        dynamic_inter_max_neighbors: 动态跨图原子边的单源邻居上限。
         dynamic_residue_cutoff: 动态配体-残基边的半径阈值。
         dynamic_residue_knn_k: 动态配体-残基边回退到 kNN 时的邻居数。
+        dynamic_residue_max_neighbors: 动态配体-残基边的单源邻居上限。
+        dynamic_residue_candidate_topk: 动态配体-残基边每个复合物保留的候选残基数。
 
     Returns:
         dict[str, Any]: 可直接保存到磁盘的完整 checkpoint 字典。
@@ -351,8 +353,11 @@ def compose_checkpoint(
         protein_residue_fallback_k=protein_residue_fallback_k,
         dynamic_inter_cutoff=dynamic_inter_cutoff,
         dynamic_inter_knn_k=dynamic_inter_knn_k,
+        dynamic_inter_max_neighbors=dynamic_inter_max_neighbors,
         dynamic_residue_cutoff=dynamic_residue_cutoff,
         dynamic_residue_knn_k=dynamic_residue_knn_k,
+        dynamic_residue_max_neighbors=dynamic_residue_max_neighbors,
+        dynamic_residue_candidate_topk=dynamic_residue_candidate_topk,
     )
     return {
         "epoch": epoch_idx,

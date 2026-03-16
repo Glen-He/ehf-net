@@ -200,15 +200,6 @@ class PredictionHead(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
         )
 
-        self.pose_quality_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 3 + 6, hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.SiLU(),
-            nn.Linear(hidden_dim // 2, 1),
-        )
-
         self.pose_rank_mlp = nn.Sequential(
             nn.Linear(hidden_dim * 2 + 3 + 6, hidden_dim),
             nn.SiLU(),
@@ -265,7 +256,6 @@ class PredictionHead(nn.Module):
 
             return {
                 "binding_affinity": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
-                "pose_quality": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
                 "pose_rank_score": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
                 "steric_clash_batch": torch.zeros(B, device=device, dtype=torch.float32),
                 "ligand_interaction_context": torch.zeros_like(lig_atom_feat),
@@ -324,7 +314,6 @@ class PredictionHead(nn.Module):
 
             return {
                 "binding_affinity": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
-                "pose_quality": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
                 "pose_rank_score": torch.zeros((B, 1), device=device, dtype=lig_atom_feat.dtype),
                 "steric_clash_batch": torch.zeros(B, device=device, dtype=torch.float32),
                 "ligand_interaction_context": torch.zeros_like(lig_atom_feat),
@@ -443,7 +432,10 @@ class PredictionHead(nn.Module):
 
         context_sum = scatter_add(context_atom, lig_batch, dim=0, dim_size=B)
         context_global = context_sum / atom_counts.clamp(min=1).unsqueeze(-1)
-        force_norm_sum = scatter_add(force_atom.norm(dim=-1), lig_batch, dim=0, dim_size=B)
+        force_atom_norm = torch.sqrt(
+            force_atom.pow(2).sum(dim=-1) + PredictionConstants.EPSILON
+        )
+        force_norm_sum = scatter_add(force_atom_norm, lig_batch, dim=0, dim_size=B)
         force_norm_global = force_norm_sum / atom_counts.clamp(min=1.0)
 
         global_input = torch.cat([lig_mol_feat, context_global], dim=-1)
@@ -466,18 +458,27 @@ class PredictionHead(nn.Module):
             torch.ones(N_pro, device=device, dtype=torch.float32),
             pro_atom_batch, dim=0, dim_size=B,
         ).clamp(min=1).unsqueeze(-1)
-        centroid_dist = torch.norm(lig_centroid - pro_centroid, dim=-1, keepdim=True)
+        centroid_delta = lig_centroid - pro_centroid
+        centroid_dist = torch.sqrt(
+            centroid_delta.pow(2).sum(dim=-1, keepdim=True) + PredictionConstants.EPSILON
+        )
 
         min_dist_per_lig = torch.full((N_lig,), float("inf"), device=device)
         if edge_index.size(1) > 0:
             min_dist_per_lig.scatter_reduce_(0, i_idx, dist.float(), reduce="amin", include_self=True)
+        min_dist_per_lig = torch.where(
+            torch.isfinite(min_dist_per_lig),
+            min_dist_per_lig,
+            torch.full_like(min_dist_per_lig, self.r_cutoff),
+        )
         min_dist_per_mol = scatter_add(
             min_dist_per_lig, lig_batch, dim=0, dim_size=B
         ) / atom_counts.clamp(min=1)
 
         dist_per_atom = scatter_add(dist.float(), i_idx, dim=0, dim_size=N_lig) / edge_count_per_atom
         dist_sq_per_atom = scatter_add(dist.float().pow(2), i_idx, dim=0, dim_size=N_lig) / edge_count_per_atom
-        dist_std_per_atom = (dist_sq_per_atom - dist_per_atom.pow(2)).clamp(min=0).sqrt()
+        dist_var_per_atom = (dist_sq_per_atom - dist_per_atom.pow(2)).clamp(min=0.0)
+        dist_std_per_atom = torch.sqrt(dist_var_per_atom + PredictionConstants.EPSILON)
 
         dist_mean_edge = scatter_add(dist_per_atom, lig_batch, dim=0, dim_size=B) / atom_counts
         dist_std_edge = scatter_add(dist_std_per_atom, lig_batch, dim=0, dim_size=B) / atom_counts
@@ -491,7 +492,7 @@ class PredictionHead(nn.Module):
             clash_hotspot_batch.unsqueeze(-1),
         ], dim=-1)
 
-        pose_quality_input = torch.cat(
+        pose_rank_input = torch.cat(
             [
                 global_input,
                 binding_affinity,
@@ -501,12 +502,10 @@ class PredictionHead(nn.Module):
             ],
             dim=-1,
         )
-        pose_quality = self.pose_quality_mlp(pose_quality_input)
-        pose_rank_score = self.pose_rank_mlp(pose_quality_input)
+        pose_rank_score = self.pose_rank_mlp(pose_rank_input)
 
         return {
             "binding_affinity": binding_affinity,
-            "pose_quality": pose_quality,
             "pose_rank_score": pose_rank_score,
             "steric_clash_batch": steric_clash_batch,
             "ligand_interaction_context": context_atom,

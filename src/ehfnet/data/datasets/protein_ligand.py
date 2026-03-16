@@ -41,11 +41,14 @@ from ehfnet.data.preprocess import (
     prepare_graph_sample,
 )
 from ehfnet.data.datasets.ligand_sanitize import LigandSanitizationError
-from ehfnet.data.datasets.pose_initialization import generate_decoupled_ligand_positions
-from ehfnet.graph import ESMEmbeddingFiller, GraphBuilder
+from ehfnet.data.datasets.pose_initialization import (
+    build_start_positions,
+)
+from ehfnet.graph import ESMEmbeddingFiller, GraphBuilder, build_graph_cost_profile
 
 
 logger = logging.getLogger(__name__)
+GRAPH_COST_PROFILE_VERSION = 1
 
 
 class ProteinLigandDataset(Dataset):
@@ -278,6 +281,8 @@ class ProteinLigandDataset(Dataset):
         payload.setdefault("cache_dir", GRAPH_CACHE_DIRNAME)
         payload.setdefault("esm_model_name", self.esm_model_name)
         payload.setdefault("esm_dim", self.esm_dim)
+        if "graph_cost_profile" in payload:
+            payload["graph_cost_profile_version"] = GRAPH_COST_PROFILE_VERSION
         with open(self._preprocess_metadata_path(pdb_id), "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=True, indent=2, sort_keys=True)
 
@@ -303,6 +308,8 @@ class ProteinLigandDataset(Dataset):
         payload.setdefault("cache_dir", GRAPH_CACHE_DIRNAME)
         payload.setdefault("esm_model_name", None)
         payload.setdefault("esm_dim", None)
+        payload.setdefault("graph_cost_profile", None)
+        payload.setdefault("graph_cost_profile_version", 0)
         return payload
 
     def _is_cached_preprocess_metadata_compatible(self, metadata: dict[str, Any]) -> bool:
@@ -334,8 +341,41 @@ class ProteinLigandDataset(Dataset):
         metadata = extract_ligand_sanitize_metadata(data)
         metadata["esm_model_name"] = None
         metadata["esm_dim"] = None
+        metadata["graph_cost_profile"] = build_graph_cost_profile(data)
+        metadata["graph_cost_profile_version"] = GRAPH_COST_PROFILE_VERSION
         self._write_preprocess_metadata(pdb_id, metadata)
         return metadata
+
+    def get_graph_cost_profile(self, idx: int) -> dict[str, int]:
+        """
+        读取或恢复指定样本的图成本画像。
+
+        Args:
+            idx: 当前访问的样本索引。
+
+        Returns:
+            dict[str, int]: 包含节点、边和扭转规模信息的成本画像。
+
+        Raises:
+            IndexError: 当索引超出有效样本范围时抛出。
+        """
+        if idx < 0 or idx >= len(self._valid_pdb_ids):
+            raise IndexError(f"Index {idx} out of range [0, {len(self._valid_pdb_ids)})")
+
+        pdb_id = self._valid_pdb_ids[idx]
+        graph_path = osp.join(self.processed_dir, f"data_{pdb_id}.pt")
+        metadata = self._load_or_recover_preprocess_metadata(pdb_id, graph_path)
+        cached_profile = metadata.get("graph_cost_profile")
+        cached_version = int(metadata.get("graph_cost_profile_version", 0))
+        if isinstance(cached_profile, dict) and cached_version == GRAPH_COST_PROFILE_VERSION:
+            return {str(key): int(value) for key, value in cached_profile.items()}
+
+        data = cast(HeteroData, torch.load(graph_path, map_location="cpu", weights_only=False))
+        graph_cost_profile = build_graph_cost_profile(data)
+        metadata["graph_cost_profile"] = graph_cost_profile
+        metadata["graph_cost_profile_version"] = GRAPH_COST_PROFILE_VERSION
+        self._write_preprocess_metadata(pdb_id, metadata)
+        return graph_cost_profile
 
     def _write_preprocess_summary(self, summary: dict[str, Any]) -> None:
         os.makedirs(self.processed_dir, exist_ok=True)
@@ -427,6 +467,8 @@ class ProteinLigandDataset(Dataset):
                 if self.pre_transform is not None:
                     data = self.pre_transform(data)
 
+                metadata["graph_cost_profile"] = build_graph_cost_profile(data)
+                metadata["graph_cost_profile_version"] = GRAPH_COST_PROFILE_VERSION
                 torch.save(data, out_path)
                 self._write_preprocess_metadata(pdb_id, metadata)
                 success_count += 1
@@ -586,7 +628,7 @@ class ProteinLigandDataset(Dataset):
             return None
 
         seed = zlib.adler32(pdb_id.encode("utf-8")) & 0xFFFFFFFF
-        start_pos_np = generate_decoupled_ligand_positions(
+        start_pos_np = build_start_positions(
             lig_path,
             random_seed=seed,
         )

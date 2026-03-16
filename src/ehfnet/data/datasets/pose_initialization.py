@@ -100,3 +100,33 @@ def generate_decoupled_ligand_positions(
         start_mol = remove_all_hs_safe(start_mol)
 
     return get_positions(start_mol).astype(np.float32, copy=False)
+
+
+def build_start_positions(
+    ligand_path: str,
+    *,
+    random_seed: int,
+    remove_hs: bool = True,
+) -> np.ndarray:
+    """
+    构建解耦初始配体坐标。
+
+    当前实现固定使用 `rdkit_decoupled` 路径，
+    即仅基于 ligand 文件中的分子拓扑重新嵌入三维构象。
+
+    Args:
+        ligand_path: 配体文件路径。
+        random_seed: 随机种子。
+        remove_hs: 是否移除分子中的显式氢原子。
+
+    Returns:
+        np.ndarray: 解耦初始配体坐标。
+
+    Raises:
+        ValueError: 当输入参数或运行时状态不满足要求时抛出。
+    """
+    return generate_decoupled_ligand_positions(
+        ligand_path,
+        random_seed=random_seed,
+        remove_hs=remove_hs,
+    )

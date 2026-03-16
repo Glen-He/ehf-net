@@ -37,7 +37,10 @@ clip_grad = 1.0
 warmup_epochs = 20
 accumulation_steps = 8
 ema_decay = 0.999
-rmsd_ratio = 0.2
+val_subset_ratio = 0.3
+val_full_every = 10
+val_full_last_epochs = 10
+ode_method = "euler"
 
 [split]
 split_train_frac = 0.7
@@ -48,29 +51,34 @@ split_cache_file = "cache/splits/hiqbind_scaffold_split.json"
 force_resplit = false
 
 [batching]
-max_nodes_per_batch = 20000
-val_max_nodes_per_batch = 6000
-test_max_nodes_per_batch = 5000
-topn_max_nodes_per_batch = 4000
-edge_budget_factor = 40
-eval_edge_guard_headroom = 1.5
+train_cost_budget = 1300000
+val_cost_budget = 1300000
+blind_pool_cost_budget = 1600000
+final_topn_cost_budget = 1600000
+eval_cost_guard_headroom = 1.5
 dataloader_num_workers = 4
 dataloader_pin_memory = true
 dataloader_persistent_workers = true
-enable_oom_adaptive_batch = true
-enable_val_oom_adaptive_batch = true
+max_oom_retry_splits = 3
+enable_train_budget_callback = true
+enable_val_budget_callback = true
 oom_reduce_threshold = 3
 oom_reduce_factor = 0.85
-min_max_nodes_per_batch = 12000
+min_train_cost_budget = 480000
 val_oom_reduce_threshold = 3
 val_oom_reduce_factor = 0.85
-min_val_max_nodes_per_batch = 3000
-oom_recover_epochs = 3
-oom_recover_factor = 1.1
+min_val_cost_budget = 120000
+train_budget_window_size = 8
+train_budget_recover_window_count = 2
+train_budget_recover_step = 80000
+train_offender_cooldown = 6
+val_budget_window_size = 4
+val_budget_recover_window_count = 2
+val_budget_recover_step = 80000
+val_offender_cooldown = 4
 
 [blind_inference]
 test_topk = "1,5,10"
-test_pose_samples = 10
 val_ode_steps = 50
 center_proposal_topk = 8
 center_refine_topk = 3
@@ -81,18 +89,34 @@ stage2_pose_samples = 4
 [proposal]
 center_proposal_weight = 0.15
 center_positive_radius = 4.0
+center_guidance_learned_start = 0.35
 crop_candidate_topk = 8
+crop_proposal_start = 0.10
+crop_near_miss_start = 0.35
+crop_hard_negative_start = 0.65
 crop_min_residues = 12
 crop_atom_margin = 2.0
 disable_jitter_crop = false
 disable_hard_negative_crop = false
 
 [ranking]
-pose_ranking_pair_weight = 0.2
+pose_ranking_pair_weight = 0.1
 pose_ranking_margin = 0.5
+ranking_same_center_start = 0.55
+ranking_wrong_center_start = 0.75
+same_center_micro_batch_size = 2
+same_center_budget_window_size = 8
+same_center_budget_recover_window_count = 2
+same_center_budget_recover_step = 1
+same_center_offender_cooldown = 6
+ranking_budget_window_size = 8
+ranking_budget_recover_window_count = 2
+ranking_offender_cooldown = 6
+ranking_wrong_center_cap = 1
 
 [bootstrap]
 pose_bootstrap_weight = 0.05
+pose_bootstrap_start = 0.80
 pose_bootstrap_frequency = 25
 pose_bootstrap_ode_steps = 10
 
@@ -101,19 +125,20 @@ pose_bootstrap_ode_steps = 10
 # 候选池会周期性刷新，当前模型会重新打分缓存 pose。
 blind_pool_refresh_every = 3
 blind_pool_start_epoch = 2
+blind_pool_refresh_on_best_update = false
 blind_pool_max_complexes = 500
 blind_pool_cache_bce_weight = 1.0
 blind_pool_cache_rank_weight = 1.0
 blind_pool_pairs_per_complex = 4
+replay_start_ratio = 0.85
+replay_micro_batch_size = 4
+replay_budget_window_size = 8
+replay_budget_recover_window_count = 2
+replay_candidate_cooldown = 6
+replay_max_candidates_per_complex = 8
 
 [checkpoint]
-checkpoint_selection_mode = "composite"
-
-[fusion]
-enable_fusion_calibration = true
-fusion_search_center_weights = "0,0.15,0.25,0.35,0.5,0.65"
-fusion_search_aff_weights = "0"
-fusion_search_clash_weights = "0"
+checkpoint_selection_mode = "rmsd_priority"
 
 [ablation]
 ablation_mode = "none"

@@ -218,8 +218,11 @@ def build_model(
     knn_fallback_k: int,
     dynamic_inter_cutoff: float,
     dynamic_inter_knn_k: int,
+    dynamic_inter_max_neighbors: int,
     dynamic_residue_cutoff: float,
     dynamic_residue_knn_k: int,
+    dynamic_residue_max_neighbors: int,
+    dynamic_residue_candidate_topk: int,
 ) -> EHFNet:
     """
     构造 EHFNet 模型。
@@ -257,8 +260,11 @@ def build_model(
         knn_fallback_k: 回退到 kNN 时使用的邻居数。
         dynamic_inter_cutoff: 动态跨图原子边的半径阈值。
         dynamic_inter_knn_k: 动态跨图原子边回退到 kNN 时的邻居数。
+        dynamic_inter_max_neighbors: 动态跨图原子边的单源邻居上限。
         dynamic_residue_cutoff: 动态配体-残基边的半径阈值。
         dynamic_residue_knn_k: 动态配体-残基边回退到 kNN 时的邻居数。
+        dynamic_residue_max_neighbors: 动态配体-残基边的单源邻居上限。
+        dynamic_residue_candidate_topk: 动态配体-残基边每个复合物保留的候选残基数。
 
     Returns:
         EHFNet: 按给定参数实例化完成的主模型。
@@ -322,11 +328,23 @@ def build_model(
         dynamic_inter_knn_k=int(
             _require_value(dynamic_inter_knn_k, name="dynamic_inter_knn_k")
         ),
+        dynamic_inter_max_neighbors=int(
+            _require_value(dynamic_inter_max_neighbors, name="dynamic_inter_max_neighbors")
+        ),
         dynamic_residue_cutoff=float(
             _require_value(dynamic_residue_cutoff, name="dynamic_residue_cutoff")
         ),
         dynamic_residue_knn_k=int(
             _require_value(dynamic_residue_knn_k, name="dynamic_residue_knn_k")
+        ),
+        dynamic_residue_max_neighbors=int(
+            _require_value(dynamic_residue_max_neighbors, name="dynamic_residue_max_neighbors")
+        ),
+        dynamic_residue_candidate_topk=int(
+            _require_value(
+                dynamic_residue_candidate_topk,
+                name="dynamic_residue_candidate_topk",
+            )
         ),
     )
 
@@ -382,7 +400,10 @@ def build_model_from_config(
         knn_fallback_k=int(model_config["knn_fallback_k"]),
         dynamic_inter_cutoff=float(model_config["dynamic_inter_cutoff"]),
         dynamic_inter_knn_k=int(model_config["dynamic_inter_knn_k"]),
+        dynamic_inter_max_neighbors=int(model_config["dynamic_inter_max_neighbors"]),
         dynamic_residue_cutoff=float(model_config["dynamic_residue_cutoff"]),
         dynamic_residue_knn_k=int(model_config["dynamic_residue_knn_k"]),
+        dynamic_residue_max_neighbors=int(model_config["dynamic_residue_max_neighbors"]),
+        dynamic_residue_candidate_topk=int(model_config["dynamic_residue_candidate_topk"]),
     )
     return model.to(device) if device is not None else model

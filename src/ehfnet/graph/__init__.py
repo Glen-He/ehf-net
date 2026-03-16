@@ -17,6 +17,9 @@ __all__ = [
     "crop_graph_to_center",
     "build_context_features",
     "context_feature_dim",
+    "build_graph_cost_profile",
+    "estimate_dynamic_edge_upper_bounds",
+    "estimate_graph_cost_units",
     "build_batched_bipartite_knn_edges",
     "build_batched_radius_or_knn_edges",
     "AGGREGATE_EDGES",
@@ -47,6 +50,12 @@ _EXPORT_MAP = {
         "build_context_features",
     ),
     "context_feature_dim": ("ehfnet.graph.features.protein_context", "context_feature_dim"),
+    "build_graph_cost_profile": ("ehfnet.graph.costs", "build_graph_cost_profile"),
+    "estimate_dynamic_edge_upper_bounds": (
+        "ehfnet.graph.costs",
+        "estimate_dynamic_edge_upper_bounds",
+    ),
+    "estimate_graph_cost_units": ("ehfnet.graph.costs", "estimate_graph_cost_units"),
     "build_batched_bipartite_knn_edges": (
         "ehfnet.graph.inter_edges",
         "build_batched_bipartite_knn_edges",

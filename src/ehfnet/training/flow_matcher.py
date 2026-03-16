@@ -251,7 +251,7 @@ class ConditionalFlowMatcher:
         data: HeteroData,
         steps: int,
         inference_t_start: float = 0.0,
-        method: str = "rk4",
+        method: str = "euler",
         store_trajectory: bool = False,
     ) -> tuple[Tensor, list[Tensor] | None]:
         """
@@ -267,6 +267,9 @@ class ConditionalFlowMatcher:
 
         Returns:
             tuple[Tensor, list[Tensor] | None]: 返回最终生成的坐标，以及可选的中间轨迹列表。
+
+        Raises:
+            ValueError: 当积分方法不是 `euler` 或 `rk4` 时抛出。
         """
 
         device = data["ligand_atom"].pos.device
@@ -412,6 +415,9 @@ class ConditionalFlowMatcher:
                         torsion_moving_mask=torsion_moving_mask,
                         dt=dt,
                     )
+
+                else:
+                    raise ValueError(f"Unsupported ODE method: {method!r}.")
 
                 if trajectory is not None:
                     trajectory.append(current_pos.clone())

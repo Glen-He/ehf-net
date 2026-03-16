@@ -17,6 +17,54 @@ from torch_scatter import scatter_min
 from ehfnet.graph.builders import GraphBuilder
 
 
+def _normalize_atom_residue_idx(data: HeteroData) -> Tensor:
+    """
+    归一化蛋白原子到残基的映射索引。
+
+    运行时局部裁剪既可能收到原始单样本图，也可能收到由 batch
+    拆回的样本。后者的 `residue_idx` 可能仍带有全局偏移，因此这里
+    在裁剪入口统一归一化为局部残基索引。
+
+    Args:
+        data: 当前处理的图数据对象。
+
+    Returns:
+        Tensor: 与当前样本局部残基节点对齐的 `residue_idx`。
+
+    Raises:
+        RuntimeError: 当 `residue_idx` 无法与局部残基节点数对齐时抛出。
+    """
+    residue_idx = data["protein_atom"].residue_idx.long()
+    num_residues = int(data["protein_residue"].num_nodes)
+    if residue_idx.numel() == 0 or num_residues <= 0:
+        return residue_idx
+
+    min_idx = int(residue_idx.min().item())
+    max_idx = int(residue_idx.max().item())
+    if 0 <= min_idx and max_idx < num_residues:
+        return residue_idx
+
+    shifted = residue_idx - min_idx
+    if min_idx >= 0 and int(shifted.max().item()) < num_residues:
+        return shifted
+
+    unique_idx = torch.unique(residue_idx, sorted=True)
+    if int(unique_idx.numel()) > num_residues:
+        raise RuntimeError(
+            "protein_atom.residue_idx references more residues than protein_residue stores "
+            f"(unique={int(unique_idx.numel())}, num_residues={num_residues})."
+        )
+
+    positions = torch.bucketize(residue_idx, unique_idx)
+    normalized = positions.long()
+    if int(normalized.max().item()) >= num_residues:
+        raise RuntimeError(
+            "protein_atom.residue_idx is inconsistent with protein_residue.num_nodes "
+            f"(max_idx={max_idx}, num_residues={num_residues})."
+        )
+    return normalized
+
+
 def compute_ligand_center(data: HeteroData) -> Tensor:
     """
     计算配体几何中心。
@@ -77,7 +125,7 @@ def crop_graph_to_center(
     residue_dist = torch.norm(residue_pos - center.unsqueeze(0), dim=-1)
 
     atom_pos = data["protein_atom"].pos
-    atom_residue_idx = data["protein_atom"].residue_idx
+    atom_residue_idx = _normalize_atom_residue_idx(data)
     atom_dist = torch.norm(atom_pos - center.unsqueeze(0), dim=-1)
     residue_atom_min_dist = torch.full(
         (int(data["protein_residue"].num_nodes),),
@@ -170,14 +218,12 @@ def crop_graph_to_center(
     _copy_store("protein_residue", residue_idx)
     _copy_store("protein_atom", atom_idx)
 
-    local_atom_residue_idx = residue_old_to_new[data["protein_atom"].residue_idx[atom_idx]]
+    local_atom_residue_idx = residue_old_to_new[atom_residue_idx[atom_idx]]
     valid_atom_mask = local_atom_residue_idx >= 0
     if not bool(valid_atom_mask.all()):
         atom_idx = atom_idx[valid_atom_mask]
         _copy_store("protein_atom", atom_idx)
-        local_atom_residue_idx = residue_old_to_new[
-            data["protein_atom"].residue_idx[atom_idx]
-        ]
+        local_atom_residue_idx = residue_old_to_new[atom_residue_idx[atom_idx]]
 
     out["protein_atom"].residue_idx = local_atom_residue_idx.long()
     out["protein_context"].x_cont = graph_builder.build_context_node_features(

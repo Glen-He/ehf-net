@@ -20,6 +20,8 @@ from torch import Tensor
 from torch.utils.data import Dataset, DataLoader
 
 from ehfnet.graph import GraphCollator, crop_graph_to_center
+from ehfnet.training.adaptive_batching import WindowAimdBudgetController
+from ehfnet.training.batch_helpers import select_pose_rank_logit
 from ehfnet.training.candidate_generation import generate_candidates_from_loader
 from ehfnet.training.inference import predict_center_proposal_logits
 from ehfnet.training.rerank_losses import (
@@ -79,6 +81,7 @@ def refresh_blind_candidate_pool(
     stage2_pose_samples: int,
     crop_radius: float,
     ode_steps: int,
+    ode_method: str,
     warmup_epochs: int,
     center_hit_radius: float,
     crop_min_residues: int,
@@ -86,8 +89,16 @@ def refresh_blind_candidate_pool(
     max_complexes: int | None = None,
     fusion_weights: dict[str, float] | None = None,
     use_learned_center_scores: bool = True,
+    cost_guard_limit: int | None = None,
+    num_gnn_blocks: int = 1,
+    dynamic_inter_max_neighbors: int = 1,
+    dynamic_residue_max_neighbors: int = 1,
+    dynamic_residue_candidate_topk: int = 1,
+    phase_multiplier: float = 1.0,
+    max_oom_retry_splits: int = 0,
     pool_epoch: int = -1,
     generator_ckpt_id: str = "",
+    dataset_raw_dir: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     刷新 blind 候选池。
@@ -109,6 +120,7 @@ def refresh_blind_candidate_pool(
         stage2_pose_samples: 第二阶段精排生成的候选构象数。
         crop_radius: 局部裁剪半径。
         ode_steps: ODE 推理积分步数。
+        ode_method: 候选池刷新阶段使用的 ODE 积分方法。
         warmup_epochs: 课程学习预热轮数。
         center_hit_radius: 判断中心命中的距离阈值。
         crop_min_residues: 局部裁剪后至少保留的残基数量。
@@ -116,13 +128,21 @@ def refresh_blind_candidate_pool(
         max_complexes: 本轮最多处理的复合物数量。
         fusion_weights: 融合不同分支分数时使用的权重字典。
         use_learned_center_scores: 是否优先使用模型学习得到的中心分数。
+        cost_guard_limit: 候选生成阶段的成本保护上限。
+        num_gnn_blocks: 主干 GNN 块数量，用于估计运行时成本。
+        dynamic_inter_max_neighbors: 动态原子跨图边的单源邻居上限。
+        dynamic_residue_max_neighbors: 动态配体-残基边的单源邻居上限。
+        dynamic_residue_candidate_topk: 动态配体-残基边每个复合物保留的候选残基数。
+        phase_multiplier: 当前候选生成阶段的成本倍率。
+        max_oom_retry_splits: 单个候选生成 batch 允许递归拆分重试的最大深度。
         pool_epoch: 当前候选池对应的训练轮次。
         generator_ckpt_id: 生成候选时使用的 checkpoint 标识。
+        dataset_raw_dir: 数据集原始样本目录，用于计算对称感知 RMSD。
 
     Returns:
         list[dict[str, Any]]: 当前轮次生成的候选池记录列表。
     """
-    return generate_candidates_from_loader(
+    result = generate_candidates_from_loader(
         model=model,
         matcher=matcher,
         loader=loader,
@@ -136,6 +156,7 @@ def refresh_blind_candidate_pool(
         stage2_pose_samples=stage2_pose_samples,
         crop_radius=crop_radius,
         ode_steps=ode_steps,
+        ode_method=ode_method,
         warmup_epochs=warmup_epochs,
         center_hit_radius=center_hit_radius,
         crop_min_residues=crop_min_residues,
@@ -143,9 +164,19 @@ def refresh_blind_candidate_pool(
         max_complexes=max_complexes,
         fusion_weights=fusion_weights,
         use_learned_center_scores=use_learned_center_scores,
+        cost_guard_limit=cost_guard_limit,
+        num_gnn_blocks=num_gnn_blocks,
+        dynamic_inter_max_neighbors=dynamic_inter_max_neighbors,
+        dynamic_residue_max_neighbors=dynamic_residue_max_neighbors,
+        dynamic_residue_candidate_topk=dynamic_residue_candidate_topk,
+        phase_multiplier=phase_multiplier,
+        max_oom_retry_splits=max_oom_retry_splits,
         pool_epoch=pool_epoch,
         generator_ckpt_id=generator_ckpt_id,
+        progress_desc="BlindPool Refresh",
+        dataset_raw_dir=dataset_raw_dir,
     )
+    return cast(list[dict[str, Any]], result.get("candidate_records", []))
 
 
 def save_blind_pool(
@@ -453,7 +484,9 @@ def replay_and_compute_losses(
     lambda_pair: float,
     lambda_list: float,
     lambda_center_value: float,
-    use_pose_rank_head: bool,
+    micro_batch_size: int,
+    max_candidates_per_complex: int,
+    budget_controller: WindowAimdBudgetController | None = None,
 ) -> dict[str, Tensor]:
     """
     将缓存候选通过当前模型重放并计算 rerank 损失。
@@ -468,8 +501,8 @@ def replay_and_compute_losses(
 
     Args:
         model: 当前使用的模型实例。
-        replay_items: replayitems。
-        train_set: trainset。
+        replay_items: 从 blind pool 采样得到的 replay 监督条目列表。
+        train_set: 当前训练阶段使用的数据集或其 `Subset` 包装。
         graph_builder: 用于构图或重建局部图的图构建器。
         collator: 用于拼接局部样本的图批处理器。
         device: 运行所用设备，如 CPU 或 CUDA 设备。
@@ -480,11 +513,13 @@ def replay_and_compute_losses(
         lambda_bce: BCE 损失权重。
         lambda_pair: pairwise 损失权重。
         lambda_list: listwise 损失权重。
-        lambda_center_value: lambda中心数值。
-        use_pose_rank_head: 是否使用构象rankhead。
+        lambda_center_value: center-value 损失权重。
+        micro_batch_size: replay 候选打分的初始微批大小。
+        max_candidates_per_complex: 每个复合物保留的最大 replay 候选数。
+        budget_controller: replay 微批回调控制器；为 `None` 时仅使用固定微批。
 
     Returns:
-        dict[str, Tensor | float]: 当前模型在 blind pool 回放样本上的损失与统计信息。
+        dict[str, Tensor]: 当前模型在 blind pool 回放样本上的损失与统计信息。
 
     Raises:
         RuntimeError: 当回放过程中没有得到任何有效局部样本时抛出。
@@ -501,14 +536,107 @@ def replay_and_compute_losses(
     candidate_failures = 0
     sample_failures = 0
     center_value_failures = 0
+    cooldown_skips = 0
+    replay_oom_events = 0
+    use_configured_cuda = device.type == "cuda"
+
+    def _score_candidate_chunk(
+        *,
+        sample_obj: Any,
+        complex_id: str,
+        candidate_chunk: list[dict[str, Any]],
+    ) -> tuple[list[Tensor], list[Tensor], list[dict[str, Any]], bool]:
+        try:
+            local_samples: list[Any] = []
+            pose_tensors: list[Tensor] = []
+            valid_chunk_candidates: list[dict[str, Any]] = []
+            rmsd_tensors: list[Tensor] = []
+
+            for cand in candidate_chunk:
+                center_xyz = torch.tensor(cand["center_xyz"], dtype=torch.float32)
+                pose_xyz = torch.tensor(cand["pose_xyz"], dtype=torch.float32)
+                local_sample = crop_graph_to_center(
+                    sample_obj,
+                    center=center_xyz,
+                    radius=crop_radius,
+                    min_residues=crop_min_residues,
+                    atom_margin=crop_atom_margin,
+                    graph_builder=graph_builder,
+                )
+                n_lig = int(local_sample["ligand_atom"].pos.size(0))
+                if pose_xyz.size(0) != n_lig:
+                    continue
+                local_samples.append(local_sample)
+                pose_tensors.append(pose_xyz)
+                valid_chunk_candidates.append(cand)
+                rmsd_tensors.append(
+                    torch.tensor([cand["rmsd"]], device=device, dtype=torch.float32)
+                )
+
+            if not valid_chunk_candidates:
+                return [], [], [], False
+
+            infer_batch = cast(Any, collator.collate(local_samples)).to(device)
+            infer_batch["ligand_atom"].pos = torch.cat(
+                [
+                    pose_xyz.to(device=device, dtype=infer_batch["ligand_atom"].pos.dtype)
+                    for pose_xyz in pose_tensors
+                ],
+                dim=0,
+            )
+            t_ones = torch.ones(
+                len(valid_chunk_candidates),
+                device=device,
+                dtype=infer_batch["ligand_atom"].pos.dtype,
+            )
+            out = model(infer_batch, t_ones)
+            logits = select_pose_rank_logit(out).view(-1)
+            logits_list = [logits[i : i + 1] for i in range(len(valid_chunk_candidates))]
+            del infer_batch, out
+            return logits_list, rmsd_tensors, valid_chunk_candidates, False
+        except torch.cuda.OutOfMemoryError:
+            gc.collect()
+            if use_configured_cuda:
+                torch.cuda.empty_cache()
+            if len(candidate_chunk) <= 1:
+                raise
+            mid = len(candidate_chunk) // 2
+            left = _score_candidate_chunk(
+                sample_obj=sample_obj,
+                complex_id=complex_id,
+                candidate_chunk=candidate_chunk[:mid],
+            )
+            right = _score_candidate_chunk(
+                sample_obj=sample_obj,
+                complex_id=complex_id,
+                candidate_chunk=candidate_chunk[mid:],
+            )
+            return (
+                left[0] + right[0],
+                left[1] + right[1],
+                left[2] + right[2],
+                True,
+            )
 
     for item in replay_items:
-        candidates = item["candidates"]
+        candidates = list(item["candidates"])[: max_candidates_per_complex]
         center_values = item.get("center_values", {})
         if not candidates:
             continue
 
         ds_idx = int(item["dataset_index"])
+        complex_id = str(item.get("complex_id", ""))
+        if budget_controller is not None:
+            cooldown_action = budget_controller.get_batch_cooldown_action([ds_idx], 1)
+            if cooldown_action == "skip":
+                cooldown_skips += 1
+                budget_controller.note_cooldown_skip([ds_idx])
+                logger.warning(
+                    "Replay cooldown skip on complex=%s dataset_index=%d.",
+                    complex_id,
+                    ds_idx,
+                )
+                continue
 
         try:
             sample = _resolve_replay_sample(train_set, ds_idx)
@@ -525,59 +653,72 @@ def replay_and_compute_losses(
         group_logits: list[Tensor] = []
         group_rmsd: list[Tensor] = []
         valid_candidates: list[dict[str, Any]] = []
+        complex_had_oom = False
+        complex_irreducible_oom = False
+        chunk_size = (
+            budget_controller.current_budget
+            if budget_controller is not None
+            else micro_batch_size
+        )
+        chunk_size = max(1, min(int(chunk_size), max_candidates_per_complex))
 
-        for cand in candidates:
+        for start in range(0, len(candidates), chunk_size):
+            candidate_chunk = candidates[start : start + chunk_size]
             try:
-                center_xyz = torch.tensor(cand["center_xyz"], dtype=torch.float32)
-                pose_xyz = torch.tensor(cand["pose_xyz"], dtype=torch.float32)
-
-                local_sample = crop_graph_to_center(
-                    sample, center=center_xyz, radius=crop_radius,
-                    min_residues=crop_min_residues,
-                    atom_margin=crop_atom_margin,
-                    graph_builder=graph_builder,
+                chunk_logits, chunk_rmsd, chunk_valid_candidates, chunk_had_oom = _score_candidate_chunk(
+                    sample_obj=sample,
+                    complex_id=complex_id,
+                    candidate_chunk=candidate_chunk,
                 )
-
-                infer_batch = cast(Any, collator.collate([local_sample])).to(device)
-
-                n_lig = infer_batch["ligand_atom"].pos.size(0)
-                if pose_xyz.size(0) != n_lig:
-                    continue
-
-                infer_batch["ligand_atom"].pos = pose_xyz.to(device=device, dtype=infer_batch["ligand_atom"].pos.dtype)
-                t_ones = torch.ones(1, device=device, dtype=infer_batch["ligand_atom"].pos.dtype)
-
-                out = model(infer_batch, t_ones)
-
-                if use_pose_rank_head and "pose_rank_score" in out:
-                    logit = out["pose_rank_score"].view(-1)
-                else:
-                    logit = out["pose_quality"].view(-1)
-
-                group_logits.append(logit)
-                group_rmsd.append(torch.tensor([cand["rmsd"]], device=device, dtype=torch.float32))
-                valid_candidates.append(cand)
-                candidate_successes += 1
-
-                del infer_batch, out
-
+                group_logits.extend(chunk_logits)
+                group_rmsd.extend(chunk_rmsd)
+                valid_candidates.extend(chunk_valid_candidates)
+                candidate_successes += len(chunk_valid_candidates)
+                if chunk_had_oom:
+                    complex_had_oom = True
+                    replay_oom_events += 1
             except torch.cuda.OutOfMemoryError:
-                candidate_failures += 1
-                logger.warning("Replay OOM on candidate, skipping.")
+                complex_had_oom = True
+                complex_irreducible_oom = True
+                replay_oom_events += 1
+                candidate_failures += len(candidate_chunk)
+                logger.warning(
+                    "Replay OOM on candidate chunk, skipping | complex=%s | chunk=%d.",
+                    complex_id,
+                    len(candidate_chunk),
+                )
                 gc.collect()
-                if torch.cuda.is_available():
+                if use_configured_cuda:
                     torch.cuda.empty_cache()
                 continue
             except Exception as exc:
-                candidate_failures += 1
+                candidate_failures += len(candidate_chunk)
                 if candidate_failures <= 5:
                     logger.warning(
-                        "Replay candidate failed for complex=%s center_id=%s: %s",
-                        item.get("complex_id", ""),
-                        cand.get("center_id", "?"),
+                        "Replay candidate chunk failed for complex=%s: %s",
+                        complex_id,
                         exc,
                     )
                 continue
+
+        if budget_controller is not None:
+            adjustment = budget_controller.record_root_event(
+                root_indices=[ds_idx],
+                had_oom=complex_had_oom,
+                irreducible=complex_irreducible_oom,
+            )
+            if adjustment is not None and adjustment.new_budget != adjustment.previous_budget:
+                log_fn = logger.warning if adjustment.action == "reduce" else logger.info
+                log_fn(
+                    "Replay budget callback | action=%s | replay_micro_batch_size: %d -> %d | "
+                    "window_oom=%d/%d | offenders=%d",
+                    adjustment.action,
+                    adjustment.previous_budget,
+                    adjustment.new_budget,
+                    adjustment.window_oom,
+                    adjustment.window_total,
+                    adjustment.offender_count,
+                )
 
         if group_logits:
             resolved_groups += 1
@@ -607,9 +748,10 @@ def replay_and_compute_losses(
         if lambda_center_value > 0 and center_values:
             try:
                 sample_batch = cast(Any, collator.collate([sample])).to(device)
-
                 prop_logits, res_pos, res_batch, _ = predict_center_proposal_logits(
-                    model, sample_batch, device=device,
+                    model,
+                    sample_batch,
+                    device=device,
                 )
 
                 for cid, cv_target in center_values.items():
@@ -620,12 +762,17 @@ def replay_and_compute_losses(
                             break
                     if center_rec is None:
                         continue
-
-                    center_xyz_t = torch.tensor(center_rec["center_xyz"], device=device, dtype=res_pos.dtype)
+                    center_xyz_t = torch.tensor(
+                        center_rec["center_xyz"],
+                        device=device,
+                        dtype=res_pos.dtype,
+                    )
                     dists = torch.norm(res_pos - center_xyz_t.unsqueeze(0), dim=-1)
                     nearest_idx = dists.argmin()
                     all_center_logits.append(prop_logits[nearest_idx].view(-1))
-                    all_center_targets.append(torch.tensor([cv_target], device=device, dtype=torch.float32))
+                    all_center_targets.append(
+                        torch.tensor([cv_target], device=device, dtype=torch.float32)
+                    )
 
                 del sample_batch
             except Exception as exc:
@@ -633,7 +780,7 @@ def replay_and_compute_losses(
                 if center_value_failures <= 5:
                     logger.warning(
                         "Center-value replay failed for complex=%s: %s",
-                        item.get("complex_id", ""),
+                        complex_id,
                         exc,
                     )
 
@@ -669,14 +816,19 @@ def replay_and_compute_losses(
     if candidate_failures > 0 or sample_failures > 0 or center_value_failures > 0:
         logger.warning(
             "Replay supervision summary | valid_groups=%d | candidate_successes=%d | "
-            "sample_failures=%d | candidate_failures=%d | center_value_failures=%d",
+            "sample_failures=%d | candidate_failures=%d | center_value_failures=%d | "
+            "cooldown_skips=%d | replay_oom_events=%d",
             resolved_groups,
             candidate_successes,
             sample_failures,
             candidate_failures,
             center_value_failures,
+            cooldown_skips,
+            replay_oom_events,
         )
 
+    result["replay_cooldown_skips"] = torch.tensor(float(cooldown_skips), device=device)
+    result["replay_oom_events"] = torch.tensor(float(replay_oom_events), device=device)
     return result
 
 
@@ -746,6 +898,7 @@ def should_refresh_pool(
     refresh_every: int,
     min_start_epoch: int,
     best_updated_this_epoch: bool,
+    refresh_on_best_update: bool,
 ) -> bool:
     """
     判断是否刷新候选池。
@@ -758,13 +911,14 @@ def should_refresh_pool(
         refresh_every: 候选池刷新间隔。
         min_start_epoch: 允许开始刷新候选池的最小训练轮次。
         best_updated_this_epoch: 当前轮次是否更新了最佳模型。
+        refresh_on_best_update: 是否允许新最佳模型立刻触发一次额外刷新。
 
     Returns:
         bool: 返回布尔判断结果。
     """
     if epoch < min_start_epoch:
         return False
-    if best_updated_this_epoch:
+    if refresh_on_best_update and best_updated_this_epoch:
         return True
     return epoch % refresh_every == 0
 

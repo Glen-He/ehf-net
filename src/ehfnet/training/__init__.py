@@ -16,9 +16,9 @@ __all__ = [
     "build_local_batch_from_centers",
     "build_selection_metrics",
     "compose_checkpoint",
-    "compute_bootstrap_pose_quality_loss",
+    "compute_bootstrap_pose_rank_loss",
     "compute_center_value_loss",
-    "compute_pose_quality_target",
+    "compute_pose_rank_target",
     "compute_rerank_losses",
     "compute_train_split_normalization_stats",
     "compute_validation_loss",
@@ -34,7 +34,7 @@ __all__ = [
     "resolve_selection_rule",
     "save_blind_pool",
     "select_bootstrap_blind_centers",
-    "select_pose_ranking_logit",
+    "select_pose_rank_logit",
     "select_training_crop_centers",
     "select_wrong_center_candidates",
     "should_refresh_pool",
@@ -59,17 +59,17 @@ _EXPORT_MAP = {
         "build_selection_metrics",
     ),
     "compose_checkpoint": ("ehfnet.training.checkpoint_io", "compose_checkpoint"),
-    "compute_bootstrap_pose_quality_loss": (
+    "compute_bootstrap_pose_rank_loss": (
         "ehfnet.training.center_sampling",
-        "compute_bootstrap_pose_quality_loss",
+        "compute_bootstrap_pose_rank_loss",
     ),
     "compute_center_value_loss": (
         "ehfnet.training.rerank_losses",
         "compute_center_value_loss",
     ),
-    "compute_pose_quality_target": (
+    "compute_pose_rank_target": (
         "ehfnet.training.batch_helpers",
-        "compute_pose_quality_target",
+        "compute_pose_rank_target",
     ),
     "compute_rerank_losses": ("ehfnet.training.rerank_losses", "compute_rerank_losses"),
     "compute_train_split_normalization_stats": (
@@ -80,7 +80,10 @@ _EXPORT_MAP = {
         "ehfnet.training.validation",
         "compute_validation_loss",
     ),
-    "evaluate_topn_success": ("ehfnet.training.validation", "evaluate_topn_success"),
+    "evaluate_topn_success": (
+        "ehfnet.training.inference.evaluator",
+        "evaluate_topn_success",
+    ),
     "generate_blind_candidates": (
         "ehfnet.training.candidate_generation",
         "generate_blind_candidates",
@@ -113,9 +116,9 @@ _EXPORT_MAP = {
         "ehfnet.training.center_sampling",
         "select_bootstrap_blind_centers",
     ),
-    "select_pose_ranking_logit": (
+    "select_pose_rank_logit": (
         "ehfnet.training.batch_helpers",
-        "select_pose_ranking_logit",
+        "select_pose_rank_logit",
     ),
     "select_training_crop_centers": (
         "ehfnet.training.center_sampling",

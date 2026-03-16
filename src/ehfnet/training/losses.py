@@ -35,7 +35,7 @@ class FlowMatchingLoss(nn.Module):
         weight_torsion: float,
         weight_energy: float,
         weight_clash: float,
-        weight_pose_quality: float,
+        weight_pose_rank: float,
         curriculum_weights: dict[str, dict[str, float]],
         refine_start: float,
         pose_gate_epoch_start: float,
@@ -54,7 +54,7 @@ class FlowMatchingLoss(nn.Module):
             weight_torsion: 扭转损失权重。
             weight_energy: 亲和力损失权重。
             weight_clash: 位阻损失权重。
-            weight_pose_quality: 构象质量损失权重。
+            weight_pose_rank: 构象排序损失权重。
             curriculum_weights: 课程学习各阶段的损失权重配置。
             refine_start: 进入细化阶段时对应的训练进度阈值。
             pose_gate_epoch_start: 构象相关损失开始打开门控的训练进度。
@@ -73,7 +73,7 @@ class FlowMatchingLoss(nn.Module):
             "torsion": weight_torsion,
             "energy": weight_energy,
             "clash": weight_clash,
-            "pose_quality": weight_pose_quality,
+            "pose_rank": weight_pose_rank,
         }
 
         self.curriculum_weights = curriculum_weights
@@ -203,6 +203,7 @@ class FlowMatchingLoss(nn.Module):
 
         loss_trans = F.huber_loss(pred_trans, gt_trans, delta=1.0)
         loss_dict["loss_trans"] = loss_trans.detach()
+        loss_dict["_raw_loss_trans"] = loss_trans
 
         pred_rot = predictions.get("v_rotation")
         gt_rot = targets.get("v_rot_target")
@@ -212,6 +213,7 @@ class FlowMatchingLoss(nn.Module):
 
         loss_rot = F.huber_loss(pred_rot * self.L, gt_rot * self.L, delta=1.0)
         loss_dict["loss_rot"] = loss_rot.detach()
+        loss_dict["_raw_loss_rot"] = loss_rot
 
         loss_torsion = torch.tensor(0.0, device=device)
         pred_tor = predictions.get("v_torsion")
@@ -232,6 +234,7 @@ class FlowMatchingLoss(nn.Module):
             loss_torsion = torch.tensor(0.0, device=device)
 
         loss_dict["loss_torsion"] = loss_torsion.detach()
+        loss_dict["_raw_loss_torsion"] = loss_torsion
 
         loss_energy = torch.tensor(0.0, device=device)
         energy_nan_skipped = torch.tensor(0.0, device=device)
@@ -275,6 +278,7 @@ class FlowMatchingLoss(nn.Module):
 
         loss_dict["loss_energy"] = loss_energy.detach()
         loss_dict["energy_nan_skipped"] = energy_nan_skipped.detach()
+        loss_dict["_raw_loss_energy"] = loss_energy
 
         loss_clash = torch.tensor(0.0, device=device)
         clash_batch = predictions.get("steric_clash_batch")
@@ -295,18 +299,19 @@ class FlowMatchingLoss(nn.Module):
                 loss_clash = clash_batch.mean() * float(gate_sum)
 
         loss_dict["loss_clash"] = loss_clash.detach()
-        loss_pose_quality = torch.tensor(0.0, device=device)
-        pred_pose_quality = predictions.get("pose_quality")
-        gt_pose_quality = targets.get("pose_quality_target")
+        loss_dict["_raw_loss_clash"] = loss_clash
+        loss_pose_rank = torch.tensor(0.0, device=device)
+        pred_pose_rank = predictions.get("pose_rank_score")
+        gt_pose_rank = targets.get("pose_rank_target")
 
-        if pred_pose_quality is not None and gt_pose_quality is not None:
-            pred_pose_quality = pred_pose_quality.view(-1)
-            gt_pose_quality = gt_pose_quality.view(-1).to(device=device, dtype=pred_pose_quality.dtype)
-            if not torch.isnan(pred_pose_quality).any() and not torch.isnan(gt_pose_quality).any():
-                weight = 1.0 + 2.0 * gt_pose_quality
+        if pred_pose_rank is not None and gt_pose_rank is not None:
+            pred_pose_rank = pred_pose_rank.view(-1)
+            gt_pose_rank = gt_pose_rank.view(-1).to(device=device, dtype=pred_pose_rank.dtype)
+            if not torch.isnan(pred_pose_rank).any() and not torch.isnan(gt_pose_rank).any():
+                weight = 1.0 + 2.0 * gt_pose_rank
                 per_sample_bce = F.binary_cross_entropy_with_logits(
-                    pred_pose_quality,
-                    gt_pose_quality.clamp(min=0.0, max=1.0),
+                    pred_pose_rank,
+                    gt_pose_rank.clamp(min=0.0, max=1.0),
                     reduction="none",
                 )
                 t_val = getattr(data, "t", None)
@@ -315,23 +320,24 @@ class FlowMatchingLoss(nn.Module):
                         data,
                         t_val,
                         device=device,
-                        dtype=pred_pose_quality.dtype,
+                        dtype=pred_pose_rank.dtype,
                     ).view(-1)
                     gate_sum = pose_focus_gate.sum()
                     if gate_sum > 1e-8:
-                        loss_pose_quality = (
+                        loss_pose_rank = (
                             per_sample_bce * weight * pose_focus_gate
                         ).sum() / gate_sum
                 else:
-                    loss_pose_quality = (per_sample_bce * weight).mean()
+                    loss_pose_rank = (per_sample_bce * weight).mean()
 
-        loss_dict["loss_pose_quality"] = loss_pose_quality.detach()
+        loss_dict["loss_pose_rank_bce"] = loss_pose_rank.detach()
         loss_dict["weight_trans"] = torch.tensor(schedule["trans"], device=device)
         loss_dict["weight_rot"] = torch.tensor(schedule["rot"], device=device)
         loss_dict["weight_torsion"] = torch.tensor(schedule["torsion"], device=device)
         loss_dict["weight_energy"] = torch.tensor(schedule["energy"], device=device)
         loss_dict["weight_clash"] = torch.tensor(schedule["clash"], device=device)
-        loss_dict["weight_pose_quality"] = torch.tensor(schedule["pose_quality"], device=device)
+        loss_dict["weight_pose_rank"] = torch.tensor(schedule["pose_rank"], device=device)
+        loss_dict["_raw_loss_pose_rank_bce"] = loss_pose_rank
 
         total_loss = (
             schedule["trans"] * loss_trans
@@ -339,7 +345,7 @@ class FlowMatchingLoss(nn.Module):
             + schedule["torsion"] * loss_torsion
             + schedule["energy"] * loss_energy
             + schedule["clash"] * loss_clash
-            + schedule["pose_quality"] * loss_pose_quality
+            + schedule["pose_rank"] * loss_pose_rank
         )
 
         loss_dict["total"] = total_loss

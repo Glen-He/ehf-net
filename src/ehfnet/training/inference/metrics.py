@@ -25,7 +25,7 @@ def summarize_blind_candidate_records(
     """
     汇总 blind 候选指标。
 
-    根据候选中心和 pose 记录计算 Top-N、proposal gap 和 rerank 指标，
+    根据候选中心和 pose 记录计算 Top-N、proposal gap、候选上界指标和最终排序指标，
     用于评估完整盲对接流水线的效果。
 
     Args:
@@ -44,11 +44,11 @@ def summarize_blind_candidate_records(
         "topn_total_graphs": float(len(candidate_records)),
     }
     center_recall_hits = {1: 0.0, 3: 0.0, 8: 0.0, 16: 0.0}
-    oracle_top1_rmsd: list[float] = []
-    oracle_top5_rmsd: list[float] = []
-    reranked_top1_rmsd: list[float] = []
-    reranked_top5_rmsd: list[float] = []
-    reranked_topk_rmsd: dict[int, list[float]] = {k: [] for k in topk_unique}
+    best_of_all_rmsd: list[float] = []
+    best_of_first5_centers_rmsd: list[float] = []
+    selected_top1_rmsd: list[float] = []
+    selected_top5_rmsd: list[float] = []
+    selected_topk_rmsd: dict[int, list[float]] = {k: [] for k in topk_unique}
     proposal_failures = 0.0
     local_failures = 0.0
     ranking_failures = 0.0
@@ -66,23 +66,23 @@ def summarize_blind_candidate_records(
             if any(center_hits[: min(k, len(center_hits))]):
                 center_recall_hits[k] += 1.0
 
-        oracle_all = min(float(item["rmsd"]) for item in poses)
-        oracle_first5_pool = [
+        best_of_all = min(float(item["rmsd"]) for item in poses)
+        best_of_first5_centers_pool = [
             float(item["rmsd"])
             for item in poses
             if int(item.get("center_id", 999)) <= 5
         ]
-        if not oracle_first5_pool:
-            oracle_first5_pool = [float(item["rmsd"]) for item in poses]
-        oracle_top1_rmsd.append(oracle_all)
-        oracle_top5_rmsd.append(min(oracle_first5_pool))
+        if not best_of_first5_centers_pool:
+            best_of_first5_centers_pool = [float(item["rmsd"]) for item in poses]
+        best_of_all_rmsd.append(best_of_all)
+        best_of_first5_centers_rmsd.append(min(best_of_first5_centers_pool))
 
-        reranked = sorted(
+        selected_poses = sorted(
             poses,
             key=lambda item: float(
                 combine_center_pose_score(
                     torch.tensor([item["center_logit"]], dtype=torch.float32),
-                    torch.tensor([item["ranking_logit"]], dtype=torch.float32),
+                    torch.tensor([item["pose_rank_logit"]], dtype=torch.float32),
                     aff_logit=torch.tensor(
                         [item.get("binding_affinity_teacher", 0.0)],
                         dtype=torch.float32,
@@ -96,23 +96,26 @@ def summarize_blind_candidate_records(
             ),
             reverse=True,
         )
-        reranked_top1 = float(reranked[0]["rmsd"])
-        reranked_top5 = min(
-            float(item["rmsd"]) for item in reranked[: min(5, len(reranked))]
+        selected_top1 = float(selected_poses[0]["rmsd"])
+        selected_top5 = min(
+            float(item["rmsd"]) for item in selected_poses[: min(5, len(selected_poses))]
         )
-        reranked_top1_rmsd.append(reranked_top1)
-        reranked_top5_rmsd.append(reranked_top5)
+        selected_top1_rmsd.append(selected_top1)
+        selected_top5_rmsd.append(selected_top5)
         for k in topk_unique:
-            reranked_topk_rmsd[k].append(
-                min(float(item["rmsd"]) for item in reranked[: min(k, len(reranked))])
+            selected_topk_rmsd[k].append(
+                min(
+                    float(item["rmsd"])
+                    for item in selected_poses[: min(k, len(selected_poses))]
+                )
             )
 
         has_center_hit = any(center_hits)
         if not has_center_hit:
             proposal_failures += 1.0
-        elif oracle_all >= 2.0:
+        elif best_of_all >= 2.0:
             local_failures += 1.0
-        elif reranked_top1 >= 2.0:
+        elif selected_top1 >= 2.0:
             ranking_failures += 1.0
         else:
             successes += 1.0
@@ -127,25 +130,25 @@ def summarize_blind_candidate_records(
     def _success(values: list[float], threshold: float) -> float:
         return 100.0 * float(sum(v < threshold for v in values)) / max(1, len(values))
 
-    metrics["oracle_top1_success_2a"] = _success(oracle_top1_rmsd, 2.0)
-    metrics["oracle_top1_success_5a"] = _success(oracle_top1_rmsd, 5.0)
-    metrics["oracle_top5_success_2a"] = _success(oracle_top5_rmsd, 2.0)
-    metrics["oracle_top5_success_5a"] = _success(oracle_top5_rmsd, 5.0)
-    metrics["oracle_top1_mean_best_rmsd"] = _mean(oracle_top1_rmsd)
-    metrics["oracle_top5_mean_best_rmsd"] = _mean(oracle_top5_rmsd)
-    metrics["reranked_top1_success_2a"] = _success(reranked_top1_rmsd, 2.0)
-    metrics["reranked_top1_success_5a"] = _success(reranked_top1_rmsd, 5.0)
-    metrics["reranked_top5_success_2a"] = _success(reranked_top5_rmsd, 2.0)
-    metrics["reranked_top5_success_5a"] = _success(reranked_top5_rmsd, 5.0)
-    metrics["reranked_top1_mean_best_rmsd"] = _mean(reranked_top1_rmsd)
-    metrics["reranked_top5_mean_best_rmsd"] = _mean(reranked_top5_rmsd)
+    metrics["best_of_all_success_2a"] = _success(best_of_all_rmsd, 2.0)
+    metrics["best_of_all_success_5a"] = _success(best_of_all_rmsd, 5.0)
+    metrics["best_of_first5_centers_success_2a"] = _success(best_of_first5_centers_rmsd, 2.0)
+    metrics["best_of_first5_centers_success_5a"] = _success(best_of_first5_centers_rmsd, 5.0)
+    metrics["best_of_all_mean_best_rmsd"] = _mean(best_of_all_rmsd)
+    metrics["best_of_first5_centers_mean_best_rmsd"] = _mean(best_of_first5_centers_rmsd)
+    metrics["selected_top1_success_2a"] = _success(selected_top1_rmsd, 2.0)
+    metrics["selected_top1_success_5a"] = _success(selected_top1_rmsd, 5.0)
+    metrics["selected_top5_success_2a"] = _success(selected_top5_rmsd, 2.0)
+    metrics["selected_top5_success_5a"] = _success(selected_top5_rmsd, 5.0)
+    metrics["selected_top1_mean_best_rmsd"] = _mean(selected_top1_rmsd)
+    metrics["selected_top5_mean_best_rmsd"] = _mean(selected_top5_rmsd)
     metrics["proposal_gap"] = (proposal_failures / total) * 100.0
     metrics["local_gap"] = (local_failures / total) * 100.0
     metrics["ranking_gap"] = (ranking_failures / total) * 100.0
     metrics["pipeline_success"] = (successes / total) * 100.0
 
     for k in topk_unique:
-        source = reranked_topk_rmsd[k]
+        source = selected_topk_rmsd[k]
         metrics[f"top{k}_success_2a"] = _success(source, 2.0)
         metrics[f"top{k}_success_5a"] = _success(source, 5.0)
         metrics[f"top{k}_mean_best_rmsd"] = _mean(source)
@@ -185,20 +188,20 @@ def calibrate_linear_fusion_weights(
     )
 
     def _is_better(trial: dict[str, float], ref: dict[str, float]) -> bool:
-        t1 = trial.get("reranked_top1_success_2a", 0.0)
-        r1 = ref.get("reranked_top1_success_2a", 0.0)
+        t1 = trial.get("selected_top1_success_2a", 0.0)
+        r1 = ref.get("selected_top1_success_2a", 0.0)
         if t1 > r1 + 1e-6:
             return True
         if t1 < r1 - 1e-6:
             return False
-        t5 = trial.get("reranked_top5_success_2a", 0.0)
-        r5 = ref.get("reranked_top5_success_2a", 0.0)
+        t5 = trial.get("selected_top5_success_2a", 0.0)
+        r5 = ref.get("selected_top5_success_2a", 0.0)
         if t5 > r5 + 1e-6:
             return True
         if t5 < r5 - 1e-6:
             return False
-        return trial.get("reranked_top1_mean_best_rmsd", float("inf")) < ref.get(
-            "reranked_top1_mean_best_rmsd",
+        return trial.get("selected_top1_mean_best_rmsd", float("inf")) < ref.get(
+            "selected_top1_mean_best_rmsd",
             float("inf"),
         ) - 1e-6
 

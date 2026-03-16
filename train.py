@@ -203,34 +203,42 @@ def main():
             "warmup_epochs",
             "accumulation_steps",
             "ema_decay",
-            "rmsd_ratio",
+            "val_subset_ratio",
+            "val_full_every",
+            "val_full_last_epochs",
+            "ode_method",
             "split_train_frac",
             "split_val_frac",
             "split_test_frac",
             "split_seed",
-            "max_nodes_per_batch",
-            "val_max_nodes_per_batch",
-            "test_max_nodes_per_batch",
-            "topn_max_nodes_per_batch",
-            "edge_budget_factor",
-            "eval_edge_guard_headroom",
+            "train_cost_budget",
+            "val_cost_budget",
+            "blind_pool_cost_budget",
+            "final_topn_cost_budget",
+            "eval_cost_guard_headroom",
             "dataloader_num_workers",
             "dataloader_pin_memory",
             "dataloader_persistent_workers",
-            "enable_oom_adaptive_batch",
+            "max_oom_retry_splits",
+            "enable_train_budget_callback",
             "oom_reduce_threshold",
             "oom_reduce_factor",
-            "min_max_nodes_per_batch",
-            "enable_val_oom_adaptive_batch",
+            "min_train_cost_budget",
+            "enable_val_budget_callback",
             "val_oom_reduce_threshold",
             "val_oom_reduce_factor",
-            "min_val_max_nodes_per_batch",
-            "oom_recover_epochs",
-            "oom_recover_factor",
+            "min_val_cost_budget",
+            "train_budget_window_size",
+            "train_budget_recover_window_count",
+            "train_budget_recover_step",
+            "train_offender_cooldown",
+            "val_budget_window_size",
+            "val_budget_recover_window_count",
+            "val_budget_recover_step",
+            "val_offender_cooldown",
             "split_cache_file",
             "force_resplit",
             "test_topk",
-            "test_pose_samples",
             "val_ode_steps",
             "center_proposal_topk",
             "center_refine_topk",
@@ -239,27 +247,46 @@ def main():
             "stage2_pose_samples",
             "center_proposal_weight",
             "center_positive_radius",
+            "center_guidance_learned_start",
             "crop_candidate_topk",
+            "crop_proposal_start",
+            "crop_near_miss_start",
+            "crop_hard_negative_start",
             "crop_min_residues",
             "crop_atom_margin",
             "disable_jitter_crop",
             "disable_hard_negative_crop",
             "pose_ranking_pair_weight",
             "pose_ranking_margin",
+            "ranking_same_center_start",
+            "ranking_wrong_center_start",
             "pose_bootstrap_weight",
+            "pose_bootstrap_start",
             "pose_bootstrap_frequency",
             "pose_bootstrap_ode_steps",
             "blind_pool_refresh_every",
             "blind_pool_start_epoch",
+            "blind_pool_refresh_on_best_update",
             "blind_pool_max_complexes",
             "blind_pool_cache_bce_weight",
             "blind_pool_cache_rank_weight",
             "blind_pool_pairs_per_complex",
+            "replay_start_ratio",
+            "same_center_micro_batch_size",
+            "same_center_budget_window_size",
+            "same_center_budget_recover_window_count",
+            "same_center_budget_recover_step",
+            "same_center_offender_cooldown",
+            "ranking_budget_window_size",
+            "ranking_budget_recover_window_count",
+            "ranking_offender_cooldown",
+            "ranking_wrong_center_cap",
+            "replay_micro_batch_size",
+            "replay_budget_window_size",
+            "replay_budget_recover_window_count",
+            "replay_candidate_cooldown",
+            "replay_max_candidates_per_complex",
             "checkpoint_selection_mode",
-            "enable_fusion_calibration",
-            "fusion_search_center_weights",
-            "fusion_search_aff_weights",
-            "fusion_search_clash_weights",
             "ablation_mode",
             "run_test_after_training",
             "num_rbf",
@@ -280,8 +307,11 @@ def main():
             "knn_fallback_k",
             "dynamic_inter_cutoff",
             "dynamic_inter_knn_k",
+            "dynamic_inter_max_neighbors",
             "dynamic_residue_cutoff",
             "dynamic_residue_knn_k",
+            "dynamic_residue_max_neighbors",
+            "dynamic_residue_candidate_topk",
             "r_cutoff_intra",
             "max_neighbors_intra",
             "atom_neighbor_cap",
@@ -297,25 +327,25 @@ def main():
             "loss_weight_torsion",
             "loss_weight_energy",
             "loss_weight_clash",
-            "loss_weight_pose_quality",
+            "loss_weight_pose_rank",
             "loss_coarse_trans",
             "loss_coarse_rot",
             "loss_coarse_torsion",
             "loss_coarse_energy",
             "loss_coarse_clash",
-            "loss_coarse_pose_quality",
+            "loss_coarse_pose_rank",
             "loss_transition_trans",
             "loss_transition_rot",
             "loss_transition_torsion",
             "loss_transition_energy",
             "loss_transition_clash",
-            "loss_transition_pose_quality",
+            "loss_transition_pose_rank",
             "loss_refine_trans",
             "loss_refine_rot",
             "loss_refine_torsion",
             "loss_refine_energy",
             "loss_refine_clash",
-            "loss_refine_pose_quality",
+            "loss_refine_pose_rank",
             "loss_refine_start",
             "loss_pose_gate_epoch_start",
             "loss_pose_gate_epoch_end",
@@ -380,8 +410,11 @@ def main():
     parser.add_argument("--force_cutoff", type=float, default=config_defaults["force_cutoff"], help="Force branch local radius in Å (from model.toml)")
     parser.add_argument("--dynamic_inter_cutoff", type=float, default=config_defaults["dynamic_inter_cutoff"], help="Dynamic inter-atom edge radius (from model.toml)")
     parser.add_argument("--dynamic_inter_knn_k", type=int, default=config_defaults["dynamic_inter_knn_k"], help="kNN fallback for inter-atom edges (from model.toml)")
+    parser.add_argument("--dynamic_inter_max_neighbors", type=int, default=config_defaults["dynamic_inter_max_neighbors"], help="Per-source neighbor cap for dynamic inter-atom edges (from model.toml)")
     parser.add_argument("--dynamic_residue_cutoff", type=float, default=config_defaults["dynamic_residue_cutoff"], help="Dynamic ligand-residue edge radius (from model.toml)")
     parser.add_argument("--dynamic_residue_knn_k", type=int, default=config_defaults["dynamic_residue_knn_k"], help="kNN fallback for ligand-residue edges (from model.toml)")
+    parser.add_argument("--dynamic_residue_max_neighbors", type=int, default=config_defaults["dynamic_residue_max_neighbors"], help="Per-source neighbor cap for dynamic ligand-residue edges (from model.toml)")
+    parser.add_argument("--dynamic_residue_candidate_topk", type=int, default=config_defaults["dynamic_residue_candidate_topk"], help="Graph-level top-k residue candidates kept before building ligand-residue dynamic edges (from model.toml)")
     parser.add_argument("--frame_refine_threshold", type=float, default=config_defaults["frame_refine_threshold"], help="Frame refinement gate threshold (from model.toml)")
     parser.add_argument("--frame_refine_temperature", type=float, default=config_defaults["frame_refine_temperature"], help="Frame refinement gate temperature (from model.toml)")
     parser.add_argument("--energy_guide_threshold", type=float, default=config_defaults["energy_guide_threshold"], help="Energy guidance gate threshold (from model.toml)")
@@ -418,25 +451,25 @@ def main():
     parser.add_argument("--loss_weight_torsion", type=float, default=config_defaults["loss_weight_torsion"], help="Global multiplier for torsion loss")
     parser.add_argument("--loss_weight_energy", type=float, default=config_defaults["loss_weight_energy"], help="Global multiplier for affinity loss")
     parser.add_argument("--loss_weight_clash", type=float, default=config_defaults["loss_weight_clash"], help="Global multiplier for clash loss")
-    parser.add_argument("--loss_weight_pose_quality", type=float, default=config_defaults["loss_weight_pose_quality"], help="Global multiplier for pose-quality loss")
+    parser.add_argument("--loss_weight_pose_rank", type=float, default=config_defaults["loss_weight_pose_rank"], help="Global multiplier for pose-rank BCE loss")
     parser.add_argument("--loss_coarse_trans", type=float, default=config_defaults["loss_coarse_trans"], help="Coarse curriculum translation weight")
     parser.add_argument("--loss_coarse_rot", type=float, default=config_defaults["loss_coarse_rot"], help="Coarse curriculum rotation weight")
     parser.add_argument("--loss_coarse_torsion", type=float, default=config_defaults["loss_coarse_torsion"], help="Coarse curriculum torsion weight")
     parser.add_argument("--loss_coarse_energy", type=float, default=config_defaults["loss_coarse_energy"], help="Coarse curriculum affinity weight")
     parser.add_argument("--loss_coarse_clash", type=float, default=config_defaults["loss_coarse_clash"], help="Coarse curriculum clash weight")
-    parser.add_argument("--loss_coarse_pose_quality", type=float, default=config_defaults["loss_coarse_pose_quality"], help="Coarse curriculum pose-quality weight")
+    parser.add_argument("--loss_coarse_pose_rank", type=float, default=config_defaults["loss_coarse_pose_rank"], help="Coarse curriculum pose-rank BCE weight")
     parser.add_argument("--loss_transition_trans", type=float, default=config_defaults["loss_transition_trans"], help="Transition curriculum translation weight")
     parser.add_argument("--loss_transition_rot", type=float, default=config_defaults["loss_transition_rot"], help="Transition curriculum rotation weight")
     parser.add_argument("--loss_transition_torsion", type=float, default=config_defaults["loss_transition_torsion"], help="Transition curriculum torsion weight")
     parser.add_argument("--loss_transition_energy", type=float, default=config_defaults["loss_transition_energy"], help="Transition curriculum affinity weight")
     parser.add_argument("--loss_transition_clash", type=float, default=config_defaults["loss_transition_clash"], help="Transition curriculum clash weight")
-    parser.add_argument("--loss_transition_pose_quality", type=float, default=config_defaults["loss_transition_pose_quality"], help="Transition curriculum pose-quality weight")
+    parser.add_argument("--loss_transition_pose_rank", type=float, default=config_defaults["loss_transition_pose_rank"], help="Transition curriculum pose-rank BCE weight")
     parser.add_argument("--loss_refine_trans", type=float, default=config_defaults["loss_refine_trans"], help="Refine curriculum translation weight")
     parser.add_argument("--loss_refine_rot", type=float, default=config_defaults["loss_refine_rot"], help="Refine curriculum rotation weight")
     parser.add_argument("--loss_refine_torsion", type=float, default=config_defaults["loss_refine_torsion"], help="Refine curriculum torsion weight")
     parser.add_argument("--loss_refine_energy", type=float, default=config_defaults["loss_refine_energy"], help="Refine curriculum affinity weight")
     parser.add_argument("--loss_refine_clash", type=float, default=config_defaults["loss_refine_clash"], help="Refine curriculum clash weight")
-    parser.add_argument("--loss_refine_pose_quality", type=float, default=config_defaults["loss_refine_pose_quality"], help="Refine curriculum pose-quality weight")
+    parser.add_argument("--loss_refine_pose_rank", type=float, default=config_defaults["loss_refine_pose_rank"], help="Refine curriculum pose-rank BCE weight")
     parser.add_argument("--loss_refine_start", type=float, default=config_defaults["loss_refine_start"], help="Progress threshold where refine curriculum starts")
     parser.add_argument("--loss_pose_gate_epoch_start", type=float, default=config_defaults["loss_pose_gate_epoch_start"], help="Pose gate smoothstep start over training progress")
     parser.add_argument("--loss_pose_gate_epoch_end", type=float, default=config_defaults["loss_pose_gate_epoch_end"], help="Pose gate smoothstep end over training progress")
@@ -469,32 +502,62 @@ def main():
     )
     parser.add_argument("--crop_radius", type=float, default=config_defaults["crop_radius"], help="Runtime local crop radius in angstroms (default: 10.0)")
     parser.add_argument("--warmup_epochs", type=int, default=config_defaults["warmup_epochs"], help="Number of warmup epochs for spatial curriculum learning (default: 20)")
-    parser.add_argument("--rmsd_ratio", type=float, default=config_defaults["rmsd_ratio"], help="Ratio of validation set to compute RMSD (0.0-1.0)")
+    parser.add_argument(
+        "--val_subset_ratio",
+        type=float,
+        default=config_defaults["val_subset_ratio"],
+        help="Fraction of validation graphs used by the default partial validation schedule",
+    )
+    parser.add_argument(
+        "--val_full_every",
+        type=int,
+        default=config_defaults["val_full_every"],
+        help="Run full lightweight validation every N epochs (0 disables periodic full validation)",
+    )
+    parser.add_argument(
+        "--val_full_last_epochs",
+        type=int,
+        default=config_defaults["val_full_last_epochs"],
+        help="Always run full lightweight validation during the last N epochs",
+    )
+    parser.add_argument(
+        "--ode_method",
+        type=str,
+        default=config_defaults["ode_method"],
+        choices=["euler", "rk4"],
+        help="ODE solver used by validation, bootstrap, blind-pool refresh, and final Top-N evaluation",
+    )
     parser.add_argument("--accumulation_steps", type=int, default=config_defaults["accumulation_steps"], help="Gradient accumulation steps")
-    parser.add_argument("--max_nodes_per_batch", type=int, default=config_defaults["max_nodes_per_batch"], help="Max nodes per batch for DynamicBatchSampler.")
-    parser.add_argument("--val_max_nodes_per_batch", type=int, default=config_defaults["val_max_nodes_per_batch"], help="Max nodes per batch for validation loader (default: min(train_budget, 6000))")
-    parser.add_argument("--test_max_nodes_per_batch", type=int, default=config_defaults["test_max_nodes_per_batch"], help="Max nodes per batch for final test loader (default: same as val budget)")
-    parser.add_argument("--topn_max_nodes_per_batch", type=int, default=config_defaults["topn_max_nodes_per_batch"], help="Max nodes per batch for Top-N evaluation loader (default: same as test budget)")
-    parser.add_argument("--edge_budget_factor", type=int, default=config_defaults["edge_budget_factor"], help="Edge budget multiplier used by DynamicBatchSampler")
-    parser.add_argument("--eval_edge_guard_headroom", type=float, default=config_defaults["eval_edge_guard_headroom"], help="Extra headroom for evaluation edge guard")
+    parser.add_argument("--train_cost_budget", type=int, default=config_defaults["train_cost_budget"], help="Static cost budget used by training; it only shrinks after real OOM")
+    parser.add_argument("--val_cost_budget", type=int, default=config_defaults["val_cost_budget"], help="Static cost budget used by training-time validation")
+    parser.add_argument("--blind_pool_cost_budget", type=int, default=config_defaults["blind_pool_cost_budget"], help="Static cost budget used by blind-pool refresh")
+    parser.add_argument("--final_topn_cost_budget", type=int, default=config_defaults["final_topn_cost_budget"], help="Static cost budget used by final blind Top-N evaluation")
+    parser.add_argument("--eval_cost_guard_headroom", type=float, default=config_defaults["eval_cost_guard_headroom"], help="Extra headroom multiplier applied to evaluation cost guards")
     parser.add_argument("--ema_decay", type=float, default=config_defaults["ema_decay"], help="EMA decay rate (default: 0.999; use 0.99 for quick smoke tests)")
     parser.add_argument("--dataloader_num_workers", type=int, default=config_defaults["dataloader_num_workers"], help="DataLoader worker count")
     parser.add_argument("--dataloader_pin_memory", action="store_true", default=bool(config_defaults["dataloader_pin_memory"]), help="Enable DataLoader pin_memory")
     parser.add_argument("--no_dataloader_pin_memory", dest="dataloader_pin_memory", action="store_false", help="Disable DataLoader pin_memory")
     parser.add_argument("--dataloader_persistent_workers", action="store_true", default=bool(config_defaults["dataloader_persistent_workers"]), help="Enable DataLoader persistent_workers")
     parser.add_argument("--no_dataloader_persistent_workers", dest="dataloader_persistent_workers", action="store_false", help="Disable DataLoader persistent_workers")
-    parser.add_argument("--enable_oom_adaptive_batch", action="store_true", default=bool(config_defaults["enable_oom_adaptive_batch"]), help="Auto-reduce max_nodes_per_batch when frequent CUDA OOM occurs")
-    parser.add_argument("--disable_oom_adaptive_batch", dest="enable_oom_adaptive_batch", action="store_false", help="Disable adaptive OOM batch protection")
-    parser.add_argument("--oom_reduce_threshold", type=int, default=config_defaults["oom_reduce_threshold"], help="Reduce batch node budget when OOM batches in an epoch reach this threshold")
-    parser.add_argument("--oom_reduce_factor", type=float, default=config_defaults["oom_reduce_factor"], help="Factor to shrink max_nodes_per_batch after OOM threshold (0-1)")
-    parser.add_argument("--min_max_nodes_per_batch", type=int, default=config_defaults["min_max_nodes_per_batch"], help="Lower bound for adaptive max_nodes_per_batch")
-    parser.add_argument("--enable_val_oom_adaptive_batch", action="store_true", default=bool(config_defaults["enable_val_oom_adaptive_batch"]), help="Auto-reduce validation node budget when validation OOM is frequent")
-    parser.add_argument("--disable_val_oom_adaptive_batch", dest="enable_val_oom_adaptive_batch", action="store_false", help="Disable validation OOM adaptive protection")
-    parser.add_argument("--val_oom_reduce_threshold", type=int, default=config_defaults["val_oom_reduce_threshold"], help="Reduce validation node budget when validation OOM batches reach this threshold")
-    parser.add_argument("--val_oom_reduce_factor", type=float, default=config_defaults["val_oom_reduce_factor"], help="Factor to shrink validation max_nodes_per_batch after OOM threshold (0-1)")
-    parser.add_argument("--min_val_max_nodes_per_batch", type=int, default=config_defaults["min_val_max_nodes_per_batch"], help="Lower bound for adaptive validation max_nodes_per_batch (default: same as min_max_nodes_per_batch)")
-    parser.add_argument("--oom_recover_epochs", type=int, default=config_defaults["oom_recover_epochs"], help="Consecutive clean epochs before attempting batch budget recovery")
-    parser.add_argument("--oom_recover_factor", type=float, default=config_defaults["oom_recover_factor"], help="Factor to grow max_nodes_per_batch during recovery (>1)")
+    parser.add_argument("--max_oom_retry_splits", type=int, default=config_defaults["max_oom_retry_splits"], help="Maximum recursive split depth used to retry an OOM batch")
+    parser.add_argument("--enable_train_budget_callback", action="store_true", default=bool(config_defaults["enable_train_budget_callback"]), help="Enable window-based train budget callback after real CUDA OOM events")
+    parser.add_argument("--disable_train_budget_callback", dest="enable_train_budget_callback", action="store_false", help="Disable the train budget callback and keep train_cost_budget fixed")
+    parser.add_argument("--oom_reduce_threshold", type=int, default=config_defaults["oom_reduce_threshold"], help="Reduce train cost budget when OOM batches in an epoch reach this threshold")
+    parser.add_argument("--oom_reduce_factor", type=float, default=config_defaults["oom_reduce_factor"], help="Factor to shrink train_cost_budget after OOM threshold (0-1)")
+    parser.add_argument("--min_train_cost_budget", type=int, default=config_defaults["min_train_cost_budget"], help="Lower bound for adaptive train_cost_budget")
+    parser.add_argument("--enable_val_budget_callback", action="store_true", default=bool(config_defaults["enable_val_budget_callback"]), help="Enable window-based validation budget callback after validation OOM events")
+    parser.add_argument("--disable_val_budget_callback", dest="enable_val_budget_callback", action="store_false", help="Disable the validation budget callback and keep val_cost_budget fixed")
+    parser.add_argument("--val_oom_reduce_threshold", type=int, default=config_defaults["val_oom_reduce_threshold"], help="Reduce validation cost budget when validation OOM batches reach this threshold")
+    parser.add_argument("--val_oom_reduce_factor", type=float, default=config_defaults["val_oom_reduce_factor"], help="Factor to shrink val_cost_budget after OOM threshold (0-1)")
+    parser.add_argument("--min_val_cost_budget", type=int, default=config_defaults["min_val_cost_budget"], help="Lower bound for adaptive val_cost_budget")
+    parser.add_argument("--train_budget_window_size", type=int, default=config_defaults["train_budget_window_size"], help="Root-batch window size used by the train cost-budget callback")
+    parser.add_argument("--train_budget_recover_window_count", type=int, default=config_defaults["train_budget_recover_window_count"], help="Number of clean train windows required before additive budget recovery")
+    parser.add_argument("--train_budget_recover_step", type=int, default=config_defaults["train_budget_recover_step"], help="Additive recovery step for train_cost_budget after clean windows")
+    parser.add_argument("--train_offender_cooldown", type=int, default=config_defaults["train_offender_cooldown"], help="Cooldown length for train offenders, measured in root-batch events")
+    parser.add_argument("--val_budget_window_size", type=int, default=config_defaults["val_budget_window_size"], help="Validation callback window size for partial/full budget recovery")
+    parser.add_argument("--val_budget_recover_window_count", type=int, default=config_defaults["val_budget_recover_window_count"], help="Number of clean validation windows required before additive budget recovery")
+    parser.add_argument("--val_budget_recover_step", type=int, default=config_defaults["val_budget_recover_step"], help="Additive recovery step for validation budgets after clean windows")
+    parser.add_argument("--val_offender_cooldown", type=int, default=config_defaults["val_offender_cooldown"], help="Cooldown length for validation offenders, measured in validation events")
     parser.add_argument("--split_train_frac", type=float, default=config_defaults["split_train_frac"], help="Train split fraction")
     parser.add_argument("--split_val_frac", type=float, default=config_defaults["split_val_frac"], help="Validation split fraction")
     parser.add_argument("--split_test_frac", type=float, default=config_defaults["split_test_frac"], help="Test split fraction")
@@ -511,48 +574,67 @@ def main():
     parser.add_argument("--run_test_after_training", action="store_true", default=bool(config_defaults["run_test_after_training"]), help="Run final test-set evaluation after training")
     parser.add_argument("--skip_test_after_training", dest="run_test_after_training", action="store_false", help="Skip final test-set evaluation")
     parser.add_argument("--test_topk", type=str, default=config_defaults["test_topk"], help="Comma-separated top-k values for final test evaluation")
-    parser.add_argument("--test_pose_samples", type=int, default=config_defaults["test_pose_samples"], help="Number of candidate poses per complex for Top-N evaluation")
     parser.add_argument("--center_proposal_weight", type=float, default=config_defaults["center_proposal_weight"], help="Loss weight for replay-based center value supervision")
     parser.add_argument("--center_positive_radius", type=float, default=config_defaults["center_positive_radius"], help="Hit radius in angstroms used by crop curriculum and blind center metrics")
+    parser.add_argument("--center_guidance_learned_start", type=float, default=config_defaults["center_guidance_learned_start"], help="Training progress where crop-center scoring switches from heuristic priors to learned proposal logits")
     parser.add_argument("--center_proposal_topk", type=int, default=config_defaults["center_proposal_topk"], help="Number of diverse residue centers kept in stage-1 proposal")
     parser.add_argument("--center_refine_topk", type=int, default=config_defaults["center_refine_topk"], help="Number of centers refined in stage-2 local docking")
     parser.add_argument("--center_nms_radius", type=float, default=config_defaults["center_nms_radius"], help="Diversity radius in angstroms for center NMS")
     parser.add_argument("--stage1_pose_samples", type=int, default=config_defaults["stage1_pose_samples"], help="Number of local docking samples per center in stage-1")
     parser.add_argument("--stage2_pose_samples", type=int, default=config_defaults["stage2_pose_samples"], help="Number of local docking samples per center in stage-2")
     parser.add_argument("--crop_candidate_topk", type=int, default=config_defaults["crop_candidate_topk"], help="Top-k proposal candidates used for weighted crop sampling in each curriculum bucket")
+    parser.add_argument("--crop_proposal_start", type=float, default=config_defaults["crop_proposal_start"], help="Training progress where proposal-positive crop centers enter the curriculum")
+    parser.add_argument("--crop_near_miss_start", type=float, default=config_defaults["crop_near_miss_start"], help="Training progress where near-miss crop centers enter the curriculum")
+    parser.add_argument("--crop_hard_negative_start", type=float, default=config_defaults["crop_hard_negative_start"], help="Training progress where hard-negative crop centers enter the curriculum")
     parser.add_argument("--crop_min_residues", type=int, default=config_defaults["crop_min_residues"], help="Minimum protein residues kept in runtime local crop")
     parser.add_argument("--crop_atom_margin", type=float, default=config_defaults["crop_atom_margin"], help="Extra atom-distance margin used by runtime local crop")
     parser.add_argument("--disable_jitter_crop", action="store_true", default=bool(config_defaults["disable_jitter_crop"]), help="Disable jitter crop branch for ablation")
     parser.add_argument("--disable_hard_negative_crop", action="store_true", default=bool(config_defaults["disable_hard_negative_crop"]), help="Disable hard-negative crop branch for ablation")
     parser.add_argument("--pose_ranking_pair_weight", type=float, default=config_defaults["pose_ranking_pair_weight"], help="Pairwise ranking loss weight for pose confidence")
     parser.add_argument("--pose_ranking_margin", type=float, default=config_defaults["pose_ranking_margin"], help="Margin used by the pairwise ranking loss")
+    parser.add_argument("--ranking_same_center_start", type=float, default=config_defaults["ranking_same_center_start"], help="Training progress where same-center pairwise ranking becomes active")
+    parser.add_argument("--ranking_wrong_center_start", type=float, default=config_defaults["ranking_wrong_center_start"], help="Training progress where wrong-center pairwise ranking becomes active")
+    parser.add_argument("--same_center_micro_batch_size", type=int, default=config_defaults["same_center_micro_batch_size"], help="Initial micro-batch size used by the online same-center ranking branch")
+    parser.add_argument("--same_center_budget_window_size", type=int, default=config_defaults["same_center_budget_window_size"], help="Window size used to recover same-center ranking after OOM")
+    parser.add_argument("--same_center_budget_recover_window_count", type=int, default=config_defaults["same_center_budget_recover_window_count"], help="Number of clean same-center windows required before growing the same-center micro-batch")
+    parser.add_argument("--same_center_budget_recover_step", type=int, default=config_defaults["same_center_budget_recover_step"], help="Additive recovery step for same-center ranking micro-batches")
+    parser.add_argument("--same_center_offender_cooldown", type=int, default=config_defaults["same_center_offender_cooldown"], help="Cooldown length for root samples that repeatedly trigger same-center ranking OOM")
+    parser.add_argument("--ranking_budget_window_size", type=int, default=config_defaults["ranking_budget_window_size"], help="Window size used to recover wrong-center ranking after OOM")
+    parser.add_argument("--ranking_budget_recover_window_count", type=int, default=config_defaults["ranking_budget_recover_window_count"], help="Number of clean ranking windows required before re-enabling wrong-center ranking")
+    parser.add_argument("--ranking_offender_cooldown", type=int, default=config_defaults["ranking_offender_cooldown"], help="Cooldown length for ranking offenders that repeatedly trigger wrong-center OOM")
+    parser.add_argument("--ranking_wrong_center_cap", type=int, default=config_defaults["ranking_wrong_center_cap"], help="Maximum wrong-center ranking branch level; 1 means enabled, 0 means same-center only")
     parser.add_argument("--pose_bootstrap_weight", type=float, default=config_defaults["pose_bootstrap_weight"], help="Bootstrap loss weight for model-generated poses")
+    parser.add_argument("--pose_bootstrap_start", type=float, default=config_defaults["pose_bootstrap_start"], help="Training progress where bootstrap ranking supervision becomes active")
     parser.add_argument("--pose_bootstrap_frequency", type=int, default=config_defaults["pose_bootstrap_frequency"], help="Run bootstrap scoring every N training batches (0 disables)")
     parser.add_argument("--pose_bootstrap_ode_steps", type=int, default=config_defaults["pose_bootstrap_ode_steps"], help="ODE steps used to generate bootstrap poses")
-    parser.add_argument("--enable_fusion_calibration", action="store_true", default=bool(config_defaults["enable_fusion_calibration"]), help="Grid-search center/pose fusion weight on Val-Blind")
-    parser.add_argument("--disable_fusion_calibration", dest="enable_fusion_calibration", action="store_false", help="Disable Val-Blind fusion calibration")
-    parser.add_argument("--val_ode_steps", type=int, default=config_defaults["val_ode_steps"], help="ODE integration steps for validation and test evaluation (default: 50)")
+    parser.add_argument("--val_ode_steps", type=int, default=config_defaults["val_ode_steps"], help="Shared ODE integration steps for training-time validation and final blind test evaluation (default: 50)")
     parser.add_argument(
         "--checkpoint_selection_mode",
         type=str,
         default=config_defaults["checkpoint_selection_mode"],
         choices=[
             "composite",
-            "reranked_top1_success_2a",
-            "reranked_top5_success_2a",
-            "reranked_top1_plus_oracle_top5",
+            "mean_rmsd",
+            "val_loss",
+            "single_shot_success_2a",
+            "single_shot_success_5a",
+            "rmsd_priority",
         ],
-        help="Primary blind metric used for best_selected_model checkpoint selection",
+        help="Primary lightweight-validation metric used for best_selected_model checkpoint selection",
     )
-    parser.add_argument("--fusion_search_center_weights", type=str, default=config_defaults["fusion_search_center_weights"], help="Comma-separated center weights for fusion ablation grid")
-    parser.add_argument("--fusion_search_aff_weights", type=str, default=config_defaults["fusion_search_aff_weights"], help="Comma-separated affinity weights for fusion ablation grid (default: '0' = disabled)")
-    parser.add_argument("--fusion_search_clash_weights", type=str, default=config_defaults["fusion_search_clash_weights"], help="Comma-separated clash weights for fusion ablation grid (default: '0' = disabled)")
     parser.add_argument("--blind_pool_refresh_every", type=int, default=config_defaults["blind_pool_refresh_every"], help="Refresh blind candidate pool every N epochs")
     parser.add_argument("--blind_pool_start_epoch", type=int, default=config_defaults["blind_pool_start_epoch"], help="Earliest epoch to start pool refresh")
+    parser.add_argument("--blind_pool_refresh_on_best_update", action="store_true", default=bool(config_defaults["blind_pool_refresh_on_best_update"]), help="Also refresh the blind candidate pool immediately when a new best checkpoint is selected")
     parser.add_argument("--blind_pool_max_complexes", type=int, default=config_defaults["blind_pool_max_complexes"], help="Max complexes per pool refresh")
     parser.add_argument("--blind_pool_cache_bce_weight", type=float, default=config_defaults["blind_pool_cache_bce_weight"], help="Cache BCE loss weight")
     parser.add_argument("--blind_pool_cache_rank_weight", type=float, default=config_defaults["blind_pool_cache_rank_weight"], help="Cache pairwise ranking loss weight")
     parser.add_argument("--blind_pool_pairs_per_complex", type=int, default=config_defaults["blind_pool_pairs_per_complex"], help="Hard pairs sampled per complex from cache")
+    parser.add_argument("--replay_start_ratio", type=float, default=config_defaults["replay_start_ratio"], help="Training progress where replay-based reranking becomes active")
+    parser.add_argument("--replay_micro_batch_size", type=int, default=config_defaults["replay_micro_batch_size"], help="Initial replay micro-batch size for candidate scoring")
+    parser.add_argument("--replay_budget_window_size", type=int, default=config_defaults["replay_budget_window_size"], help="Window size used by replay micro-batch recovery")
+    parser.add_argument("--replay_budget_recover_window_count", type=int, default=config_defaults["replay_budget_recover_window_count"], help="Number of clean replay windows required before growing replay micro-batches")
+    parser.add_argument("--replay_candidate_cooldown", type=int, default=config_defaults["replay_candidate_cooldown"], help="Cooldown length for replay complexes that repeatedly trigger OOM")
+    parser.add_argument("--replay_max_candidates_per_complex", type=int, default=config_defaults["replay_max_candidates_per_complex"], help="Maximum replay candidates kept per complex before micro-batching")
 
     parser.set_defaults(**config_defaults)
 
@@ -570,13 +652,6 @@ def main():
         args.test_topk_values = parsed_topk
     except Exception as e:
         raise ValueError(f"Invalid --test_topk='{args.test_topk}': {e}") from e
-
-    try:
-        args.parsed_fusion_center_weights = tuple(float(x.strip()) for x in args.fusion_search_center_weights.split(",") if x.strip())
-        args.parsed_fusion_aff_weights = tuple(float(x.strip()) for x in args.fusion_search_aff_weights.split(",") if x.strip())
-        args.parsed_fusion_clash_weights = tuple(float(x.strip()) for x in args.fusion_search_clash_weights.split(",") if x.strip())
-    except Exception as e:
-        raise ValueError(f"Invalid fusion search weights: {e}") from e
 
     # 动态计算 `pro_res_cont_count`：残基连续特征维度加上 `esm_dim`。
     args.pro_res_cont_count = len(PROTEIN_RESIDUE_CONT_SCHEMA) + args.esm_dim
@@ -652,8 +727,11 @@ def main():
             protein_residue_fallback_k=args.protein_residue_fallback_k,
             dynamic_inter_cutoff=args.dynamic_inter_cutoff,
             dynamic_inter_knn_k=args.dynamic_inter_knn_k,
+            dynamic_inter_max_neighbors=args.dynamic_inter_max_neighbors,
             dynamic_residue_cutoff=args.dynamic_residue_cutoff,
             dynamic_residue_knn_k=args.dynamic_residue_knn_k,
+            dynamic_residue_max_neighbors=args.dynamic_residue_max_neighbors,
+            dynamic_residue_candidate_topk=args.dynamic_residue_candidate_topk,
             flow_sigma_min=args.flow_sigma_min,
             flow_spatial_sigma_min=args.flow_spatial_sigma_min,
             flow_spatial_sigma_max=args.flow_spatial_sigma_max,
@@ -668,25 +746,25 @@ def main():
             loss_weight_torsion=args.loss_weight_torsion,
             loss_weight_energy=args.loss_weight_energy,
             loss_weight_clash=args.loss_weight_clash,
-            loss_weight_pose_quality=args.loss_weight_pose_quality,
+            loss_weight_pose_rank=args.loss_weight_pose_rank,
             loss_coarse_trans=args.loss_coarse_trans,
             loss_coarse_rot=args.loss_coarse_rot,
             loss_coarse_torsion=args.loss_coarse_torsion,
             loss_coarse_energy=args.loss_coarse_energy,
             loss_coarse_clash=args.loss_coarse_clash,
-            loss_coarse_pose_quality=args.loss_coarse_pose_quality,
+            loss_coarse_pose_rank=args.loss_coarse_pose_rank,
             loss_transition_trans=args.loss_transition_trans,
             loss_transition_rot=args.loss_transition_rot,
             loss_transition_torsion=args.loss_transition_torsion,
             loss_transition_energy=args.loss_transition_energy,
             loss_transition_clash=args.loss_transition_clash,
-            loss_transition_pose_quality=args.loss_transition_pose_quality,
+            loss_transition_pose_rank=args.loss_transition_pose_rank,
             loss_refine_trans=args.loss_refine_trans,
             loss_refine_rot=args.loss_refine_rot,
             loss_refine_torsion=args.loss_refine_torsion,
             loss_refine_energy=args.loss_refine_energy,
             loss_refine_clash=args.loss_refine_clash,
-            loss_refine_pose_quality=args.loss_refine_pose_quality,
+            loss_refine_pose_rank=args.loss_refine_pose_rank,
             loss_refine_start=args.loss_refine_start,
             loss_pose_gate_epoch_start=args.loss_pose_gate_epoch_start,
             loss_pose_gate_epoch_end=args.loss_pose_gate_epoch_end,
@@ -696,18 +774,21 @@ def main():
             device=args.device,
             crop_radius=args.crop_radius,
             warmup_epochs=args.warmup_epochs,
-            rmsd_check_ratio=args.rmsd_ratio,
+            val_subset_ratio=args.val_subset_ratio,
+            val_full_every=args.val_full_every,
+            val_full_last_epochs=args.val_full_last_epochs,
+            ode_method=args.ode_method,
             accumulation_steps=args.accumulation_steps,
-            max_nodes_per_batch=args.max_nodes_per_batch,
-            val_max_nodes_per_batch=args.val_max_nodes_per_batch,
-            test_max_nodes_per_batch=args.test_max_nodes_per_batch,
-            topn_max_nodes_per_batch=args.topn_max_nodes_per_batch,
-            edge_budget_factor=args.edge_budget_factor,
-            eval_edge_guard_headroom=args.eval_edge_guard_headroom,
+            train_cost_budget=args.train_cost_budget,
+            val_cost_budget=args.val_cost_budget,
+            blind_pool_cost_budget=args.blind_pool_cost_budget,
+            final_topn_cost_budget=args.final_topn_cost_budget,
+            eval_cost_guard_headroom=args.eval_cost_guard_headroom,
             ema_decay=args.ema_decay,
             dataloader_num_workers=args.dataloader_num_workers,
             dataloader_pin_memory=args.dataloader_pin_memory,
             dataloader_persistent_workers=args.dataloader_persistent_workers,
+            max_oom_retry_splits=args.max_oom_retry_splits,
             split_train_frac=args.split_train_frac,
             split_val_frac=args.split_val_frac,
             split_test_frac=args.split_test_frac,
@@ -717,46 +798,70 @@ def main():
             ablation_mode=args.ablation_mode,
             run_test_after_training=args.run_test_after_training,
             test_topk_values=args.test_topk_values,
-            test_pose_samples=args.test_pose_samples,
-            enable_oom_adaptive_batch=args.enable_oom_adaptive_batch,
+            enable_train_budget_callback=args.enable_train_budget_callback,
             oom_reduce_threshold=args.oom_reduce_threshold,
             oom_reduce_factor=args.oom_reduce_factor,
-            min_max_nodes_per_batch=args.min_max_nodes_per_batch,
-            enable_val_oom_adaptive_batch=args.enable_val_oom_adaptive_batch,
+            min_train_cost_budget=args.min_train_cost_budget,
+            enable_val_budget_callback=args.enable_val_budget_callback,
             val_oom_reduce_threshold=args.val_oom_reduce_threshold,
             val_oom_reduce_factor=args.val_oom_reduce_factor,
-            min_val_max_nodes_per_batch=args.min_val_max_nodes_per_batch,
-            oom_recover_epochs=args.oom_recover_epochs,
-            oom_recover_factor=args.oom_recover_factor,
+            min_val_cost_budget=args.min_val_cost_budget,
+            train_budget_window_size=args.train_budget_window_size,
+            train_budget_recover_window_count=args.train_budget_recover_window_count,
+            train_budget_recover_step=args.train_budget_recover_step,
+            train_offender_cooldown=args.train_offender_cooldown,
+            val_budget_window_size=args.val_budget_window_size,
+            val_budget_recover_window_count=args.val_budget_recover_window_count,
+            val_budget_recover_step=args.val_budget_recover_step,
+            val_offender_cooldown=args.val_offender_cooldown,
             center_proposal_weight=args.center_proposal_weight,
             center_positive_radius=args.center_positive_radius,
+            center_guidance_learned_start=args.center_guidance_learned_start,
             center_proposal_topk=args.center_proposal_topk,
             center_refine_topk=args.center_refine_topk,
             center_nms_radius=args.center_nms_radius,
             stage1_pose_samples=args.stage1_pose_samples,
             stage2_pose_samples=args.stage2_pose_samples,
             crop_candidate_topk=args.crop_candidate_topk,
+            crop_proposal_start=args.crop_proposal_start,
+            crop_near_miss_start=args.crop_near_miss_start,
+            crop_hard_negative_start=args.crop_hard_negative_start,
             crop_min_residues=args.crop_min_residues,
             crop_atom_margin=args.crop_atom_margin,
             disable_jitter_crop=args.disable_jitter_crop,
             disable_hard_negative_crop=args.disable_hard_negative_crop,
             pose_ranking_pair_weight=args.pose_ranking_pair_weight,
             pose_ranking_margin=args.pose_ranking_margin,
+            ranking_same_center_start=args.ranking_same_center_start,
+            ranking_wrong_center_start=args.ranking_wrong_center_start,
             pose_bootstrap_weight=args.pose_bootstrap_weight,
+            pose_bootstrap_start=args.pose_bootstrap_start,
             pose_bootstrap_frequency=args.pose_bootstrap_frequency,
             pose_bootstrap_ode_steps=args.pose_bootstrap_ode_steps,
-            enable_fusion_calibration=args.enable_fusion_calibration,
             val_ode_steps=args.val_ode_steps,
             checkpoint_selection_mode=args.checkpoint_selection_mode,
-            fusion_search_center_weights=args.parsed_fusion_center_weights,
-            fusion_search_aff_weights=args.parsed_fusion_aff_weights,
-            fusion_search_clash_weights=args.parsed_fusion_clash_weights,
             blind_pool_refresh_every=args.blind_pool_refresh_every,
             blind_pool_start_epoch=args.blind_pool_start_epoch,
+            blind_pool_refresh_on_best_update=args.blind_pool_refresh_on_best_update,
             blind_pool_max_complexes=args.blind_pool_max_complexes,
             blind_pool_cache_bce_weight=args.blind_pool_cache_bce_weight,
             blind_pool_cache_rank_weight=args.blind_pool_cache_rank_weight,
             blind_pool_pairs_per_complex=args.blind_pool_pairs_per_complex,
+            replay_start_ratio=args.replay_start_ratio,
+            same_center_micro_batch_size=args.same_center_micro_batch_size,
+            same_center_budget_window_size=args.same_center_budget_window_size,
+            same_center_budget_recover_window_count=args.same_center_budget_recover_window_count,
+            same_center_budget_recover_step=args.same_center_budget_recover_step,
+            same_center_offender_cooldown=args.same_center_offender_cooldown,
+            ranking_budget_window_size=args.ranking_budget_window_size,
+            ranking_budget_recover_window_count=args.ranking_budget_recover_window_count,
+            ranking_offender_cooldown=args.ranking_offender_cooldown,
+            ranking_wrong_center_cap=args.ranking_wrong_center_cap,
+            replay_micro_batch_size=args.replay_micro_batch_size,
+            replay_budget_window_size=args.replay_budget_window_size,
+            replay_budget_recover_window_count=args.replay_budget_recover_window_count,
+            replay_candidate_cooldown=args.replay_candidate_cooldown,
+            replay_max_candidates_per_complex=args.replay_max_candidates_per_complex,
             run_name=run_name,
             run_log_file=log_file,
         )

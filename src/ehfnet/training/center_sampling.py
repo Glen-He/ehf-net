@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 from ehfnet.graph import GraphCollator
-from ehfnet.training.batch_helpers import build_local_batch_from_centers, compute_pose_quality_target
+from ehfnet.training.batch_helpers import build_local_batch_from_centers, compute_pose_rank_target
 from ehfnet.training.flow_matcher import ConditionalFlowMatcher
 
 
@@ -28,7 +28,9 @@ def select_training_crop_centers(
     weighted_sampling: bool,
     disable_jitter: bool,
     disable_hard_negative: bool,
-    allow_proposal_buckets: bool,
+    proposal_start: float,
+    near_miss_start: float,
+    hard_negative_start: float,
 ) -> tuple[torch.Tensor, list[str]]:
     """
     采样训练裁剪中心。
@@ -47,18 +49,25 @@ def select_training_crop_centers(
         weighted_sampling: 是否按分数执行加权采样。
         disable_jitter: 是否关闭中心扰动。
         disable_hard_negative: 是否关闭 hard negative 中心采样。
-        allow_proposal_buckets: 是否允许使用提议桶采样中心。
+        proposal_start: `proposal_pos` 进入课程的训练进度阈值。
+        near_miss_start: `near_miss` 进入课程的训练进度阈值。
+        hard_negative_start: `hard_neg` 进入课程的训练进度阈值。
 
     Returns:
         tuple[Tensor, list[str]]: 训练裁剪中心张量 [B, 3] 与各样本的采样模式列表。
     """
     progress = float(max(0.0, min(1.0, progress)))
+    proposal_active = progress >= float(max(0.0, min(1.0, proposal_start)))
+    near_miss_active = progress >= float(max(0.0, min(1.0, near_miss_start)))
+    hard_negative_active = progress >= float(max(0.0, min(1.0, hard_negative_start)))
     stage_weights = {
         "gt": max(0.10, 0.50 - 0.40 * progress),
         "jitter": max(0.15, 0.30 - 0.10 * progress),
-        "proposal_pos": 0.10 + 0.20 * progress,
-        "near_miss": 0.05 + 0.15 * progress,
-        "hard_neg": max(0.0, -0.05 + 0.30 * progress),
+        "proposal_pos": (0.10 + 0.20 * progress) if proposal_active else 0.0,
+        "near_miss": (0.05 + 0.15 * progress) if near_miss_active else 0.0,
+        "hard_neg": (
+            max(0.0, -0.05 + 0.30 * progress) if hard_negative_active else 0.0
+        ),
     }
     if disable_jitter:
         stage_weights["jitter"] = 0.0
@@ -105,15 +114,15 @@ def select_training_crop_centers(
         }
         if not disable_jitter:
             bucket_to_center["jitter"] = gt_center + torch.randn_like(gt_center) * jitter_sigma
-        if allow_proposal_buckets and positive_mask.any():
+        if proposal_active and positive_mask.any():
             pos_pool = ordered_pos[positive_mask]
             pos_logits = ordered_logits[positive_mask]
             bucket_to_center["proposal_pos"] = _sample_from_bucket(pos_pool, pos_logits)
-        if allow_proposal_buckets and near_mask.any():
+        if near_miss_active and near_mask.any():
             near_pool = ordered_pos[near_mask]
             near_logits = ordered_logits[near_mask]
             bucket_to_center["near_miss"] = _sample_from_bucket(near_pool, near_logits)
-        if allow_proposal_buckets and hard_mask.any() and not disable_hard_negative:
+        if hard_negative_active and hard_mask.any() and not disable_hard_negative:
             hard_pool = ordered_pos[hard_mask]
             hard_logits = ordered_logits[hard_mask]
             bucket_to_center["hard_neg"] = _sample_from_bucket(hard_pool, hard_logits)
@@ -349,7 +358,7 @@ def select_bootstrap_blind_centers(
     return bootstrap_centers
 
 
-def compute_bootstrap_pose_quality_loss(
+def compute_bootstrap_pose_rank_loss(
     *,
     student_model: torch.nn.Module,
     teacher_model: torch.nn.Module,
@@ -358,17 +367,19 @@ def compute_bootstrap_pose_quality_loss(
     placement_centers: torch.Tensor,
     epoch: int,
     ode_steps: int,
+    ode_method: str,
     graph_builder: Any,
     collator: GraphCollator,
     crop_radius: float,
     crop_min_residues: int,
     crop_atom_margin: float,
+    dataset_raw_dir: str,
 ) -> torch.Tensor:
     """
-    计算 bootstrap pose 质量损失。
+    计算 bootstrap pose 排序损失。
 
-    利用 teacher 轨迹构造监督目标，再由 student 预测局部质量，
-    为 pose quality 分支提供额外训练信号。
+    利用 teacher 轨迹构造监督目标，再由 student 预测局部排序分数，
+    为单一排序头提供额外训练信号。
 
     Args:
         student_model: 待优化的 student 模型实例。
@@ -378,14 +389,16 @@ def compute_bootstrap_pose_quality_loss(
         placement_centers: 指定初始放置或 bootstrap 使用的中心集合。
         epoch: 当前训练轮次。
         ode_steps: ODE 推理积分步数。
+        ode_method: bootstrap teacher rollout 使用的 ODE 积分方法。
         graph_builder: 用于构图或重建局部图的图构建器。
         collator: 用于拼接局部样本的图批处理器。
         crop_radius: 局部裁剪半径。
         crop_min_residues: 局部裁剪后至少保留的残基数量。
         crop_atom_margin: 基于原子距离扩展残基裁剪范围的边界。
+        dataset_raw_dir: 数据集原始样本目录。
 
     Returns:
-        tuple[Tensor, dict[str, Tensor | float]]: bootstrap 损失值及其调试统计信息。
+        Tensor: bootstrap 排序损失标量。
     """
     blind_local_batch = build_local_batch_from_centers(
         source_batch,
@@ -395,6 +408,11 @@ def compute_bootstrap_pose_quality_loss(
         crop_atom_margin=crop_atom_margin,
         graph_builder=graph_builder,
         collator=collator,
+    )
+    blind_local_samples = (
+        blind_local_batch.to_data_list()
+        if hasattr(blind_local_batch, "to_data_list")
+        else [blind_local_batch]
     )
     device = next(student_model.parameters()).device
     blind_local_batch = blind_local_batch.to(device)
@@ -422,16 +440,22 @@ def compute_bootstrap_pose_quality_loss(
             model=teacher_model,
             data=teacher_batch,
             steps=ode_steps,
-            method="euler",
+            method=ode_method,
             store_trajectory=False,
         )
-        teacher_target = compute_pose_quality_target(final_pos, x_ref, batch_idx=lig_batch)
+        teacher_target = compute_pose_rank_target(
+            final_pos,
+            x_ref,
+            batch_idx=lig_batch,
+            samples=blind_local_samples,
+            dataset_raw_dir=dataset_raw_dir,
+        )
 
     student_batch = blind_local_batch.clone()
     student_batch["ligand_atom"].pos = final_pos.detach()
     student_batch.t = torch.ones(B, device=x_ref.device, dtype=x_ref.dtype)
     student_pred = student_model(student_batch, student_batch.t)
-    pred_pose_quality = student_pred["pose_quality"].view(-1)
-    target_pose_quality = teacher_target.view(-1).to(device=pred_pose_quality.device, dtype=pred_pose_quality.dtype)
-    weight = 1.0 + 2.0 * target_pose_quality
-    return F.binary_cross_entropy_with_logits(pred_pose_quality, target_pose_quality, weight=weight)
+    pred_pose_rank = student_pred["pose_rank_score"].view(-1)
+    target_pose_rank = teacher_target.view(-1).to(device=pred_pose_rank.device, dtype=pred_pose_rank.dtype)
+    weight = 1.0 + 2.0 * target_pose_rank
+    return F.binary_cross_entropy_with_logits(pred_pose_rank, target_pose_rank, weight=weight)

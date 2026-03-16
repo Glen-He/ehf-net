@@ -10,61 +10,66 @@ from typing import Any
 
 import torch
 
+from ehfnet.geometry import compute_batch_symmetry_aware_rmsd
 from ehfnet.training.rerank_losses import SOFT_TARGET_CENTER, SOFT_TARGET_SCALE
-from torch_scatter import scatter_mean
 
 from ehfnet.graph import GraphCollator, crop_graph_to_center
 
 
-def compute_pose_quality_target(
+def compute_pose_rank_target(
     current_pos: torch.Tensor,
     target_pos: torch.Tensor,
     *,
     batch_idx: torch.Tensor,
+    samples: list[Any],
+    dataset_raw_dir: str,
 ) -> torch.Tensor:
     """
-    计算 pose 质量软目标。
+    计算 pose 排序软目标。
 
     根据 RMSD 将真实构象质量映射为平滑监督值，
-    供排序和 pose quality 相关损失使用。
+    供单一排序头的 BCE 与排序损失共用。
 
     Args:
         current_pos: 当前构象坐标。
         target_pos: 目标构象坐标。
         batch_idx: 原子或样本所属的 batch 索引。
+        samples: 与 batch 对齐的逐图样本列表。
+        dataset_raw_dir: 数据集原始样本目录。
 
     Returns:
-        Tensor: 与 batch 对齐的 pose quality 软目标张量。
+        Tensor: 与 batch 对齐的 pose 排序软目标张量。
     """
-    sq_diff = ((current_pos - target_pos) ** 2).sum(dim=-1)
-    rmsd = torch.sqrt(scatter_mean(sq_diff, batch_idx, dim=0) + 1e-8)
+    rmsd = compute_batch_symmetry_aware_rmsd(
+        current_pos=current_pos,
+        target_pos=target_pos,
+        batch_idx=batch_idx,
+        samples=samples,
+        dataset_raw_dir=dataset_raw_dir,
+    )
     return torch.sigmoid((SOFT_TARGET_CENTER - rmsd) / SOFT_TARGET_SCALE).unsqueeze(-1)
 
 
-def select_pose_ranking_logit(predictions: dict[str, torch.Tensor]) -> torch.Tensor:
+def select_pose_rank_logit(predictions: dict[str, torch.Tensor | None]) -> torch.Tensor:
     """
-    选择排序打分张量。
+    读取单一排序头输出。
 
-    从模型预测结果中提取用于排序的主 logit，
-    在不同输出字段之间提供统一访问入口。
+    在单头方案下统一读取 `pose_rank_score`，
+    避免训练、候选生成和评估阶段分别手写字段访问逻辑。
 
     Args:
         predictions: 模型前向传播返回的预测结果字典。
 
     Returns:
-        Tensor: 用于排序损失的主 logit 张量。
+        Tensor: 单一排序头输出的主 logit 张量。
 
     Raises:
-        KeyError: 当预测结果中既不存在 `pose_rank_score` 也不存在 `pose_quality` 时抛出。
+        KeyError: 当预测结果中不存在 `pose_rank_score` 时抛出。
     """
     rank_logit = predictions.get("pose_rank_score")
-    if rank_logit is not None:
-        return rank_logit
-
-    pose_quality = predictions.get("pose_quality")
-    if pose_quality is None:
-        raise KeyError("Predictions must contain either 'pose_rank_score' or 'pose_quality'.")
-    return pose_quality
+    if rank_logit is None:
+        raise KeyError("Predictions must contain 'pose_rank_score'.")
+    return rank_logit
 
 
 def apply_loss_context(

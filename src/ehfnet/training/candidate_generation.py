@@ -15,8 +15,15 @@ import torch
 from torch import Tensor
 from torch.utils.data import DataLoader
 from torch_scatter import scatter_mean
+from tqdm import tqdm
 
+from ehfnet.geometry import compute_symmetry_aware_rmsd, resolve_sample_ligand_path
 from ehfnet.graph import GraphCollator, crop_graph_to_center
+from ehfnet.training.adaptive_batching import (
+    estimate_runtime_batch_cost,
+    split_collated_batch,
+)
+from ehfnet.training.batch_helpers import select_pose_rank_logit
 from ehfnet.training.rerank_losses import rmsd_to_soft_target
 from ehfnet.training.inference import (
     combine_center_pose_score,
@@ -60,12 +67,14 @@ def generate_blind_candidates(
     stage2_pose_samples: int,
     crop_radius: float,
     ode_steps: int,
+    ode_method: str,
     warmup_epochs: int,
     center_hit_radius: float,
     crop_min_residues: int,
     crop_atom_margin: float,
     fusion_weights: dict[str, float] | None = None,
     use_learned_center_scores: bool = True,
+    dataset_raw_dir: str | None = None,
     dataset_indices: list[int] | None = None,
     pool_epoch: int = -1,
     generator_ckpt_id: str = "",
@@ -90,12 +99,14 @@ def generate_blind_candidates(
         stage2_pose_samples: 第二阶段精排生成的候选构象数。
         crop_radius: 局部裁剪半径。
         ode_steps: ODE 推理积分步数。
+        ode_method: 候选生成阶段使用的 ODE 积分方法。
         warmup_epochs: 课程学习预热轮数。
         center_hit_radius: 判断中心命中的距离阈值。
         crop_min_residues: 局部裁剪后至少保留的残基数量。
         crop_atom_margin: 基于原子距离扩展残基裁剪范围的边界。
         fusion_weights: 融合不同分支分数时使用的权重字典。
         use_learned_center_scores: 是否优先使用模型学习得到的中心分数。
+        dataset_raw_dir: 数据集原始样本目录，用于计算对称感知 RMSD。
         dataset_indices: 与样本一一对应的原始数据集索引。
         pool_epoch: 当前候选池对应的训练轮次。
         generator_ckpt_id: 生成候选时使用的 checkpoint 标识。
@@ -107,6 +118,7 @@ def generate_blind_candidates(
         RuntimeError: 当候选生成过程出现不可恢复的局部对接错误时抛出。
     """
     model.eval()
+    use_configured_cuda = device.type == "cuda"
     records: list[dict[str, Any]] = []
     failed_samples = 0
 
@@ -177,12 +189,14 @@ def generate_blind_candidates(
                         collator=collator,
                         device=device,
                         ode_steps=ode_steps,
+                        ode_method=ode_method,
                         warmup_epochs=warmup_epochs,
                         epoch_offset=pose_id,
                         stage_id="stage1",
                         center_id=proposal_rank,
                         pose_counter=pose_counter,
                         fusion_weights=fusion_weights,
+                        dataset_raw_dir=dataset_raw_dir,
                     )
                     if pose_rec is not None:
                         pose_records.append(pose_rec)
@@ -217,12 +231,14 @@ def generate_blind_candidates(
                         collator=collator,
                         device=device,
                         ode_steps=ode_steps,
+                        ode_method=ode_method,
                         warmup_epochs=warmup_epochs,
                         epoch_offset=stage1_pose_samples + pose_id,
                         stage_id="stage2",
                         center_id=c_rank,
                         pose_counter=pose_counter,
                         fusion_weights=fusion_weights,
+                        dataset_raw_dir=dataset_raw_dir,
                     )
                     if pose_rec is not None:
                         pose_records.append(pose_rec)
@@ -271,13 +287,13 @@ def generate_blind_candidates(
             failed_samples += 1
             logger.warning("Candidate generation: OOM on sample %d, skipping.", sample_idx)
             gc.collect()
-            if torch.cuda.is_available():
+            if use_configured_cuda:
                 torch.cuda.empty_cache()
         except Exception as exc:
             failed_samples += 1
             logger.warning("Candidate generation: sample %d failed: %s\n%s", sample_idx, exc, traceback.format_exc())
             gc.collect()
-            if torch.cuda.is_available():
+            if use_configured_cuda:
                 torch.cuda.empty_cache()
 
     if not records and failed_samples > 0 and samples:
@@ -306,12 +322,14 @@ def _generate_single_pose(
     collator: GraphCollator,
     device: torch.device,
     ode_steps: int,
+    ode_method: str,
     warmup_epochs: int,
     epoch_offset: int,
     stage_id: str,
     center_id: int,
     pose_counter: int,
     fusion_weights: dict[str, float] | None,
+    dataset_raw_dir: str | None,
 ) -> dict[str, Any] | None:
     """
     在给定中心点生成一个构象。发生 OOM 时返回 None。
@@ -320,6 +338,7 @@ def _generate_single_pose(
         dict[str, Any] | None: 返回单个候选构象的记录字典；若生成过程中发生 OOM 则返回 `None`。
     """
     try:
+        use_configured_cuda = device.type == "cuda"
         infer_batch = cast(Any, collator.collate([local_sample])).to(device)
         x_ref = infer_batch["ligand_atom"].pos
         lig_batch = infer_batch["ligand_atom"].batch
@@ -338,11 +357,25 @@ def _generate_single_pose(
         infer_batch["ligand_atom"].pos = x0
         final_pos, _ = matcher.ode_solve(
             model=model, data=infer_batch, steps=ode_steps,
-            method="euler", store_trajectory=False,
+            method=ode_method, store_trajectory=False,
         )
 
-        sq_diff = ((final_pos - x_ref) ** 2).sum(dim=-1)
-        rmsd = float(torch.sqrt(scatter_mean(sq_diff, lig_batch, dim=0, dim_size=1))[0].item())
+        if dataset_raw_dir is None:
+            raise ValueError("dataset_raw_dir must be provided for symmetry-aware RMSD.")
+        ligand_file = resolve_sample_ligand_path(
+            local_sample,
+            dataset_raw_dir=dataset_raw_dir,
+        )
+        if ligand_file is None:
+            pdb_id = getattr(local_sample, "dataset_pdb_id", getattr(local_sample, "pdb_id", "unknown"))
+            raise ValueError(
+                f"Missing ligand file for symmetry-aware RMSD on sample {pdb_id!r}."
+            )
+        rmsd = compute_symmetry_aware_rmsd(
+            current_pos=final_pos,
+            target_pos=x_ref,
+            ligand_file=ligand_file,
+        )
 
         centroid_pred = final_pos.mean(dim=0).detach().cpu()
         centroid_gt = x_ref.mean(dim=0).detach().cpu()
@@ -352,19 +385,19 @@ def _generate_single_pose(
         score_batch["ligand_atom"].pos = final_pos
         score_out = model(score_batch, torch.ones(1, device=device, dtype=final_pos.dtype))
 
-        pose_quality_logit = float(score_out["pose_quality"].detach().cpu().view(-1)[0].item())
         aff_raw = score_out.get("binding_affinity", torch.zeros(1))
         clash_raw = score_out.get("steric_clash_batch", None)
         force_atom = score_out.get("ligand_force", None)
-        rank_score_raw = score_out.get("pose_rank_score", None)
+        pose_rank_logit_raw = select_pose_rank_logit(score_out)
 
         aff_val = float(aff_raw.detach().cpu().view(-1)[0].item())
         clash_val = float(clash_raw.detach().cpu().view(-1)[0].item()) if clash_raw is not None else 0.0
-        rank_score = float(rank_score_raw.detach().cpu().view(-1)[0].item()) if rank_score_raw is not None else None
-        primary_ranking_logit = rank_score if rank_score is not None else pose_quality_logit
+        pose_rank_logit = float(
+            pose_rank_logit_raw.detach().cpu().view(-1)[0].item()
+        )
 
         center_logit_t = torch.tensor([center_logit], dtype=torch.float32)
-        pose_logit_t = torch.tensor([primary_ranking_logit], dtype=torch.float32)
+        pose_logit_t = torch.tensor([pose_rank_logit], dtype=torch.float32)
         combined_score = float(combine_center_pose_score(
             center_logit_t, pose_logit_t,
             aff_logit=torch.tensor([aff_val]),
@@ -374,7 +407,7 @@ def _generate_single_pose(
 
         pose_xyz = final_pos.detach().cpu().tolist()
 
-        del infer_batch, x_ref, lig_batch, masses, x0, final_pos, sq_diff
+        del infer_batch, x_ref, lig_batch, masses, x0, final_pos
         del score_batch, score_out
 
         rec: dict[str, Any] = {
@@ -384,8 +417,7 @@ def _generate_single_pose(
             "pose_xyz": pose_xyz,
             "rmsd": rmsd,
             "centroid_dist": centroid_dist,
-            "ranking_logit": primary_ranking_logit,
-            "pose_quality_logit": pose_quality_logit,
+            "pose_rank_logit": pose_rank_logit,
             "binding_affinity_teacher": aff_val,
             "steric_clash_teacher": clash_val,
             "center_logit": center_logit,
@@ -402,7 +434,7 @@ def _generate_single_pose(
     except torch.cuda.OutOfMemoryError:
         logger.warning("Single pose generation OOM at center_id=%d, stage=%s", center_id, stage_id)
         gc.collect()
-        if torch.cuda.is_available():
+        if use_configured_cuda:
             torch.cuda.empty_cache()
         return None
 
@@ -423,17 +455,26 @@ def generate_candidates_from_loader(
     stage2_pose_samples: int,
     crop_radius: float,
     ode_steps: int,
+    ode_method: str,
     warmup_epochs: int,
     center_hit_radius: float,
     crop_min_residues: int,
     crop_atom_margin: float,
     fusion_weights: dict[str, float] | None = None,
     use_learned_center_scores: bool = True,
-    edge_guard_limit: int | None = None,
+    cost_guard_limit: int | None = None,
+    num_gnn_blocks: int = 1,
+    dynamic_inter_max_neighbors: int = 1,
+    dynamic_residue_max_neighbors: int = 1,
+    dynamic_residue_candidate_topk: int = 1,
+    phase_multiplier: float = 1.0,
+    max_oom_retry_splits: int = 0,
     max_complexes: int | None = None,
     pool_epoch: int = -1,
     generator_ckpt_id: str = "",
-) -> list[dict[str, Any]]:
+    progress_desc: str = "Candidate Generation",
+    dataset_raw_dir: str | None = None,
+) -> dict[str, Any]:
     """
     便捷封装：遍历 DataLoader，拆分 batch 后逐样本生成候选。
 
@@ -454,19 +495,28 @@ def generate_candidates_from_loader(
         stage2_pose_samples: 第二阶段精排生成的候选构象数。
         crop_radius: 局部裁剪半径。
         ode_steps: ODE 推理积分步数。
+        ode_method: 候选生成阶段使用的 ODE 积分方法。
         warmup_epochs: 课程学习预热轮数。
         center_hit_radius: 判断中心命中的距离阈值。
         crop_min_residues: 局部裁剪后至少保留的残基数量。
         crop_atom_margin: 基于原子距离扩展残基裁剪范围的边界。
         fusion_weights: 融合不同分支分数时使用的权重字典。
         use_learned_center_scores: 是否优先使用模型学习得到的中心分数。
-        edge_guard_limit: 候选生成阶段的边数保护上限。
+        cost_guard_limit: 候选生成阶段的成本保护上限。
+        num_gnn_blocks: 主干 GNN 块数量，用于估计运行时成本。
+        dynamic_inter_max_neighbors: 动态原子跨图边的单源邻居上限。
+        dynamic_residue_max_neighbors: 动态配体-残基边的单源邻居上限。
+        dynamic_residue_candidate_topk: 动态配体-残基边每个复合物保留的候选残基数。
+        phase_multiplier: 当前候选生成阶段的成本倍率。
+        max_oom_retry_splits: 单个候选生成 batch 允许递归拆分重试的最大深度。
         max_complexes: 本轮最多处理的复合物数量。
         pool_epoch: 当前候选池对应的训练轮次。
         generator_ckpt_id: 生成候选时使用的 checkpoint 标识。
+        progress_desc: 终端中显示的候选生成阶段名称。
+        dataset_raw_dir: 数据集原始样本目录，用于计算对称感知 RMSD。
 
     Returns:
-        list[dict[str, Any]]: 按 DataLoader 遍历得到的完整候选记录列表。
+        dict[str, Any]: 候选记录与候选生成运行统计。
 
     Raises:
         RuntimeError: 当批次拆分或候选生成流程失败时抛出。
@@ -475,81 +525,196 @@ def generate_candidates_from_loader(
     total_complexes = 0
     batches_seen = 0
     failed_batches = 0
+    cost_guard_skips = 0
+    oom_batches = 0
+    use_configured_cuda = device.type == "cuda"
 
-    for batch_idx, batch in enumerate(loader):
-        batches_seen += 1
-        try:
-            if edge_guard_limit is not None:
-                total_edges_cpu = 0
-                edge_types = getattr(batch, "edge_types", None)
-                if edge_types:
-                    for edge_type in edge_types:
-                        edge_store = batch[edge_type]
-                        edge_index = getattr(edge_store, "edge_index", None)
-                        if edge_index is not None and edge_index.ndim == 2:
-                            total_edges_cpu += int(edge_index.size(1))
-                if total_edges_cpu > edge_guard_limit:
-                    logger.warning("Candidate gen batch %d: edge-guard skip (%d > %d)", batch_idx, total_edges_cpu, edge_guard_limit)
-                    continue
+    total_graphs = len(cast(Any, loader).dataset) if hasattr(loader, "dataset") else 0
+    if max_complexes is not None:
+        total_graphs = min(total_graphs, max_complexes) if total_graphs > 0 else max_complexes
 
+    pbar = tqdm(
+        total=total_graphs if total_graphs > 0 else None,
+        desc=progress_desc,
+        unit="complexes",
+        leave=False,
+    )
+
+    try:
+        for batch_idx, batch in enumerate(loader):
+            batches_seen += 1
             data_list = batch.to_data_list() if hasattr(batch, "to_data_list") else [batch]
-            batch_dataset_indices = [
-                int(getattr(sample, "dataset_index"))
-                for sample in data_list
-                if getattr(sample, "dataset_index", None) is not None
-            ]
 
             if max_complexes is not None and total_complexes + len(data_list) > max_complexes:
-                data_list = data_list[:max(1, max_complexes - total_complexes)]
+                remaining = max_complexes - total_complexes
+                if remaining <= 0:
+                    break
+                data_list = data_list[:remaining]
 
-            batch_records = generate_blind_candidates(
-                model=model,
-                matcher=matcher,
-                samples=data_list,
-                device=device,
-                graph_builder=graph_builder,
-                collator=collator,
-                center_topk=center_topk,
-                refine_topk=refine_topk,
-                center_nms_radius=center_nms_radius,
-                stage1_pose_samples=stage1_pose_samples,
-                stage2_pose_samples=stage2_pose_samples,
-                crop_radius=crop_radius,
-                ode_steps=ode_steps,
-                warmup_epochs=warmup_epochs,
-                center_hit_radius=center_hit_radius,
-                crop_min_residues=crop_min_residues,
-                crop_atom_margin=crop_atom_margin,
-                fusion_weights=fusion_weights,
-                use_learned_center_scores=use_learned_center_scores,
-                dataset_indices=batch_dataset_indices if len(batch_dataset_indices) == len(data_list) else None,
-                pool_epoch=pool_epoch,
-                generator_ckpt_id=generator_ckpt_id,
-            )
-            all_records.extend(batch_records)
-            total_complexes += len(batch_records)
+            batch_size = len(data_list)
+            if batch_size == 0:
+                continue
 
-            del batch, data_list
+            batch = collator.collate(data_list)
+            pbar.update(batch_size)
+            pending_batches: list[tuple[Any, int]] = [(batch, 0)]
 
-        except torch.cuda.OutOfMemoryError:
-            failed_batches += 1
-            logger.warning("Candidate gen batch %d: CUDA OOM, skipping.", batch_idx)
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception as exc:
-            failed_batches += 1
-            logger.warning("Candidate gen batch %d failed: %s\n%s", batch_idx, exc, traceback.format_exc())
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            while pending_batches:
+                batch, split_depth = pending_batches.pop(0)
+                batch_samples = batch.to_data_list() if hasattr(batch, "to_data_list") else [batch]
+                batch_cost = estimate_runtime_batch_cost(
+                    batch,
+                    num_gnn_blocks=num_gnn_blocks,
+                    dynamic_inter_max_neighbors=dynamic_inter_max_neighbors,
+                    dynamic_residue_max_neighbors=dynamic_residue_max_neighbors,
+                    dynamic_residue_candidate_topk=dynamic_residue_candidate_topk,
+                    phase_multiplier=phase_multiplier,
+                )
+                current_budget_limit = cost_guard_limit
 
-        if max_complexes is not None and total_complexes >= max_complexes:
-            break
+                if current_budget_limit is not None and batch_cost > current_budget_limit:
+                    split_batches = (
+                        split_collated_batch(batch, collator=collator)
+                        if split_depth < max_oom_retry_splits
+                        else None
+                    )
+                    if split_batches is not None:
+                        pending_batches = [
+                            (split_batches[0], split_depth + 1),
+                            (split_batches[1], split_depth + 1),
+                        ] + pending_batches
+                        continue
+                    cost_guard_skips += len(batch_samples)
+                    logger.warning(
+                        "Candidate gen batch %d: skip due to oversized cost batch (cost=%d > limit=%d).",
+                        batch_idx,
+                        batch_cost,
+                        current_budget_limit,
+                    )
+                    pbar.set_postfix(
+                        processed=total_complexes,
+                        skipped=cost_guard_skips,
+                        oom=oom_batches,
+                        failed=failed_batches,
+                        refresh=False,
+                    )
+                    continue
+
+                try:
+                    if use_configured_cuda:
+                        torch.cuda.reset_peak_memory_stats(device=device)
+                    batch_dataset_indices = [
+                        int(getattr(sample, "dataset_index"))
+                        for sample in batch_samples
+                        if getattr(sample, "dataset_index", None) is not None
+                    ]
+                    batch_records = generate_blind_candidates(
+                        model=model,
+                        matcher=matcher,
+                        samples=batch_samples,
+                        device=device,
+                        graph_builder=graph_builder,
+                        collator=collator,
+                        center_topk=center_topk,
+                        refine_topk=refine_topk,
+                        center_nms_radius=center_nms_radius,
+                        stage1_pose_samples=stage1_pose_samples,
+                        stage2_pose_samples=stage2_pose_samples,
+                        crop_radius=crop_radius,
+                        ode_steps=ode_steps,
+                        ode_method=ode_method,
+                        warmup_epochs=warmup_epochs,
+                        center_hit_radius=center_hit_radius,
+                        crop_min_residues=crop_min_residues,
+                        crop_atom_margin=crop_atom_margin,
+                        fusion_weights=fusion_weights,
+                        use_learned_center_scores=use_learned_center_scores,
+                        dataset_raw_dir=dataset_raw_dir,
+                        dataset_indices=(
+                            batch_dataset_indices
+                            if len(batch_dataset_indices) == len(batch_samples)
+                            else None
+                        ),
+                        pool_epoch=pool_epoch,
+                        generator_ckpt_id=generator_ckpt_id,
+                    )
+                    all_records.extend(batch_records)
+                    total_complexes += len(batch_records)
+                    pbar.set_postfix(
+                        processed=total_complexes,
+                        skipped=cost_guard_skips,
+                        oom=oom_batches,
+                        failed=failed_batches,
+                        refresh=False,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    oom_batches += 1
+                    gc.collect()
+                    if use_configured_cuda:
+                        torch.cuda.empty_cache()
+                    split_batches = (
+                        split_collated_batch(batch, collator=collator)
+                        if split_depth < max_oom_retry_splits
+                        else None
+                    )
+                    if split_batches is not None:
+                        pending_batches = [
+                            (split_batches[0], split_depth + 1),
+                            (split_batches[1], split_depth + 1),
+                        ] + pending_batches
+                        pbar.set_postfix(
+                            processed=total_complexes,
+                            skipped=cost_guard_skips,
+                            oom=oom_batches,
+                            failed=failed_batches,
+                            refresh=False,
+                        )
+                        continue
+                    failed_batches += 1
+                    logger.warning(
+                        "Candidate gen batch %d: irreducible CUDA OOM after split retries.",
+                        batch_idx,
+                    )
+                    pbar.set_postfix(
+                        processed=total_complexes,
+                        skipped=cost_guard_skips,
+                        oom=oom_batches,
+                        failed=failed_batches,
+                        refresh=False,
+                    )
+                except Exception as exc:
+                    failed_batches += 1
+                    logger.warning(
+                        "Candidate gen batch %d failed: %s\n%s",
+                        batch_idx,
+                        exc,
+                        traceback.format_exc(),
+                    )
+                    pbar.set_postfix(
+                        processed=total_complexes,
+                        skipped=cost_guard_skips,
+                        oom=oom_batches,
+                        failed=failed_batches,
+                        refresh=False,
+                    )
+                    gc.collect()
+                    if use_configured_cuda:
+                        torch.cuda.empty_cache()
+
+            if max_complexes is not None and total_complexes >= max_complexes:
+                break
+    finally:
+        pbar.close()
 
     if not all_records and failed_batches > 0 and batches_seen > 0:
         raise RuntimeError(
             f"Candidate generation failed for all processed batches. failed_batches={failed_batches}"
         )
 
-    return all_records
+    return {
+        "candidate_records": all_records,
+        "processed_complexes": float(total_complexes),
+        "cost_guard_skips": float(cost_guard_skips),
+        "oom_batches": float(oom_batches),
+        "failed_batches": float(failed_batches),
+    }

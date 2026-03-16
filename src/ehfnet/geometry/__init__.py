@@ -14,9 +14,12 @@ __all__ = [
     "PoseUpdater",
     "TangentTargetProjector",
     "calculate_dihedral",
+    "compute_batch_symmetry_aware_rmsd",
     "compute_center_of_mass",
     "compute_principal_frame",
+    "compute_symmetry_aware_rmsd",
     "get_moving_atoms",
+    "resolve_sample_ligand_path",
 ]
 
 _EXPORT_MAP = {
@@ -28,12 +31,24 @@ _EXPORT_MAP = {
         "TangentTargetProjector",
     ),
     "calculate_dihedral": ("ehfnet.geometry.static", "calculate_dihedral"),
+    "compute_batch_symmetry_aware_rmsd": (
+        "ehfnet.geometry.rmsd",
+        "compute_batch_symmetry_aware_rmsd",
+    ),
     "compute_center_of_mass": ("ehfnet.geometry.dynamics", "compute_center_of_mass"),
     "compute_principal_frame": (
         "ehfnet.geometry.dynamics",
         "compute_principal_frame",
     ),
+    "compute_symmetry_aware_rmsd": (
+        "ehfnet.geometry.rmsd",
+        "compute_symmetry_aware_rmsd",
+    ),
     "get_moving_atoms": ("ehfnet.geometry.static", "get_moving_atoms"),
+    "resolve_sample_ligand_path": (
+        "ehfnet.geometry.rmsd",
+        "resolve_sample_ligand_path",
+    ),
 }
 
 

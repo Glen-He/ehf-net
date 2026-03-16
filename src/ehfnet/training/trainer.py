@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import os
+import time
 import traceback
 from pathlib import Path
 from typing import Any, cast
@@ -19,9 +20,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+from torch.optim.lr_scheduler import LambdaLR
 from torch.optim.swa_utils import AveragedModel
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch_scatter import scatter_mean
 from tqdm import tqdm
 
@@ -33,17 +34,25 @@ from ehfnet.data.featurizers import (
     PROTEIN_ATOM_CONT_SCHEMA,
     PROTEIN_RESIDUE_CONT_SCHEMA,
 )
-from ehfnet.graph import GraphCollator
+from ehfnet.contracts import build_blind_pool_signature
+from ehfnet.graph import GraphCollator, estimate_graph_cost_units
 from ehfnet.runtime import build_dataset, build_model, resolve_interaction_profile
 from ehfnet.training.batch_helpers import (
     apply_loss_context,
     build_local_batch_from_centers,
-    compute_pose_quality_target,
-    select_pose_ranking_logit,
+    compute_pose_rank_target,
+    select_pose_rank_logit,
+)
+from ehfnet.training.adaptive_batching import (
+    AdaptiveCostBatchSampler,
+    estimate_runtime_batch_cost,
+    extract_root_dataset_indices,
+    resolve_subset_root_indices,
+    split_collated_batch,
+    WindowAimdBudgetController,
 )
 from ehfnet.training.blind_pool import (
     BlindCandidateReplayDataset,
-    build_blind_pool_signature,
     get_pool_stats,
     load_blind_pool,
     refresh_blind_candidate_pool,
@@ -53,7 +62,7 @@ from ehfnet.training.blind_pool import (
 )
 from ehfnet.training.candidate_generation import generate_blind_candidates
 from ehfnet.training.center_sampling import (
-    compute_bootstrap_pose_quality_loss,
+    compute_bootstrap_pose_rank_loss,
     select_bootstrap_blind_centers,
     select_training_crop_centers,
     select_wrong_center_candidates,
@@ -68,8 +77,8 @@ from ehfnet.training.checkpoint_io import (
 from ehfnet.training.flow_matcher import ConditionalFlowMatcher
 from ehfnet.training.inference import (
     DEFAULT_FUSION_WEIGHTS,
-    calibrate_linear_fusion_weights,
     compute_center_guidance_scores,
+    evaluate_topn_success,
     predict_center_proposal_logits,
     select_diverse_center_indices,
     summarize_blind_candidate_records,
@@ -77,7 +86,7 @@ from ehfnet.training.inference import (
 from ehfnet.training.losses import FlowMatchingLoss
 from ehfnet.training.normalization import compute_train_split_normalization_stats
 from ehfnet.training.rerank_losses import pairwise_ranking_loss_from_pairs
-from ehfnet.training.validation import compute_validation_loss, evaluate_topn_success
+from ehfnet.training.validation import compute_validation_loss
 
 logger = logging.getLogger(__name__)
 
@@ -129,8 +138,11 @@ def train(
     protein_residue_fallback_k: int,
     dynamic_inter_cutoff: float,
     dynamic_inter_knn_k: int,
+    dynamic_inter_max_neighbors: int,
     dynamic_residue_cutoff: float,
     dynamic_residue_knn_k: int,
+    dynamic_residue_max_neighbors: int,
+    dynamic_residue_candidate_topk: int,
     flow_sigma_min: float,
     flow_spatial_sigma_min: float,
     flow_spatial_sigma_max: float,
@@ -145,25 +157,25 @@ def train(
     loss_weight_torsion: float,
     loss_weight_energy: float,
     loss_weight_clash: float,
-    loss_weight_pose_quality: float,
+    loss_weight_pose_rank: float,
     loss_coarse_trans: float,
     loss_coarse_rot: float,
     loss_coarse_torsion: float,
     loss_coarse_energy: float,
     loss_coarse_clash: float,
-    loss_coarse_pose_quality: float,
+    loss_coarse_pose_rank: float,
     loss_transition_trans: float,
     loss_transition_rot: float,
     loss_transition_torsion: float,
     loss_transition_energy: float,
     loss_transition_clash: float,
-    loss_transition_pose_quality: float,
+    loss_transition_pose_rank: float,
     loss_refine_trans: float,
     loss_refine_rot: float,
     loss_refine_torsion: float,
     loss_refine_energy: float,
     loss_refine_clash: float,
-    loss_refine_pose_quality: float,
+    loss_refine_pose_rank: float,
     loss_refine_start: float,
     loss_pose_gate_epoch_start: float,
     loss_pose_gate_epoch_end: float,
@@ -173,18 +185,21 @@ def train(
     device: str | torch.device,
     crop_radius: float,
     warmup_epochs: int,
-    rmsd_check_ratio: float,
+    val_subset_ratio: float,
+    val_full_every: int,
+    val_full_last_epochs: int,
+    ode_method: str,
     accumulation_steps: int,
-    max_nodes_per_batch: int,
-    val_max_nodes_per_batch: int,
-    test_max_nodes_per_batch: int,
-    topn_max_nodes_per_batch: int,
-    edge_budget_factor: int,
-    eval_edge_guard_headroom: float,
+    train_cost_budget: int,
+    val_cost_budget: int,
+    blind_pool_cost_budget: int,
+    final_topn_cost_budget: int,
+    eval_cost_guard_headroom: float,
     ema_decay: float,
     dataloader_num_workers: int,
     dataloader_pin_memory: bool,
     dataloader_persistent_workers: bool,
+    max_oom_retry_splits: int,
     split_train_frac: float,
     split_val_frac: float,
     split_test_frac: float,
@@ -194,46 +209,70 @@ def train(
     ablation_mode: str,
     run_test_after_training: bool,
     test_topk_values: tuple[int, ...],
-    test_pose_samples: int,
-    enable_oom_adaptive_batch: bool,
+    enable_train_budget_callback: bool,
     oom_reduce_threshold: int,
     oom_reduce_factor: float,
-    min_max_nodes_per_batch: int,
-    enable_val_oom_adaptive_batch: bool,
+    min_train_cost_budget: int,
+    enable_val_budget_callback: bool,
     val_oom_reduce_threshold: int,
     val_oom_reduce_factor: float,
-    min_val_max_nodes_per_batch: int,
-    oom_recover_epochs: int,
-    oom_recover_factor: float,
+    min_val_cost_budget: int,
+    train_budget_window_size: int,
+    train_budget_recover_window_count: int,
+    train_budget_recover_step: int,
+    train_offender_cooldown: int,
+    val_budget_window_size: int,
+    val_budget_recover_window_count: int,
+    val_budget_recover_step: int,
+    val_offender_cooldown: int,
     center_proposal_weight: float,
     center_positive_radius: float,
+    center_guidance_learned_start: float,
     center_proposal_topk: int,
     center_refine_topk: int,
     center_nms_radius: float,
     stage1_pose_samples: int,
     stage2_pose_samples: int,
     crop_candidate_topk: int,
+    crop_proposal_start: float,
+    crop_near_miss_start: float,
+    crop_hard_negative_start: float,
     crop_min_residues: int,
     crop_atom_margin: float,
     disable_jitter_crop: bool,
     disable_hard_negative_crop: bool,
     pose_ranking_pair_weight: float,
     pose_ranking_margin: float,
+    ranking_same_center_start: float,
+    ranking_wrong_center_start: float,
     pose_bootstrap_weight: float,
+    pose_bootstrap_start: float,
     pose_bootstrap_frequency: int,
     pose_bootstrap_ode_steps: int,
-    enable_fusion_calibration: bool,
     val_ode_steps: int,
     checkpoint_selection_mode: str,
-    fusion_search_center_weights: tuple[float, ...],
-    fusion_search_aff_weights: tuple[float, ...],
-    fusion_search_clash_weights: tuple[float, ...],
     blind_pool_refresh_every: int,
     blind_pool_start_epoch: int,
+    blind_pool_refresh_on_best_update: bool,
     blind_pool_max_complexes: int,
     blind_pool_cache_bce_weight: float,
     blind_pool_cache_rank_weight: float,
     blind_pool_pairs_per_complex: int,
+    replay_start_ratio: float,
+    same_center_micro_batch_size: int,
+    same_center_budget_window_size: int,
+    same_center_budget_recover_window_count: int,
+    same_center_budget_recover_step: int,
+    same_center_offender_cooldown: int,
+    ranking_budget_window_size: int,
+    ranking_budget_recover_window_count: int,
+    ranking_offender_cooldown: int,
+    ranking_wrong_center_cap: int,
+    replay_micro_batch_size: int,
+    replay_budget_window_size: int,
+    replay_budget_recover_window_count: int,
+    replay_candidate_cooldown: int,
+    replay_max_candidates_per_complex: int,
     esm_path: str | None = None,
     run_name: str | None = None,
     run_log_file: str | None = None,
@@ -287,8 +326,11 @@ def train(
         protein_residue_fallback_k: 蛋白残基层图内边回退到 kNN 时的邻居数。
         dynamic_inter_cutoff: 动态跨图原子边的半径阈值。
         dynamic_inter_knn_k: 动态跨图原子边回退到 kNN 时的邻居数。
+        dynamic_inter_max_neighbors: 动态跨图原子边的单源邻居上限。
         dynamic_residue_cutoff: 动态配体-残基边的半径阈值。
         dynamic_residue_knn_k: 动态配体-残基边回退到 kNN 时的邻居数。
+        dynamic_residue_max_neighbors: 动态配体-残基边的单源邻居上限。
+        dynamic_residue_candidate_topk: 动态配体-残基边每个复合物保留的候选残基数。
         flow_sigma_min: 流匹配时间噪声下界。
         flow_spatial_sigma_min: 平移扰动课程的最小尺度。
         flow_spatial_sigma_max: 平移扰动课程的最大尺度。
@@ -303,25 +345,25 @@ def train(
         loss_weight_torsion: 扭转损失的全局权重。
         loss_weight_energy: 亲和力损失的全局权重。
         loss_weight_clash: 位阻损失的全局权重。
-        loss_weight_pose_quality: 构象质量损失的全局权重。
+        loss_weight_pose_rank: 构象排序损失的全局权重。
         loss_coarse_trans: 粗阶段平移损失权重。
         loss_coarse_rot: 粗阶段旋转损失权重。
         loss_coarse_torsion: 粗阶段扭转损失权重。
         loss_coarse_energy: 粗阶段亲和力损失权重。
         loss_coarse_clash: 粗阶段位阻损失权重。
-        loss_coarse_pose_quality: 粗阶段构象质量损失权重。
+        loss_coarse_pose_rank: 粗阶段构象排序损失权重。
         loss_transition_trans: 过渡阶段平移损失权重。
         loss_transition_rot: 过渡阶段旋转损失权重。
         loss_transition_torsion: 过渡阶段扭转损失权重。
         loss_transition_energy: 过渡阶段亲和力损失权重。
         loss_transition_clash: 过渡阶段位阻损失权重。
-        loss_transition_pose_quality: 过渡阶段构象质量损失权重。
+        loss_transition_pose_rank: 过渡阶段构象排序损失权重。
         loss_refine_trans: 细化阶段平移损失权重。
         loss_refine_rot: 细化阶段旋转损失权重。
         loss_refine_torsion: 细化阶段扭转损失权重。
         loss_refine_energy: 细化阶段亲和力损失权重。
         loss_refine_clash: 细化阶段位阻损失权重。
-        loss_refine_pose_quality: 细化阶段构象质量损失权重。
+        loss_refine_pose_rank: 细化阶段构象排序损失权重。
         loss_refine_start: 进入细化阶段时对应的训练进度阈值。
         loss_pose_gate_epoch_start: 构象相关损失开始打开门控的训练进度。
         loss_pose_gate_epoch_end: 构象相关损失完全打开门控的训练进度。
@@ -331,18 +373,21 @@ def train(
         device: 运行所用设备，如 CPU 或 CUDA 设备。
         crop_radius: 局部裁剪半径。
         warmup_epochs: 课程学习预热轮数。
-        rmsd_check_ratio: 验证阶段执行 RMSD 推演的 batch 比例。
+        val_subset_ratio: 日常 partial 验证覆盖的验证集比例。
+        val_full_every: 每隔多少个 epoch 执行一次 100% 轻量验证；0 表示关闭周期全量验证。
+        val_full_last_epochs: 训练末尾连续执行 100% 轻量验证的 epoch 数。
+        ode_method: 训练、bootstrap 与 blind 推理统一使用的 ODE 积分方法。
         accumulation_steps: 梯度累积步数。
-        max_nodes_per_batch: 训练阶段每个 batch 允许的最大节点预算。
-        val_max_nodes_per_batch: 验证阶段每个 batch 允许的最大节点预算。
-        test_max_nodes_per_batch: 测试阶段每个 batch 允许的最大节点预算。
-        topn_max_nodes_per_batch: Top-N 评估阶段每个 batch 允许的最大节点预算。
-        edge_budget_factor: 按节点数估计边数预算时使用的放大系数。
-        eval_edge_guard_headroom: 评估阶段为边数保护预留的额外裕量。
+        train_cost_budget: 训练阶段的基础成本预算。
+        val_cost_budget: 验证阶段的基础成本预算。
+        blind_pool_cost_budget: blind pool 刷新阶段的基础成本预算。
+        final_topn_cost_budget: 最终 blind Top-N 评估阶段的基础成本预算。
+        eval_cost_guard_headroom: 评估阶段为成本保护预留的额外裕量。
         ema_decay: EMA 模型更新的衰减系数。
         dataloader_num_workers: DataLoader 使用的 worker 数。
         dataloader_pin_memory: 是否为 DataLoader 启用 pin_memory。
         dataloader_persistent_workers: 是否为 DataLoader 启用持久 worker。
+        max_oom_retry_splits: 单个 OOM batch 允许递归拆分重试的最大深度。
         split_train_frac: 训练集划分比例。
         split_val_frac: 验证集划分比例。
         split_test_frac: 测试集划分比例。
@@ -352,46 +397,70 @@ def train(
         ablation_mode: 当前训练使用的消融模式名称。
         run_test_after_training: 训练结束后是否自动执行测试评估。
         test_topk_values: 测试阶段统计 Top-N 成功率时使用的 N 列表。
-        test_pose_samples: 测试阶段每个复合物采样的候选构象数。
-        enable_oom_adaptive_batch: 是否启用训练阶段的 OOM 自适应降批。
-        oom_reduce_threshold: 单个 epoch 中触发自动降批所需的 OOM 次数阈值。
-        oom_reduce_factor: 触发 OOM 后缩小节点预算的比例系数。
-        min_max_nodes_per_batch: 训练阶段自动降批后的最小节点预算。
-        enable_val_oom_adaptive_batch: 是否启用验证阶段独立的 OOM 自适应降批。
-        val_oom_reduce_threshold: 验证阶段触发降批所需的 OOM 次数阈值。
-        val_oom_reduce_factor: 验证阶段缩小节点预算的比例系数。
-        min_val_max_nodes_per_batch: 验证阶段自动降批后的最小节点预算。
-        oom_recover_epochs: 连续无 OOM 后尝试恢复预算所需的 epoch 数。
-        oom_recover_factor: 预算恢复时使用的放大系数。
+        enable_train_budget_callback: 是否启用训练阶段的窗口式预算回调。
+        oom_reduce_threshold: 单个训练窗口中触发自动降批所需的 OOM 根事件阈值。
+        oom_reduce_factor: 触发 OOM 后缩小训练成本预算的比例系数。
+        min_train_cost_budget: 训练阶段自动降批后的最小成本预算。
+        enable_val_budget_callback: 是否启用验证阶段独立的窗口式预算回调。
+        val_oom_reduce_threshold: 验证窗口中触发降批所需的 OOM 事件阈值。
+        val_oom_reduce_factor: 验证阶段缩小成本预算的比例系数。
+        min_val_cost_budget: 验证阶段自动降批后的最小成本预算。
+        train_budget_window_size: 训练预算回调使用的根 batch 窗口大小。
+        train_budget_recover_window_count: 训练预算回升所需的连续干净窗口数。
+        train_budget_recover_step: 训练预算每次回升的加性步长。
+        train_offender_cooldown: 训练坏样本冷却时长，以根 batch 事件计。
+        val_budget_window_size: 验证预算回调使用的窗口大小。
+        val_budget_recover_window_count: 验证预算回升所需的连续干净窗口数。
+        val_budget_recover_step: 验证预算每次回升的加性步长。
+        val_offender_cooldown: 验证坏样本冷却时长。
         center_proposal_weight: 中心提议损失在验证汇总中的权重。
         center_positive_radius: 中心判定为正样本时使用的距离半径。
+        center_guidance_learned_start: 中心打分从几何先验切换到学习分数的进度阈值。
         center_proposal_topk: 中心提议阶段保留的 Top-K 数量。
         center_refine_topk: 中心细化阶段阶段保留的 Top-K 数量。
         center_nms_radius: 中心去重时使用的最小间距半径。
         stage1_pose_samples: 第一阶段局部对接生成的候选构象数。
         stage2_pose_samples: 第二阶段精排生成的候选构象数。
         crop_candidate_topk: crop候选阶段保留的 Top-K 数量。
+        crop_proposal_start: `proposal_pos` 进入中心课程的进度阈值。
+        crop_near_miss_start: `near_miss` 进入中心课程的进度阈值。
+        crop_hard_negative_start: `hard_neg` 进入中心课程的进度阈值。
         crop_min_residues: 局部裁剪后至少保留的残基数量。
         crop_atom_margin: 基于原子距离扩展残基裁剪范围的边界。
         disable_jitter_crop: 是否关闭jittercrop。
         disable_hard_negative_crop: 是否关闭hard负例crop。
         pose_ranking_pair_weight: 构象rankingpair相关的权重。
         pose_ranking_margin: 构象rankingmargin。
+        ranking_same_center_start: same-center ranking 启用的进度阈值。
+        ranking_wrong_center_start: wrong-center ranking 启用的进度阈值。
         pose_bootstrap_weight: 构象bootstrap相关的权重。
+        pose_bootstrap_start: bootstrap 监督启用的进度阈值。
         pose_bootstrap_frequency: 构象bootstrapfrequency。
         pose_bootstrap_ode_steps: 构象bootstrapode的步数。
-        enable_fusion_calibration: 是否启用融合calibration。
         val_ode_steps: valode的步数。
         checkpoint_selection_mode: checkpoint 选择规则名称。
-        fusion_search_center_weights: 搜索中心融合权重时使用的候选集合。
-        fusion_search_aff_weights: 搜索亲和力融合权重时使用的候选集合。
-        fusion_search_clash_weights: 搜索位阻融合权重时使用的候选集合。
         blind_pool_refresh_every: blind pool 的刷新间隔。
         blind_pool_start_epoch: 允许开始刷新 blind pool 的最小训练轮次。
+        blind_pool_refresh_on_best_update: 新最佳 checkpoint 出现时是否立刻刷新 blind pool。
         blind_pool_max_complexes: 单次刷新 blind pool 时最多处理的复合物数量。
         blind_pool_cache_bce_weight: blind pool 回放中 BCE 损失的权重。
         blind_pool_cache_rank_weight: blind pool 回放中排序损失的权重。
         blind_pool_pairs_per_complex: 每个复合物在 blind pool 中采样的配对数量。
+        replay_start_ratio: replay 回放监督启用的进度阈值。
+        same_center_micro_batch_size: same-center ranking 分支的初始微批大小。
+        same_center_budget_window_size: same-center ranking 回调窗口大小。
+        same_center_budget_recover_window_count: same-center ranking 回升所需的连续干净窗口数。
+        same_center_budget_recover_step: same-center ranking 每次回升的加性步长。
+        same_center_offender_cooldown: same-center ranking 坏样本冷却时长。
+        ranking_budget_window_size: wrong-center ranking 回调窗口大小。
+        ranking_budget_recover_window_count: wrong-center ranking 回升所需的连续干净窗口数。
+        ranking_offender_cooldown: ranking 坏样本冷却时长。
+        ranking_wrong_center_cap: wrong-center ranking 的最大启用级别。
+        replay_micro_batch_size: replay 候选打分的初始微批大小。
+        replay_budget_window_size: replay 微批回调窗口大小。
+        replay_budget_recover_window_count: replay 微批回升所需的连续干净窗口数。
+        replay_candidate_cooldown: replay 复杂样本冷却时长。
+        replay_max_candidates_per_complex: replay 每个复合物保留的最大候选数。
         esm_path: esm路径。
         run_name: 本次运行的名称标识。
         run_log_file: 本次运行对应的日志文件路径。
@@ -410,6 +479,7 @@ def train(
             "configs/train.toml or pass it from the caller."
         )
     device = torch.device(device)
+    use_configured_cuda = device.type == "cuda"
 
     os.makedirs(save_dir, exist_ok=True)
     logger.info(f"Using device: {device}")
@@ -542,6 +612,8 @@ def train(
 
     train_set, val_set, test_set = ScaffoldSplitter.subsets_from_indices(dataset, split_indices)
     train_indices = [int(i) for i in split_indices.get("train", [])]
+    val_indices = [int(i) for i in split_indices.get("val", [])]
+    test_indices = [int(i) for i in split_indices.get("test", [])]
     if not train_indices:
         raise ValueError("Train split is empty; cannot compute train-only normalization stats.")
 
@@ -565,29 +637,126 @@ def train(
         f"Final Dataset Sizes: Train={len(train_set)}, Val={len(val_set)}, Test={len(test_set)}"
     )
 
-    from torch_geometric.loader import DynamicBatchSampler
-
     if accumulation_steps < 1:
         raise ValueError(f"Invalid accumulation_steps={accumulation_steps}.")
+    if not (0.0 < val_subset_ratio <= 1.0):
+        raise ValueError(f"Invalid val_subset_ratio={val_subset_ratio}.")
+    if val_full_every < 0:
+        raise ValueError(f"Invalid val_full_every={val_full_every}.")
+    if val_full_last_epochs < 0:
+        raise ValueError(f"Invalid val_full_last_epochs={val_full_last_epochs}.")
+    valid_val_ode_methods = {"euler", "rk4"}
+    if ode_method not in valid_val_ode_methods:
+        raise ValueError(
+            f"Unsupported ode_method={ode_method!r}. "
+            f"Choose from {tuple(sorted(valid_val_ode_methods))}."
+        )
+    progress_thresholds = {
+        "center_guidance_learned_start": center_guidance_learned_start,
+        "crop_proposal_start": crop_proposal_start,
+        "crop_near_miss_start": crop_near_miss_start,
+        "crop_hard_negative_start": crop_hard_negative_start,
+        "ranking_same_center_start": ranking_same_center_start,
+        "ranking_wrong_center_start": ranking_wrong_center_start,
+        "pose_bootstrap_start": pose_bootstrap_start,
+        "replay_start_ratio": replay_start_ratio,
+    }
+    for name, value in progress_thresholds.items():
+        if not (0.0 <= float(value) <= 1.0):
+            raise ValueError(f"Invalid {name}={value}.")
+    if crop_proposal_start > crop_near_miss_start:
+        raise ValueError(
+            "crop_proposal_start must be <= crop_near_miss_start."
+        )
+    if crop_near_miss_start > crop_hard_negative_start:
+        raise ValueError(
+            "crop_near_miss_start must be <= crop_hard_negative_start."
+        )
+    if ranking_same_center_start > ranking_wrong_center_start:
+        raise ValueError(
+            "ranking_same_center_start must be <= ranking_wrong_center_start."
+        )
 
     if not (0.0 < oom_reduce_factor < 1.0):
         raise ValueError(f"Invalid oom_reduce_factor={oom_reduce_factor}.")
+    if train_budget_window_size < 1:
+        raise ValueError(f"Invalid train_budget_window_size={train_budget_window_size}.")
+    if train_budget_recover_window_count < 1:
+        raise ValueError(
+            f"Invalid train_budget_recover_window_count={train_budget_recover_window_count}."
+        )
+    if train_budget_recover_step < 1:
+        raise ValueError(f"Invalid train_budget_recover_step={train_budget_recover_step}.")
+    if train_offender_cooldown < 0:
+        raise ValueError(f"Invalid train_offender_cooldown={train_offender_cooldown}.")
+    if val_budget_window_size < 1:
+        raise ValueError(f"Invalid val_budget_window_size={val_budget_window_size}.")
+    if val_budget_recover_window_count < 1:
+        raise ValueError(
+            f"Invalid val_budget_recover_window_count={val_budget_recover_window_count}."
+        )
+    if val_budget_recover_step < 1:
+        raise ValueError(f"Invalid val_budget_recover_step={val_budget_recover_step}.")
+    if val_offender_cooldown < 0:
+        raise ValueError(f"Invalid val_offender_cooldown={val_offender_cooldown}.")
+    if ranking_budget_window_size < 1:
+        raise ValueError(f"Invalid ranking_budget_window_size={ranking_budget_window_size}.")
+    if ranking_budget_recover_window_count < 1:
+        raise ValueError(
+            f"Invalid ranking_budget_recover_window_count={ranking_budget_recover_window_count}."
+        )
+    if ranking_offender_cooldown < 0:
+        raise ValueError(f"Invalid ranking_offender_cooldown={ranking_offender_cooldown}.")
+    if same_center_micro_batch_size < 1:
+        raise ValueError(f"Invalid same_center_micro_batch_size={same_center_micro_batch_size}.")
+    if same_center_budget_window_size < 1:
+        raise ValueError(
+            f"Invalid same_center_budget_window_size={same_center_budget_window_size}."
+        )
+    if same_center_budget_recover_window_count < 1:
+        raise ValueError(
+            "Invalid same_center_budget_recover_window_count="
+            f"{same_center_budget_recover_window_count}."
+        )
+    if same_center_budget_recover_step < 1:
+        raise ValueError(
+            f"Invalid same_center_budget_recover_step={same_center_budget_recover_step}."
+        )
+    if same_center_offender_cooldown < 0:
+        raise ValueError(
+            f"Invalid same_center_offender_cooldown={same_center_offender_cooldown}."
+        )
+    if ranking_wrong_center_cap < 0:
+        raise ValueError(f"Invalid ranking_wrong_center_cap={ranking_wrong_center_cap}.")
+    if replay_micro_batch_size < 1:
+        raise ValueError(f"Invalid replay_micro_batch_size={replay_micro_batch_size}.")
+    if replay_budget_window_size < 1:
+        raise ValueError(f"Invalid replay_budget_window_size={replay_budget_window_size}.")
+    if replay_budget_recover_window_count < 1:
+        raise ValueError(
+            f"Invalid replay_budget_recover_window_count={replay_budget_recover_window_count}."
+        )
+    if replay_candidate_cooldown < 0:
+        raise ValueError(f"Invalid replay_candidate_cooldown={replay_candidate_cooldown}.")
+    if replay_max_candidates_per_complex < 1:
+        raise ValueError(
+            f"Invalid replay_max_candidates_per_complex={replay_max_candidates_per_complex}."
+        )
 
-    if val_max_nodes_per_batch is None:
-        raise ValueError("val_max_nodes_per_batch must be configured explicitly.")
-    if test_max_nodes_per_batch is None:
-        raise ValueError("test_max_nodes_per_batch must be configured explicitly.")
-    if topn_max_nodes_per_batch is None:
-        raise ValueError("topn_max_nodes_per_batch must be configured explicitly.")
-    if min_val_max_nodes_per_batch is None:
-        raise ValueError("min_val_max_nodes_per_batch must be configured explicitly.")
+    if val_cost_budget is None:
+        raise ValueError("val_cost_budget must be configured explicitly.")
+    if blind_pool_cost_budget is None:
+        raise ValueError("blind_pool_cost_budget must be configured explicitly.")
+    if final_topn_cost_budget is None:
+        raise ValueError("final_topn_cost_budget must be configured explicitly.")
+    if min_val_cost_budget is None:
+        raise ValueError("min_val_cost_budget must be configured explicitly.")
 
-    configured_train_max_nodes_per_batch = max(1, int(max_nodes_per_batch))
-    configured_val_max_nodes_per_batch = max(1, int(val_max_nodes_per_batch))
-    configured_test_max_nodes_per_batch = max(1, int(test_max_nodes_per_batch))
-    configured_topn_max_nodes_per_batch = max(1, int(topn_max_nodes_per_batch))
-    train_edge_budget_factor = max(1, int(edge_budget_factor))
-    eval_edge_guard_headroom = max(1.0, float(eval_edge_guard_headroom))
+    configured_train_cost_budget = max(1, int(train_cost_budget))
+    configured_val_cost_budget = max(1, int(val_cost_budget))
+    configured_blind_pool_cost_budget = max(1, int(blind_pool_cost_budget))
+    configured_final_topn_cost_budget = max(1, int(final_topn_cost_budget))
+    eval_cost_guard_headroom = max(1.0, float(eval_cost_guard_headroom))
 
 
     def _annotate_loss_context(batch_obj: Any, *, current_epoch: int, total_epochs_count: int, warmup_epochs_count: int, training: bool) -> None:
@@ -599,53 +768,536 @@ def train(
             training=training,
         )
 
+    def _to_debug_scalar(value: Any) -> Any:
+        if torch.is_tensor(value):
+            if value.numel() == 1:
+                scalar = value.detach().cpu().item()
+                return float(scalar) if isinstance(scalar, (float, int)) else scalar
+            return {
+                "shape": list(value.shape),
+                "min": float(value.detach().amin().cpu().item()) if value.numel() > 0 else 0.0,
+                "max": float(value.detach().amax().cpu().item()) if value.numel() > 0 else 0.0,
+            }
+        return value
 
-    effective_min_train_nodes_per_batch = max(1, int(min_max_nodes_per_batch))
-    effective_min_val_nodes_per_batch = max(1, int(min_val_max_nodes_per_batch))
+    def _summarize_loss_debug(loss_items: dict[str, Any]) -> dict[str, Any]:
+        debug_summary: dict[str, Any] = {}
+        for key, value in loss_items.items():
+            if key.startswith(("loss_", "weight_", "rank_pairs_", "energy_nan_")) or key == "total":
+                debug_summary[key] = _to_debug_scalar(value)
+        return debug_summary
 
-    if effective_min_train_nodes_per_batch > configured_train_max_nodes_per_batch:
+    def _collect_batch_sample_debug(batch_obj: Any, *, limit: int = 8) -> list[dict[str, Any]]:
+        samples = batch_obj.to_data_list() if hasattr(batch_obj, "to_data_list") else [batch_obj]
+        summaries: list[dict[str, Any]] = []
+        for sample in samples[:limit]:
+            ligand_atoms = int(sample["ligand_atom"].num_nodes) if "ligand_atom" in sample.node_types else 0
+            protein_residues = int(sample["protein_residue"].num_nodes) if "protein_residue" in sample.node_types else 0
+            protein_atoms = int(sample["protein_atom"].num_nodes) if "protein_atom" in sample.node_types else 0
+            summaries.append(
+                {
+                    "pdb_id": str(getattr(sample, "pdb_id", "unknown")),
+                    "dataset_index": (
+                        int(getattr(sample, "dataset_index"))
+                        if getattr(sample, "dataset_index", None) is not None
+                        else None
+                    ),
+                    "ligand_atoms": ligand_atoms,
+                    "protein_atoms": protein_atoms,
+                    "protein_residues": protein_residues,
+                }
+            )
+        return summaries
+
+    def _collect_nonfinite_grad_param_names(*, limit: int = 12) -> dict[str, Any]:
+        bad_names: list[str] = []
+        total_bad = 0
+        for name, param in model.named_parameters():
+            if param.grad is None:
+                continue
+            if torch.isfinite(param.grad).all():
+                continue
+            total_bad += 1
+            if len(bad_names) < limit:
+                bad_names.append(name)
+        return {
+            "count": total_bad,
+            "examples": bad_names,
+        }
+
+    def _probe_loss_branch_gradients(
+        loss_terms: dict[str, torch.Tensor | None],
+        *,
+        limit: int = 12,
+    ) -> dict[str, Any]:
+        branch_summary: dict[str, Any] = {}
+        named_params = [
+            (name, param)
+            for name, param in model.named_parameters()
+            if param.requires_grad
+        ]
+        param_names = [name for name, _ in named_params]
+        params = [param for _, param in named_params]
+        for branch_name, branch_loss in loss_terms.items():
+            if branch_loss is None:
+                branch_summary[branch_name] = {"status": "missing"}
+                continue
+            if branch_loss.grad_fn is None:
+                branch_summary[branch_name] = {
+                    "status": "no_grad_fn",
+                    "value": _to_debug_scalar(branch_loss),
+                }
+                continue
+            grads = torch.autograd.grad(
+                branch_loss,
+                params,
+                retain_graph=True,
+                allow_unused=True,
+            )
+            nonfinite_names: list[str] = []
+            total_nonfinite = 0
+            max_abs_grad = 0.0
+            for param_name, grad in zip(param_names, grads):
+                if grad is None:
+                    continue
+                finite_mask = torch.isfinite(grad)
+                if not finite_mask.all():
+                    total_nonfinite += 1
+                    if len(nonfinite_names) < limit:
+                        nonfinite_names.append(param_name)
+                    finite_grad = grad[finite_mask]
+                    if finite_grad.numel() > 0:
+                        max_abs_grad = max(
+                            max_abs_grad,
+                            float(finite_grad.abs().max().detach().cpu().item()),
+                        )
+                    continue
+                if grad.numel() > 0:
+                    max_abs_grad = max(
+                        max_abs_grad,
+                        float(grad.abs().max().detach().cpu().item()),
+                    )
+            branch_summary[branch_name] = {
+                "status": "nonfinite" if total_nonfinite > 0 else "finite",
+                "loss": _to_debug_scalar(branch_loss),
+                "nonfinite_param_count": total_nonfinite,
+                "nonfinite_examples": nonfinite_names,
+                "max_abs_grad": max_abs_grad,
+            }
+        return branch_summary
+
+    def _log_nonfinite_training_debug(
+        *,
+        reason: str,
+        batch_idx: int,
+        source_batch_obj: Any,
+        local_batch_obj: Any,
+        loss_items: dict[str, Any],
+        combined_loss: torch.Tensor,
+        grad_norm: torch.Tensor | None = None,
+        branch_probe: dict[str, Any] | None = None,
+    ) -> None:
         logger.warning(
-            f"min_max_nodes_per_batch ({effective_min_train_nodes_per_batch}) is greater than "
-            f"max_nodes_per_batch ({configured_train_max_nodes_per_batch}); clamping min to max."
+            "Non-finite training state detected | reason=%s | epoch=%d | batch=%d | "
+            "combined_loss=%s | grad_norm=%s",
+            reason,
+            epoch + 1,
+            batch_idx,
+            _to_debug_scalar(combined_loss),
+            _to_debug_scalar(grad_norm) if grad_norm is not None else None,
         )
-        effective_min_train_nodes_per_batch = configured_train_max_nodes_per_batch
-
-    if effective_min_val_nodes_per_batch > configured_val_max_nodes_per_batch:
+        logger.warning("Loss breakdown: %s", _summarize_loss_debug(loss_items))
         logger.warning(
-            f"min_val_max_nodes_per_batch ({effective_min_val_nodes_per_batch}) is greater than "
-            f"val_max_nodes_per_batch ({configured_val_max_nodes_per_batch}); clamping min to val max."
+            "Source batch samples: %s",
+            _collect_batch_sample_debug(source_batch_obj),
         )
-        effective_min_val_nodes_per_batch = configured_val_max_nodes_per_batch
+        logger.warning(
+            "Local batch samples: %s",
+            _collect_batch_sample_debug(local_batch_obj),
+        )
+        logger.warning(
+            "Non-finite gradient parameters: %s",
+            _collect_nonfinite_grad_param_names(),
+        )
+        if branch_probe is not None:
+            logger.warning("Branch gradient probe: %s", branch_probe)
+
+    def _log_budget_adjustment(
+        adjustment: Any | None,
+        *,
+        budget_label: str,
+        rebuild_loader: bool = False,
+    ) -> None:
+        if adjustment is None or adjustment.new_budget == adjustment.previous_budget:
+            return
+        log_fn = logger.warning if adjustment.action == "reduce" else logger.info
+        log_fn(
+            "%s budget callback | phase=%s | action=%s | %s: %d -> %d | "
+            "window_oom=%d/%d | offenders=%d | reason=%s",
+            budget_label,
+            adjustment.phase_name,
+            adjustment.action,
+            budget_label,
+            adjustment.previous_budget,
+            adjustment.new_budget,
+            adjustment.window_oom,
+            adjustment.window_total,
+            adjustment.offender_count,
+            adjustment.reason,
+        )
+        if rebuild_loader:
+            logger.info(
+                "Next epoch will rebuild the train loader with %s=%d.",
+                budget_label,
+                adjustment.new_budget,
+            )
+
+    def _run_same_center_auxiliary_step(
+        *,
+        local_samples: list[Any],
+        placement_centers_cpu: torch.Tensor,
+        root_indices: list[int],
+        batch_idx: int,
+    ) -> tuple[torch.Tensor, int, bool, bool]:
+        """
+        以独立辅助反传方式执行 same-center pairwise ranking。
+
+        Args:
+            local_samples: 当前 local crop batch 对应的逐图样本列表。
+            placement_centers_cpu: 当前 batch 每个图对应的裁剪中心。
+            root_indices: 当前根 batch 的底层数据集索引。
+            batch_idx: 当前训练 batch 编号。
+
+        Returns:
+            tuple[torch.Tensor, int, bool, bool]:
+                返回聚合后的 same-center 监控损失、有效配对数、
+                是否发生 OOM、以及是否存在不可约 OOM。
+        """
+
+        def _run_chunk(
+            *,
+            chunk_samples: list[Any],
+            chunk_centers_cpu: torch.Tensor,
+        ) -> tuple[torch.Tensor, int, bool, bool]:
+            try:
+                anchor_batch = cast(Any, collator.collate(chunk_samples)).to(device)
+                x_1_anchor = anchor_batch["ligand_atom"].pos
+                chunk_centers = chunk_centers_cpu.to(
+                    device=device,
+                    dtype=x_1_anchor.dtype,
+                )
+                with torch.no_grad():
+                    t_anchor, x_t_anchor, _ = matcher.sample_location_and_target(
+                        x_1=x_1_anchor,
+                        data=anchor_batch,
+                        current_epoch=epoch,
+                        total_epochs=epochs,
+                        placement_centers=chunk_centers,
+                    )
+                anchor_batch["ligand_atom"].pos = x_t_anchor
+                anchor_batch.t = t_anchor
+                anchor_pred = model(anchor_batch, t_anchor)
+                pose_rank_anchor = compute_pose_rank_target(
+                    x_t_anchor,
+                    x_1_anchor,
+                    batch_idx=anchor_batch["ligand_atom"].batch,
+                    samples=chunk_samples,
+                    dataset_raw_dir=dataset.raw_dir,
+                )
+                anchor_rank_logit = select_pose_rank_logit(anchor_pred)
+
+                same_center_batch = cast(Any, collator.collate(chunk_samples)).to(device)
+                x_1_same = same_center_batch["ligand_atom"].pos
+                with torch.no_grad():
+                    t_same = torch.clamp(
+                        t_anchor * (0.25 + 0.45 * torch.rand_like(t_anchor)),
+                        min=1e-3,
+                        max=1.0 - 1e-3,
+                    )
+                    _, x_t_same, _ = matcher.sample_location_and_target(
+                        x_1=x_1_same,
+                        data=same_center_batch,
+                        current_epoch=epoch,
+                        total_epochs=epochs,
+                        placement_centers=chunk_centers,
+                        t_override=t_same,
+                    )
+                same_center_batch["ligand_atom"].pos = x_t_same
+                same_center_batch.t = t_same
+                same_center_pred = model(same_center_batch, t_same)
+                pose_rank_same = compute_pose_rank_target(
+                    x_t_same,
+                    x_1_same,
+                    batch_idx=same_center_batch["ligand_atom"].batch,
+                    samples=chunk_samples,
+                    dataset_raw_dir=dataset.raw_dir,
+                )
+                same_center_rank_logit = select_pose_rank_logit(same_center_pred)
+                loss_same, count_same = pairwise_ranking_loss_from_pairs(
+                    anchor_rank_logit,
+                    pose_rank_anchor,
+                    same_center_rank_logit,
+                    pose_rank_same,
+                    margin=pose_ranking_margin,
+                )
+                if count_same > 0:
+                    auxiliary_loss = (
+                        pose_ranking_pair_weight
+                        * loss_same
+                        * max(1, len(chunk_samples))
+                    )
+                    auxiliary_loss.backward()
+                    monitored_loss = loss_same.detach() * count_same
+                else:
+                    monitored_loss = loss_same.detach().new_zeros(())
+                del (
+                    anchor_batch,
+                    anchor_pred,
+                    pose_rank_anchor,
+                    anchor_rank_logit,
+                    same_center_batch,
+                    same_center_pred,
+                    pose_rank_same,
+                    same_center_rank_logit,
+                    x_1_anchor,
+                    x_t_anchor,
+                    x_1_same,
+                    x_t_same,
+                    t_anchor,
+                    t_same,
+                )
+                return monitored_loss, count_same, False, False
+            except torch.cuda.OutOfMemoryError:
+                gc.collect()
+                if use_configured_cuda:
+                    torch.cuda.empty_cache()
+                if len(chunk_samples) <= 1:
+                    logger.warning(
+                        "Batch %d: irreducible same-center ranking OOM on singleton micro-batch.",
+                        batch_idx,
+                    )
+                    return torch.zeros((), device=device), 0, True, True
+                mid = len(chunk_samples) // 2
+                left = _run_chunk(
+                    chunk_samples=chunk_samples[:mid],
+                    chunk_centers_cpu=chunk_centers_cpu[:mid],
+                )
+                right = _run_chunk(
+                    chunk_samples=chunk_samples[mid:],
+                    chunk_centers_cpu=chunk_centers_cpu[mid:],
+                )
+                return (
+                    left[0] + right[0],
+                    left[1] + right[1],
+                    True,
+                    left[3] or right[3],
+                )
+
+        same_center_action = same_center_budget_controller.get_batch_cooldown_action(
+            root_indices,
+            len(local_samples),
+        )
+        if same_center_action == "skip":
+            same_center_budget_controller.note_cooldown_skip(root_indices)
+            return torch.zeros((), device=device), 0, False, False
+
+        weighted_loss_total = torch.zeros((), device=device)
+        pair_count_total = 0
+        had_oom = False
+        irreducible_oom = False
+        chunk_size = max(
+            1,
+            min(int(same_center_budget_controller.current_budget), len(local_samples)),
+        )
+        for start in range(0, len(local_samples), chunk_size):
+            end = min(start + chunk_size, len(local_samples))
+            chunk_weighted_loss, chunk_pair_count, chunk_had_oom, chunk_irreducible = _run_chunk(
+                chunk_samples=local_samples[start:end],
+                chunk_centers_cpu=placement_centers_cpu[start:end],
+            )
+            weighted_loss_total = weighted_loss_total + chunk_weighted_loss
+            pair_count_total += chunk_pair_count
+            had_oom = had_oom or chunk_had_oom
+            irreducible_oom = irreducible_oom or chunk_irreducible
+
+        return weighted_loss_total, pair_count_total, had_oom, irreducible_oom
+
+
+    effective_min_train_cost_budget = max(1, int(min_train_cost_budget))
+    effective_min_val_cost_budget = max(1, int(min_val_cost_budget))
+
+    if effective_min_train_cost_budget > configured_train_cost_budget:
+        logger.warning(
+            f"min_train_cost_budget ({effective_min_train_cost_budget}) is greater than "
+            f"train_cost_budget ({configured_train_cost_budget}); clamping min to max."
+        )
+        effective_min_train_cost_budget = configured_train_cost_budget
+
+    if effective_min_val_cost_budget > configured_val_cost_budget:
+        logger.warning(
+            f"min_val_cost_budget ({effective_min_val_cost_budget}) is greater than "
+            f"val_cost_budget ({configured_val_cost_budget}); clamping min to val max."
+        )
+        effective_min_val_cost_budget = configured_val_cost_budget
 
     if not (0.0 < val_oom_reduce_factor < 1.0):
         raise ValueError(
             f"Invalid val_oom_reduce_factor={val_oom_reduce_factor}."
         )
+    if max_oom_retry_splits < 0:
+        raise ValueError(f"Invalid max_oom_retry_splits={max_oom_retry_splits}.")
 
-    current_train_max_nodes_per_batch = configured_train_max_nodes_per_batch
-    current_val_max_nodes_per_batch = configured_val_max_nodes_per_batch
+    train_budget_controller = WindowAimdBudgetController(
+        phase_name="train",
+        base_budget=configured_train_cost_budget,
+        min_budget=effective_min_train_cost_budget,
+        window_size=train_budget_window_size,
+        reduce_threshold=oom_reduce_threshold,
+        reduce_factor=oom_reduce_factor,
+        recover_window_count=train_budget_recover_window_count,
+        recover_step=train_budget_recover_step,
+        offender_cooldown=train_offender_cooldown,
+        enable_adaptive=enable_train_budget_callback,
+    )
+    val_partial_budget_controller = WindowAimdBudgetController(
+        phase_name="val_partial",
+        base_budget=configured_val_cost_budget,
+        min_budget=effective_min_val_cost_budget,
+        window_size=val_budget_window_size,
+        reduce_threshold=val_oom_reduce_threshold,
+        reduce_factor=val_oom_reduce_factor,
+        recover_window_count=val_budget_recover_window_count,
+        recover_step=val_budget_recover_step,
+        offender_cooldown=val_offender_cooldown,
+        enable_adaptive=enable_val_budget_callback,
+    )
+    val_full_budget_controller = WindowAimdBudgetController(
+        phase_name="val_full",
+        base_budget=configured_val_cost_budget,
+        min_budget=effective_min_val_cost_budget,
+        window_size=val_budget_window_size,
+        reduce_threshold=val_oom_reduce_threshold,
+        reduce_factor=val_oom_reduce_factor,
+        recover_window_count=val_budget_recover_window_count,
+        recover_step=val_budget_recover_step,
+        offender_cooldown=val_offender_cooldown,
+        enable_adaptive=enable_val_budget_callback,
+    )
+    same_center_budget_controller = WindowAimdBudgetController(
+        phase_name="ranking_same_center",
+        base_budget=max(1, int(same_center_micro_batch_size)),
+        min_budget=1,
+        window_size=same_center_budget_window_size,
+        reduce_threshold=1,
+        reduce_factor=0.5,
+        recover_window_count=same_center_budget_recover_window_count,
+        recover_step=same_center_budget_recover_step,
+        offender_cooldown=same_center_offender_cooldown,
+        enable_adaptive=True,
+    )
+    ranking_budget_controller = WindowAimdBudgetController(
+        phase_name="ranking_wrong_center",
+        base_budget=max(0, int(ranking_wrong_center_cap)),
+        min_budget=0,
+        window_size=ranking_budget_window_size,
+        reduce_threshold=1,
+        reduce_factor=0.5,
+        recover_window_count=ranking_budget_recover_window_count,
+        recover_step=1,
+        offender_cooldown=ranking_offender_cooldown,
+        enable_adaptive=True,
+    )
+    replay_budget_controller = WindowAimdBudgetController(
+        phase_name="replay_micro_batch",
+        base_budget=max(1, int(replay_micro_batch_size)),
+        min_budget=1,
+        window_size=replay_budget_window_size,
+        reduce_threshold=1,
+        reduce_factor=0.5,
+        recover_window_count=replay_budget_recover_window_count,
+        recover_step=1,
+        offender_cooldown=replay_candidate_cooldown,
+        enable_adaptive=True,
+    )
     persistent_workers = bool(dataloader_persistent_workers and dataloader_num_workers > 0)
+    graph_cost_profile_cache: dict[int, dict[str, int]] = {}
+    train_phase_multiplier = 1.0
+    val_partial_phase_multiplier = 1.35
+    val_full_phase_multiplier = 1.75
+    topn_phase_multiplier = 2.25
+
+    def _get_graph_cost_profile(root_idx: int) -> dict[str, int]:
+        if root_idx not in graph_cost_profile_cache:
+            graph_cost_profile_cache[root_idx] = dataset.get_graph_cost_profile(root_idx)
+        return graph_cost_profile_cache[root_idx]
+
+    def _estimate_sample_costs(dataset_obj: Any, *, phase_multiplier: float) -> list[int]:
+        root_indices = resolve_subset_root_indices(dataset_obj)
+        return [
+            estimate_graph_cost_units(
+                _get_graph_cost_profile(root_idx),
+                num_gnn_blocks=num_gnn_blocks,
+                dynamic_inter_max_neighbors=dynamic_inter_max_neighbors,
+                dynamic_residue_max_neighbors=dynamic_residue_max_neighbors,
+                dynamic_residue_candidate_topk=dynamic_residue_candidate_topk,
+                phase_multiplier=phase_multiplier,
+            )
+            for root_idx in root_indices
+        ]
+
+    def _summarize_sample_costs(name: str, root_indices: list[int]) -> dict[str, Any]:
+        if not root_indices:
+            return {
+                "name": name,
+                "samples": 0,
+            }
+        profiles = [_get_graph_cost_profile(root_idx) for root_idx in root_indices]
+        costs = [
+            estimate_graph_cost_units(
+                profile,
+                num_gnn_blocks=num_gnn_blocks,
+                dynamic_inter_max_neighbors=dynamic_inter_max_neighbors,
+                dynamic_residue_max_neighbors=dynamic_residue_max_neighbors,
+                dynamic_residue_candidate_topk=dynamic_residue_candidate_topk,
+                phase_multiplier=train_phase_multiplier,
+            )
+            for profile in profiles
+        ]
+        total_edges = [int(profile["total_edges"]) for profile in profiles]
+        dynamic_candidates = [
+            int(min(profile["protein_residue_nodes"], dynamic_residue_candidate_topk))
+            if dynamic_residue_candidate_topk > 0
+            else int(profile["protein_residue_nodes"])
+            for profile in profiles
+        ]
+        return {
+            "name": name,
+            "samples": len(root_indices),
+            "cost_mean": float(np.mean(costs)),
+            "cost_p95": float(np.percentile(costs, 95)),
+            "cost_p99": float(np.percentile(costs, 99)),
+            "edges_mean": float(np.mean(total_edges)),
+            "edges_p95": float(np.percentile(total_edges, 95)),
+            "residue_candidates_mean": float(np.mean(dynamic_candidates)),
+        }
 
     _prev_loaders: list[DataLoader] = []
 
-    def _build_loaders(train_max_nodes: int, val_max_nodes: int) -> tuple[DataLoader, DataLoader]:
+    def _rebuild_train_loader(train_base_cost_budget: int) -> DataLoader:
         for old_loader in _prev_loaders:
             del old_loader
         _prev_loaders.clear()
         gc.collect()
 
-        train_edge_budget = max(1, int(train_max_nodes * train_edge_budget_factor))
-        val_edge_budget = max(1, int(val_max_nodes * train_edge_budget_factor))
         logger.info(
-            f"Using DynamicBatchSampler budgets: train_max_num={train_edge_budget} (mode=edge), "
-            f"val_max_num={val_edge_budget} (mode=edge)."
+            "Using adaptive train sampler cost budget: "
+            f"train_cost_budget={train_base_cost_budget}."
         )
-
-        train_sampler = DynamicBatchSampler(
-            cast(Any, train_set),
-            max_num=train_edge_budget,
-            mode="edge",
+        train_sampler = AdaptiveCostBatchSampler(
+            sample_costs=_estimate_sample_costs(train_set, phase_multiplier=train_phase_multiplier),
+            max_cost=train_base_cost_budget,
             shuffle=True,
+            seed=42,
         )
         train_loader_local = DataLoader(
             train_set,
@@ -656,64 +1308,123 @@ def train(
             batch_sampler=train_sampler,
         )
 
-        val_sampler = DynamicBatchSampler(
-            cast(Any, val_set),
-            max_num=val_edge_budget,
-            mode="edge",
-            shuffle=False,
-        )
-        val_loader_local = DataLoader(
-            val_set,
-            collate_fn=collator.collate,
-            num_workers=dataloader_num_workers,
-            persistent_workers=persistent_workers,
-            pin_memory=dataloader_pin_memory,
-            batch_sampler=val_sampler,
-        )
+        _prev_loaders.append(train_loader_local)
+        return train_loader_local
 
-        _prev_loaders.extend([train_loader_local, val_loader_local])
-        return train_loader_local, val_loader_local
-
-    def _build_eval_loader(subset: Any, max_nodes: int) -> DataLoader:
-        eval_edge_budget = max(1, int(max_nodes * train_edge_budget_factor))
-        eval_sampler = DynamicBatchSampler(
-            cast(Any, subset),
-            max_num=eval_edge_budget,
-            mode="edge",
+    def _build_eval_loader(subset: Any, base_cost_budget: int, *, phase_multiplier: float) -> DataLoader:
+        eval_sampler = AdaptiveCostBatchSampler(
+            sample_costs=_estimate_sample_costs(subset, phase_multiplier=phase_multiplier),
+            max_cost=base_cost_budget,
             shuffle=False,
+            seed=42,
         )
         return DataLoader(
             subset,
             collate_fn=collator.collate,
             num_workers=dataloader_num_workers,
-            persistent_workers=persistent_workers,
+            persistent_workers=False,
             pin_memory=dataloader_pin_memory,
             batch_sampler=eval_sampler,
         )
 
-    train_loader, val_loader = _build_loaders(
-        current_train_max_nodes_per_batch,
-        current_val_max_nodes_per_batch,
+    def _sample_validation_subset(*, epoch_idx: int, subset_ratio: float) -> Any:
+        """
+        按比例抽取当前 epoch 使用的验证子集。
+
+        Args:
+            epoch_idx: 当前训练轮次，从 0 开始计数。
+            subset_ratio: 本轮验证需要覆盖的验证集比例。
+
+        Returns:
+            Any: 若比例达到全量则直接返回完整验证集，否则返回按固定随机种子采样后的 `Subset`。
+        """
+        if len(val_set) == 0:
+            return val_set
+        if subset_ratio >= 1.0:
+            return val_set
+        target_size = min(len(val_set), max(1, math.ceil(len(val_set) * subset_ratio)))
+        if target_size >= len(val_set):
+            return val_set
+        generator = torch.Generator()
+        generator.manual_seed(42 + epoch_idx)
+        sampled_positions = torch.randperm(len(val_set), generator=generator)[:target_size].tolist()
+        return Subset(val_set, sampled_positions)
+
+    def _resolve_validation_plan(epoch_idx: int) -> dict[str, Any]:
+        """
+        解析当前 epoch 的验证调度方案。
+
+        Args:
+            epoch_idx: 当前训练轮次，从 0 开始计数。
+
+        Returns:
+            dict[str, Any]: 返回本轮验证模式、触发原因、子集对象、覆盖比例和 ODE 方法等信息。
+        """
+        is_tail_full = val_full_last_epochs > 0 and epoch_idx >= max(0, epochs - val_full_last_epochs)
+        is_periodic_full = val_full_every > 0 and (epoch_idx + 1) % val_full_every == 0
+        is_full = bool(is_tail_full or is_periodic_full or val_subset_ratio >= 1.0)
+        subset_ratio = 1.0 if is_full else val_subset_ratio
+        subset = _sample_validation_subset(epoch_idx=epoch_idx, subset_ratio=subset_ratio)
+        subset_size = len(subset)
+        effective_ratio = 0.0 if len(val_set) == 0 else subset_size / len(val_set)
+        if is_tail_full:
+            trigger = "tail"
+        elif is_periodic_full:
+            trigger = "periodic"
+        elif is_full:
+            trigger = "ratio"
+        else:
+            trigger = "partial"
+        mode = "full" if is_full else "partial"
+        resolved_ode_method = ode_method
+        phase_multiplier = val_full_phase_multiplier if is_full else val_partial_phase_multiplier
+        if resolved_ode_method == "rk4":
+            phase_multiplier *= 1.6
+        return {
+            "mode": mode,
+            "trigger": trigger,
+            "is_full": is_full,
+            "subset": subset,
+            "subset_size": subset_size,
+            "subset_ratio": effective_ratio,
+            "ode_method": resolved_ode_method,
+            "phase_multiplier": phase_multiplier,
+            "progress_desc": f"Epoch {epoch_idx + 1} [Val:{mode}]",
+        }
+
+    train_loader = _rebuild_train_loader(train_budget_controller.current_budget)
+    graph_cost_summary = {
+        "train": _summarize_sample_costs("train", train_indices),
+        "val": _summarize_sample_costs("val", val_indices),
+        "test": _summarize_sample_costs("test", test_indices),
+    }
+    logger.info("Graph cost summary | train=%s | val=%s | test=%s", graph_cost_summary["train"], graph_cost_summary["val"], graph_cost_summary["test"])
+    report_dir = os.path.join(save_dir, "reports")
+    os.makedirs(report_dir, exist_ok=True)
+    graph_cost_report_path = os.path.join(report_dir, "graph_cost_summary.json")
+    with open(graph_cost_report_path, "w", encoding="utf-8") as f:
+        json.dump(graph_cost_summary, f, ensure_ascii=False, indent=2)
+
+    logger.info(
+        "Validation schedule: partial_ratio=%.2f%% | full_every=%d | full_last_epochs=%d | ode=%s.",
+        100.0 * val_subset_ratio,
+        val_full_every,
+        val_full_last_epochs,
+        ode_method,
     )
-
-    try:
-        total_val_batches = len(val_loader)
-
-    except ValueError:
-        total_val_batches = max(1, len(val_set) // 4)
-
-    rmsd_check_batches = int(total_val_batches * rmsd_check_ratio)
-
-    if rmsd_check_ratio > 0 and rmsd_check_batches < 1:
-        rmsd_check_batches = 1
-
-    logger.info(f"Validation Sampling: Check RMSD for {rmsd_check_batches}/{total_val_batches} batches ({rmsd_check_ratio*100:.1f}%)")
+    if val_subset_ratio < 0.10 and val_full_every == 0 and val_full_last_epochs == 0:
+        logger.warning(
+            "Validation feedback is configured to be extremely sparse | partial_ratio=%.2f%% | no scheduled full validation.",
+            100.0 * val_subset_ratio,
+        )
+    if blind_pool_start_epoch <= 0 and blind_pool_refresh_every <= 1:
+        logger.warning(
+            "Blind pool refresh is configured to start very early and run every epoch; early-epoch pool quality may be noisy."
+        )
     logger.info(
         "Evaluation budgets: "
-        f"test_nodes={configured_test_max_nodes_per_batch}, "
-        f"test_edges={max(1, int(configured_test_max_nodes_per_batch * train_edge_budget_factor))}, "
-        f"topn_nodes={configured_topn_max_nodes_per_batch}, "
-        f"topn_edges={max(1, int(configured_topn_max_nodes_per_batch * train_edge_budget_factor))}."
+        f"blind_pool_cost_budget={configured_blind_pool_cost_budget} | "
+        f"final_topn_cost_budget={configured_final_topn_cost_budget}."
     )
 
     logger.info("Initializing Model & Flow Components...")
@@ -748,8 +1459,11 @@ def train(
         knn_fallback_k=prediction_knn_fallback_k,
         dynamic_inter_cutoff=dynamic_inter_cutoff,
         dynamic_inter_knn_k=dynamic_inter_knn_k,
+        dynamic_inter_max_neighbors=dynamic_inter_max_neighbors,
         dynamic_residue_cutoff=dynamic_residue_cutoff,
         dynamic_residue_knn_k=dynamic_residue_knn_k,
+        dynamic_residue_max_neighbors=dynamic_residue_max_neighbors,
+        dynamic_residue_candidate_topk=dynamic_residue_candidate_topk,
     ).to(device)
 
     matcher = ConditionalFlowMatcher(
@@ -770,7 +1484,7 @@ def train(
         weight_torsion=loss_weight_torsion,
         weight_energy=loss_weight_energy,
         weight_clash=loss_weight_clash,
-        weight_pose_quality=loss_weight_pose_quality,
+        weight_pose_rank=loss_weight_pose_rank,
         curriculum_weights={
             "coarse": {
                 "trans": loss_coarse_trans,
@@ -778,7 +1492,7 @@ def train(
                 "torsion": loss_coarse_torsion,
                 "energy": loss_coarse_energy,
                 "clash": loss_coarse_clash,
-                "pose_quality": loss_coarse_pose_quality,
+                "pose_rank": loss_coarse_pose_rank,
             },
             "transition": {
                 "trans": loss_transition_trans,
@@ -786,7 +1500,7 @@ def train(
                 "torsion": loss_transition_torsion,
                 "energy": loss_transition_energy,
                 "clash": loss_transition_clash,
-                "pose_quality": loss_transition_pose_quality,
+                "pose_rank": loss_transition_pose_rank,
             },
             "refine": {
                 "trans": loss_refine_trans,
@@ -794,7 +1508,7 @@ def train(
                 "torsion": loss_refine_torsion,
                 "energy": loss_refine_energy,
                 "clash": loss_refine_clash,
-                "pose_quality": loss_refine_pose_quality,
+                "pose_rank": loss_refine_pose_rank,
             },
         },
         refine_start=loss_refine_start,
@@ -815,19 +1529,40 @@ def train(
     except ValueError:
         total_train_batches = max(1, len(train_set) // 4)
     updates_per_epoch = math.ceil(total_train_batches / accumulation_steps)
-    total_steps = epochs * updates_per_epoch
-    warmup_steps = max(1, warmup_epochs) * updates_per_epoch
-    scheduler_warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
-    scheduler_cosine = CosineAnnealingLR(
-        optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=1e-6
-    )
-    scheduler = SequentialLR(
-        optimizer,
-        schedulers=[scheduler_warmup, scheduler_cosine],
-        milestones=[warmup_steps],
-    )
+    total_steps = max(1, epochs * updates_per_epoch)
+    requested_warmup_steps = max(0, warmup_epochs) * updates_per_epoch
+    warmup_steps = min(requested_warmup_steps, max(0, total_steps - 1))
+    if requested_warmup_steps != warmup_steps:
+        logger.warning(
+            "Warmup steps were clamped to fit the current run | requested=%d | effective=%d | total_steps=%d.",
+            requested_warmup_steps,
+            warmup_steps,
+            total_steps,
+        )
+    cosine_eta_min = 1e-6
+    eta_min_factor = cosine_eta_min / lr if lr > 0 else 0.0
+
+    def _lr_multiplier(step_idx: int) -> float:
+        if total_steps <= 1:
+            return 1.0
+        clamped_step = min(max(step_idx, 0), total_steps - 1)
+        if warmup_steps > 0 and clamped_step < warmup_steps:
+            warmup_progress = clamped_step / max(1, warmup_steps)
+            return 0.01 + 0.99 * warmup_progress
+        cosine_progress = (
+            (clamped_step - warmup_steps)
+            / max(1, total_steps - warmup_steps - 1)
+        )
+        cosine_progress = min(max(cosine_progress, 0.0), 1.0)
+        cosine_weight = 0.5 * (1.0 + math.cos(math.pi * cosine_progress))
+        return eta_min_factor + (1.0 - eta_min_factor) * cosine_weight
+
+    scheduler = LambdaLR(optimizer, lr_lambda=_lr_multiplier)
     logger.info(
-        f"LR scheduler initialized: total_steps={total_steps}, warmup_steps={warmup_steps}."
+        "LR scheduler initialized: total_steps=%d, warmup_steps=%d, requested_warmup_steps=%d.",
+        total_steps,
+        warmup_steps,
+        requested_warmup_steps,
     )
 
     ema_model: AveragedModel | None = None
@@ -835,16 +1570,12 @@ def train(
     best_val_loss = float("inf")
     best_rmsd = float("inf")
     best_composite_metrics: dict[str, float] | None = None
-    best_success2a_metrics: dict[str, float] | None = None
+    best_single_shot_success2a_metrics: dict[str, float] | None = None
     best_rmsd_metrics: dict[str, float] | None = None
     best_selected_metrics: dict[str, float] | None = None
     current_fusion_weights = dict(DEFAULT_FUSION_WEIGHTS)
     total_oom_batches = 0
-    consecutive_clean_epochs = 0
-    consecutive_clean_val_epochs = 0
-    oom_blacklisted_pdb_ids: set[str] = set()
-    oom_counts_by_pdb: dict[str, int] = {}
-    OOM_BLACKLIST_THRESHOLD = 2
+    runtime_benchmark_history: list[dict[str, Any]] = []
     clone_safety_checked = False
     selected_primary_key, selected_higher_is_better, selected_metric_label = resolve_selection_rule(checkpoint_selection_mode)
     blind_pool_cache_dir = os.path.join(save_dir, "blind_pool_cache")
@@ -863,42 +1594,13 @@ def train(
         logger.info("Loaded existing blind pool: %d complexes.", len(cached_blind_pool))
     best_selected_updated_this_epoch = False
 
-    def _extract_batch_pdb_ids(batch_obj: Any) -> list[str]:
-        pdb_attr = getattr(batch_obj, "pdb_id", None)
-
-        if pdb_attr is None:
-            return []
-
-        if isinstance(pdb_attr, str):
-            return [pdb_attr]
-
-        if isinstance(pdb_attr, (list, tuple)):
-            return [str(pid) for pid in pdb_attr]
-
-        try:
-            return [str(pid) for pid in list(pdb_attr)]
-        except Exception:
-            return [str(pdb_attr)]
-
-    def _estimate_batch_total_edges(batch_obj: Any) -> int:
-        total_edges = 0
-
-        edge_types = getattr(batch_obj, "edge_types", None)
-        if not edge_types:
-            return 0
-
-        for edge_type in edge_types:
-            edge_store = batch_obj[edge_type]
-            edge_index = getattr(edge_store, "edge_index", None)
-            if edge_index is not None and edge_index.ndim == 2:
-                total_edges += int(edge_index.size(1))
-
-        return total_edges
-
     for epoch in range(epochs):
+        epoch_start_time = time.perf_counter()
+        epoch_progress = 1.0 if epochs <= 1 else epoch / max(1, epochs - 1)
         gc.collect()
-        if torch.cuda.is_available():
+        if use_configured_cuda:
             torch.cuda.empty_cache()
+        train_loader = _rebuild_train_loader(train_budget_controller.current_budget)
 
         model.train()
         criterion.train()
@@ -907,14 +1609,12 @@ def train(
         pbar = tqdm(total=len(train_set), desc=f"Epoch {epoch+1}/{epochs} [Train]", unit="graphs")
 
         actual_batches = 0
-        epoch_oom_batches = 0
-        epoch_edge_guard_skips = 0
+        epoch_root_oom_events = 0
+        epoch_cost_guard_skips = 0
+        epoch_cooldown_skips = 0
         accumulated_graphs = 0
         accumulated_batches = 0
-        consecutive_oom = 0
-        CIRCUIT_BREAKER_LIMIT = 10
         ENERGY_NAN_FAILFAST_LIMIT = 8
-        epoch_fused = False
         consecutive_energy_nan_skips = 0
         optimizer.zero_grad()
         epoch_local_losses: list[float] = []
@@ -931,528 +1631,678 @@ def train(
         epoch_energy_nan_skips = 0
 
         for batch_idx, batch in enumerate(train_loader):
-            num_graphs = int(batch["ligand_atom"].batch.max().item()) + 1
-            pbar.update(num_graphs)
-            batch_pdb_ids = _extract_batch_pdb_ids(batch)
+            root_num_graphs = int(batch["ligand_atom"].batch.max().item()) + 1
+            root_batch_indices = extract_root_dataset_indices(batch)
+            root_event_had_oom = False
+            root_event_irreducible_oom = False
+            root_event_same_center_oom = False
+            root_event_same_center_irreducible_oom = False
+            root_event_rank_oom = False
+            pbar.update(root_num_graphs)
+            pending_batches: list[tuple[Any, int]] = [(batch, 0)]
 
-            if oom_blacklisted_pdb_ids and batch_pdb_ids:
-                if any(pid in oom_blacklisted_pdb_ids for pid in batch_pdb_ids):
-                    blacklisted_in_batch = [pid for pid in batch_pdb_ids if pid in oom_blacklisted_pdb_ids]
+            while pending_batches:
+                batch, split_depth = pending_batches.pop(0)
+                num_graphs = int(batch["ligand_atom"].batch.max().item()) + 1
+                current_root_indices = extract_root_dataset_indices(batch)
+                cooldown_action = train_budget_controller.get_batch_cooldown_action(
+                    current_root_indices,
+                    num_graphs,
+                )
+                if cooldown_action == "split" and split_depth < max_oom_retry_splits:
+                    split_batches = split_collated_batch(batch, collator=collator)
+                    if split_batches is not None:
+                        pending_batches = [
+                            (split_batches[0], split_depth + 1),
+                            (split_batches[1], split_depth + 1),
+                        ] + pending_batches
+                        continue
+                if cooldown_action == "skip":
+                    epoch_cooldown_skips += 1
+                    train_budget_controller.note_cooldown_skip(current_root_indices)
                     logger.warning(
-                        f"Batch {batch_idx}: skipping batch containing OOM-blacklisted samples "
-                        f"({len(blacklisted_in_batch)}/{len(batch_pdb_ids)} in batch)."
+                        "Batch %d: skipping singleton offender batch during cooldown | offenders=%s.",
+                        batch_idx,
+                        current_root_indices,
                     )
-                    consecutive_oom = 0
+                    continue
+                runtime_train_cost_limit = max(1, int(train_budget_controller.current_budget))
+                batch_cost_units = estimate_runtime_batch_cost(
+                    batch,
+                    num_gnn_blocks=num_gnn_blocks,
+                    dynamic_inter_max_neighbors=dynamic_inter_max_neighbors,
+                    dynamic_residue_max_neighbors=dynamic_residue_max_neighbors,
+                    dynamic_residue_candidate_topk=dynamic_residue_candidate_topk,
+                    phase_multiplier=train_phase_multiplier,
+                )
+                if batch_cost_units > runtime_train_cost_limit:
+                    split_batches = (
+                        split_collated_batch(batch, collator=collator)
+                        if split_depth < max_oom_retry_splits
+                        else None
+                    )
+                    if split_batches is not None:
+                        pending_batches = [
+                            (split_batches[0], split_depth + 1),
+                            (split_batches[1], split_depth + 1),
+                        ] + pending_batches
+                        continue
+                    epoch_cost_guard_skips += 1
+                    train_budget_controller.mark_offender(current_root_indices, severe=True)
+                    logger.warning(
+                        f"Batch {batch_idx}: skipping irreducible oversized cost batch "
+                        f"(cost={batch_cost_units} > limit={runtime_train_cost_limit})."
+                    )
                     continue
 
-            total_edges_cpu = _estimate_batch_total_edges(batch)
-            edge_guard_limit = max(1, int(current_train_max_nodes_per_batch * train_edge_budget_factor))
-            if total_edges_cpu > edge_guard_limit:
-                epoch_edge_guard_skips += 1
-                logger.warning(
-                    f"Batch {batch_idx}: preflight skip due to edge-heavy batch "
-                    f"(total_edges={total_edges_cpu} > limit={edge_guard_limit})."
-                )
-                consecutive_oom = 0
-                continue
+                source_batch: Any | None = None
+                local_batch: Any | None = None
+                predictions: Any | None = None
+                loss_dict: dict[str, torch.Tensor] | None = None
+                loss: torch.Tensor | None = None
+                loss_sum: torch.Tensor | None = None
+                targets: dict[str, torch.Tensor] | None = None
+                x_1: torch.Tensor | None = None
+                x_t: torch.Tensor | None = None
+                t: torch.Tensor | None = None
+                ligand_centers: torch.Tensor | None = None
+                proposal_logits: torch.Tensor | None = None
+                residue_prior_feat: torch.Tensor | None = None
+                proposal_logits_cpu: torch.Tensor | None = None
+                center_guidance_logits_cpu: torch.Tensor | None = None
+                proposal_top_scores: torch.Tensor | None = None
+                proposal_top_scores_cpu: torch.Tensor | None = None
+                residue_pos_for_crop: torch.Tensor | None = None
+                residue_batch_for_crop: torch.Tensor | None = None
+                residue_prior_feat_cpu: torch.Tensor | None = None
+                residue_pos_cpu: torch.Tensor | None = None
+                residue_batch_cpu: torch.Tensor | None = None
+                crop_centers: torch.Tensor | None = None
+                crop_centers_cpu: torch.Tensor | None = None
+                wrong_centers: torch.Tensor | None = None
+                wrong_centers_cpu: torch.Tensor | None = None
+                wrong_center_scores: torch.Tensor | None = None
+                wrong_center_scores_cpu: torch.Tensor | None = None
+                wrong_center_valid: torch.Tensor | None = None
+                wrong_center_valid_cpu: torch.Tensor | None = None
+                bootstrap_centers: torch.Tensor | None = None
+                bootstrap_centers_cpu: torch.Tensor | None = None
+                local_batch_samples: list[Any] | None = None
 
-            source_batch: Any | None = None
-            local_batch: Any | None = None
-            predictions: Any | None = None
-            loss_dict: dict[str, torch.Tensor] | None = None
-            loss: torch.Tensor | None = None
-            loss_sum: torch.Tensor | None = None
-            targets: dict[str, torch.Tensor] | None = None
-            x_1: torch.Tensor | None = None
-            x_t: torch.Tensor | None = None
-            t: torch.Tensor | None = None
-            ligand_centers: torch.Tensor | None = None
-            proposal_logits: torch.Tensor | None = None
-            residue_prior_feat: torch.Tensor | None = None
-            proposal_logits_cpu: torch.Tensor | None = None
-            center_guidance_logits_cpu: torch.Tensor | None = None
-            proposal_top_scores: torch.Tensor | None = None
-            proposal_top_scores_cpu: torch.Tensor | None = None
-            residue_pos_for_crop: torch.Tensor | None = None
-            residue_batch_for_crop: torch.Tensor | None = None
-            residue_prior_feat_cpu: torch.Tensor | None = None
-            residue_pos_cpu: torch.Tensor | None = None
-            residue_batch_cpu: torch.Tensor | None = None
-            crop_centers: torch.Tensor | None = None
-            crop_centers_cpu: torch.Tensor | None = None
-            wrong_centers: torch.Tensor | None = None
-            wrong_centers_cpu: torch.Tensor | None = None
-            wrong_center_scores: torch.Tensor | None = None
-            wrong_center_scores_cpu: torch.Tensor | None = None
-            wrong_center_valid: torch.Tensor | None = None
-            wrong_center_valid_cpu: torch.Tensor | None = None
-            bootstrap_centers: torch.Tensor | None = None
-            bootstrap_centers_cpu: torch.Tensor | None = None
-
-            try:
-                source_batch = batch
-                if not clone_safety_checked:
-                    clone_safety_checked = True
-                center_value_ready = bool(cached_blind_pool)
-                ligand_centers = scatter_mean(
-                    source_batch["ligand_atom"].pos,
-                    source_batch["ligand_atom"].batch,
-                    dim=0,
-                    dim_size=num_graphs,
-                )
-                proposal_logits, residue_pos_for_crop, residue_batch_for_crop, residue_prior_feat = predict_center_proposal_logits(
-                    model,
-                    source_batch,
-                    device=device,
-                )
-                train_progress = 1.0 if epochs <= 1 else epoch / max(1, epochs - 1)
-                proposal_logits_cpu = proposal_logits.detach().cpu().view(-1)
-                residue_prior_feat_cpu = residue_prior_feat.detach().cpu()
-                center_guidance_logits_cpu = compute_center_guidance_scores(
-                    proposal_logits_cpu,
-                    residue_prior_feat_cpu,
-                    use_learned_scores=center_value_ready,
-                )
-                residue_pos_cpu = residue_pos_for_crop.detach().cpu()
-                residue_batch_cpu = residue_batch_for_crop.detach().cpu()
-                wrong_centers_cpu, wrong_center_scores_cpu, wrong_center_valid_cpu = select_wrong_center_candidates(
-                    ligand_centers.detach().cpu(),
-                    center_guidance_logits_cpu,
-                    residue_pos_cpu,
-                    residue_batch_cpu,
-                    positive_radius=center_positive_radius,
-                    bucket_topk=crop_candidate_topk,
-                    weighted_sampling=True,
-                    allow_negative_centers=center_value_ready,
-                )
-                bootstrap_centers_cpu = select_bootstrap_blind_centers(
-                    ligand_centers.detach().cpu(),
-                    center_guidance_logits_cpu,
-                    residue_pos_cpu,
-                    residue_batch_cpu,
-                    positive_radius=center_positive_radius,
-                    bucket_topk=crop_candidate_topk,
-                    allow_negative_centers=center_value_ready,
-                )
-                proposal_top_scores_cpu = torch.full((num_graphs,), -1e9, dtype=center_guidance_logits_cpu.dtype)
-                for graph_idx in range(num_graphs):
-                    graph_mask = residue_batch_cpu == graph_idx
-                    graph_logits = center_guidance_logits_cpu[graph_mask]
-                    if graph_logits.numel() > 0:
-                        proposal_top_scores_cpu[graph_idx] = graph_logits.max()
-                crop_centers_cpu, crop_modes = select_training_crop_centers(
-                    ligand_centers.detach().cpu(),
-                    center_guidance_logits_cpu,
-                    residue_pos_cpu,
-                    residue_batch_cpu,
-                    progress=train_progress,
-                    positive_radius=center_positive_radius,
-                    bucket_topk=crop_candidate_topk,
-                    weighted_sampling=True,
-                    disable_jitter=disable_jitter_crop,
-                    disable_hard_negative=disable_hard_negative_crop,
-                    allow_proposal_buckets=center_value_ready,
-                )
-                local_batch = build_local_batch_from_centers(
-                    source_batch,
-                    centers=crop_centers_cpu,
-                    crop_radius=float(crop_radius),
-                    crop_min_residues=crop_min_residues,
-                    crop_atom_margin=crop_atom_margin,
-                    graph_builder=graph_builder,
-                    collator=collator,
-                )
-                batch = local_batch.to(device)
-                crop_centers = crop_centers_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
-                wrong_center_valid = wrong_center_valid_cpu.to(device=device)
-                wrong_center_scores = wrong_center_scores_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
-                wrong_centers = wrong_centers_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
-                bootstrap_centers = bootstrap_centers_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
-                proposal_top_scores = proposal_top_scores_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
-                epoch_source_residues.append(
-                    float(source_batch["protein_residue"].pos.size(0)) / max(1, num_graphs)
-                )
-                epoch_local_residues.append(
-                    float(local_batch["protein_residue"].pos.size(0)) / max(1, num_graphs)
-                )
-                _annotate_loss_context(
-                    batch,
-                    current_epoch=epoch,
-                    total_epochs_count=epochs,
-                    warmup_epochs_count=warmup_epochs,
-                    training=True,
-                )
-
-                with torch.no_grad():
-                    x_1 = batch["ligand_atom"].pos
-                    t, x_t, targets = matcher.sample_location_and_target(
-                        x_1=x_1,
-                        data=batch,
+                try:
+                    if use_configured_cuda:
+                        torch.cuda.reset_peak_memory_stats(device=device)
+                    source_batch = batch
+                    if not clone_safety_checked:
+                        clone_safety_checked = True
+                    train_progress = epoch_progress
+                    learned_center_ready = (
+                        train_progress >= center_guidance_learned_start
+                    )
+                    center_negative_ready = train_progress >= crop_near_miss_start
+                    ligand_centers = scatter_mean(
+                        source_batch["ligand_atom"].pos,
+                        source_batch["ligand_atom"].batch,
+                        dim=0,
+                        dim_size=num_graphs,
+                    )
+                    proposal_logits, residue_pos_for_crop, residue_batch_for_crop, residue_prior_feat = predict_center_proposal_logits(
+                        model,
+                        source_batch,
+                        device=device,
+                    )
+                    proposal_logits_cpu = proposal_logits.detach().cpu().view(-1)
+                    residue_prior_feat_cpu = residue_prior_feat.detach().cpu()
+                    center_guidance_logits_cpu = compute_center_guidance_scores(
+                        proposal_logits_cpu,
+                        residue_prior_feat_cpu,
+                        use_learned_scores=learned_center_ready,
+                    )
+                    residue_pos_cpu = residue_pos_for_crop.detach().cpu()
+                    residue_batch_cpu = residue_batch_for_crop.detach().cpu()
+                    wrong_centers_cpu, wrong_center_scores_cpu, wrong_center_valid_cpu = select_wrong_center_candidates(
+                        ligand_centers.detach().cpu(),
+                        center_guidance_logits_cpu,
+                        residue_pos_cpu,
+                        residue_batch_cpu,
+                        positive_radius=center_positive_radius,
+                        bucket_topk=crop_candidate_topk,
+                        weighted_sampling=True,
+                        allow_negative_centers=center_negative_ready,
+                    )
+                    bootstrap_centers_cpu = select_bootstrap_blind_centers(
+                        ligand_centers.detach().cpu(),
+                        center_guidance_logits_cpu,
+                        residue_pos_cpu,
+                        residue_batch_cpu,
+                        positive_radius=center_positive_radius,
+                        bucket_topk=crop_candidate_topk,
+                        allow_negative_centers=center_negative_ready,
+                    )
+                    proposal_top_scores_cpu = torch.full((num_graphs,), -1e9, dtype=center_guidance_logits_cpu.dtype)
+                    for graph_idx in range(num_graphs):
+                        graph_mask = residue_batch_cpu == graph_idx
+                        graph_logits = center_guidance_logits_cpu[graph_mask]
+                        if graph_logits.numel() > 0:
+                            proposal_top_scores_cpu[graph_idx] = graph_logits.max()
+                    crop_centers_cpu, crop_modes = select_training_crop_centers(
+                        ligand_centers.detach().cpu(),
+                        center_guidance_logits_cpu,
+                        residue_pos_cpu,
+                        residue_batch_cpu,
+                        progress=train_progress,
+                        positive_radius=center_positive_radius,
+                        bucket_topk=crop_candidate_topk,
+                        weighted_sampling=True,
+                        disable_jitter=disable_jitter_crop,
+                        disable_hard_negative=disable_hard_negative_crop,
+                        proposal_start=crop_proposal_start,
+                        near_miss_start=crop_near_miss_start,
+                        hard_negative_start=crop_hard_negative_start,
+                    )
+                    local_batch = build_local_batch_from_centers(
+                        source_batch,
+                        centers=crop_centers_cpu,
+                        crop_radius=float(crop_radius),
+                        crop_min_residues=crop_min_residues,
+                        crop_atom_margin=crop_atom_margin,
+                        graph_builder=graph_builder,
+                        collator=collator,
+                    )
+                    local_batch_samples = (
+                        local_batch.to_data_list()
+                        if hasattr(local_batch, "to_data_list")
+                        else [local_batch]
+                    )
+                    batch = local_batch.to(device)
+                    crop_centers = crop_centers_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
+                    wrong_center_valid = wrong_center_valid_cpu.to(device=device)
+                    wrong_center_scores = wrong_center_scores_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
+                    wrong_centers = wrong_centers_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
+                    bootstrap_centers = bootstrap_centers_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
+                    proposal_top_scores = proposal_top_scores_cpu.to(device=device, dtype=batch["ligand_atom"].pos.dtype)
+                    epoch_source_residues.append(
+                        float(source_batch["protein_residue"].pos.size(0)) / max(1, num_graphs)
+                    )
+                    epoch_local_residues.append(
+                        float(local_batch["protein_residue"].pos.size(0)) / max(1, num_graphs)
+                    )
+                    _annotate_loss_context(
+                        batch,
                         current_epoch=epoch,
-                        total_epochs=epochs,
-                        placement_centers=crop_centers,
+                        total_epochs_count=epochs,
+                        warmup_epochs_count=warmup_epochs,
+                        training=True,
                     )
 
-                batch["ligand_atom"].pos = x_t
-                batch.t = t
-
-                predictions = model(batch, t)
-
-                targets["binding_affinity_target"] = batch.get("y_energy", None)
-                targets["pose_quality_target"] = compute_pose_quality_target(
-                    x_t, x_1, batch_idx=batch["ligand_atom"].batch
-                )
-
-                loss_dict = criterion(predictions, targets, batch)
-                epoch_local_losses.append(float(loss_dict["total"].detach().item()))
-                energy_nan_this_batch = int(loss_dict.get("energy_nan_skipped", torch.tensor(0.0)).item())
-                epoch_energy_nan_skips += energy_nan_this_batch
-                if energy_nan_this_batch > 0:
-                    consecutive_energy_nan_skips += 1
-                    if consecutive_energy_nan_skips >= ENERGY_NAN_FAILFAST_LIMIT:
-                        raise RuntimeError(
-                            f"Energy head produced non-finite affinity values on "
-                            f"{consecutive_energy_nan_skips} consecutive batches "
-                            f"(epoch={epoch+1}, batch={batch_idx})."
+                    with torch.no_grad():
+                        x_1 = batch["ligand_atom"].pos
+                        t, x_t, targets = matcher.sample_location_and_target(
+                            x_1=x_1,
+                            data=batch,
+                            current_epoch=epoch,
+                            total_epochs=epochs,
+                            placement_centers=crop_centers,
                         )
-                else:
-                    consecutive_energy_nan_skips = 0
-                loss_pose_rank = torch.tensor(0.0, device=device)
-                if pose_ranking_pair_weight > 0.0:
-                    try:
-                        rank_terms: list[torch.Tensor] = []
-                        current_rank_logit = select_pose_ranking_logit(predictions)
-                        same_center_batch = batch.clone()
-                        with torch.no_grad():
-                            t_same = torch.clamp(
-                                t * (0.25 + 0.45 * torch.rand_like(t)),
-                                min=1e-3,
-                                max=1.0 - 1e-3,
+
+                    batch["ligand_atom"].pos = x_t
+                    batch.t = t
+
+                    predictions = model(batch, t)
+
+                    targets["binding_affinity_target"] = batch.get("y_energy", None)
+                    targets["pose_rank_target"] = compute_pose_rank_target(
+                        x_t,
+                        x_1,
+                        batch_idx=batch["ligand_atom"].batch,
+                        samples=local_batch_samples,
+                        dataset_raw_dir=dataset.raw_dir,
+                    )
+
+                    loss_dict = criterion(predictions, targets, batch)
+                    epoch_local_losses.append(float(loss_dict["total"].detach().item()))
+                    energy_nan_this_batch = int(loss_dict.get("energy_nan_skipped", torch.tensor(0.0)).item())
+                    epoch_energy_nan_skips += energy_nan_this_batch
+                    if energy_nan_this_batch > 0:
+                        consecutive_energy_nan_skips += 1
+                        if consecutive_energy_nan_skips >= ENERGY_NAN_FAILFAST_LIMIT:
+                            raise RuntimeError(
+                                f"Energy head produced non-finite affinity values on "
+                                f"{consecutive_energy_nan_skips} consecutive batches "
+                                f"(epoch={epoch+1}, batch={batch_idx})."
                             )
-                            _, x_t_same, _ = matcher.sample_location_and_target(
-                                x_1=x_1,
-                                data=same_center_batch,
-                                current_epoch=epoch,
-                                total_epochs=epochs,
-                                placement_centers=crop_centers,
-                                t_override=t_same,
+                    else:
+                        consecutive_energy_nan_skips = 0
+                    loss_pose_rank = torch.tensor(0.0, device=device)
+                    same_center_monitored_loss = torch.tensor(0.0, device=device)
+                    same_center_pair_count = 0
+                    same_center_ranking_active = (
+                        pose_ranking_pair_weight > 0.0
+                        and train_progress >= ranking_same_center_start
+                    )
+                    wrong_center_ranking_active = (
+                        same_center_ranking_active
+                        and train_progress >= ranking_wrong_center_start
+                    )
+                    if same_center_ranking_active:
+                        if not local_batch_samples:
+                            loss_dict["loss_pose_rank"] = loss_pose_rank.detach()
+                            loss_dict["rank_pairs_same_center"] = torch.tensor(0.0, device=device)
+                            loss_dict["rank_pairs_wrong_center"] = torch.tensor(0.0, device=device)
+                        else:
+                            rank_terms: list[torch.Tensor] = []
+                            current_rank_logit = select_pose_rank_logit(predictions)
+                            allow_wrong_center_branch = (
+                                wrong_center_ranking_active
+                                and ranking_budget_controller.current_budget > 0
+                                and bool(wrong_center_valid.any())
                             )
-                        same_center_batch["ligand_atom"].pos = x_t_same
-                        same_center_batch.t = t_same
-                        same_center_pred = model(same_center_batch, t_same)
-                        pose_quality_same = compute_pose_quality_target(
-                            x_t_same, x_1, batch_idx=batch["ligand_atom"].batch
+                            if allow_wrong_center_branch:
+                                try:
+                                    wrong_local_batch = build_local_batch_from_centers(
+                                        source_batch,
+                                        centers=wrong_centers_cpu,
+                                        crop_radius=float(crop_radius),
+                                        crop_min_residues=crop_min_residues,
+                                        crop_atom_margin=crop_atom_margin,
+                                        graph_builder=graph_builder,
+                                        collator=collator,
+                                    )
+                                    wrong_local_batch_samples = (
+                                        wrong_local_batch.to_data_list()
+                                        if hasattr(wrong_local_batch, "to_data_list")
+                                        else [wrong_local_batch]
+                                    )
+                                    wrong_local_batch = wrong_local_batch.to(device)
+                                    x_1_wrong = wrong_local_batch["ligand_atom"].pos
+                                    with torch.no_grad():
+                                        t_wrong = torch.clamp(
+                                            t * (0.65 + 0.25 * torch.rand_like(t)),
+                                            min=1e-3,
+                                            max=0.9,
+                                        )
+                                        _, x_t_wrong, _ = matcher.sample_location_and_target(
+                                            x_1=x_1_wrong,
+                                            data=wrong_local_batch,
+                                            current_epoch=epoch,
+                                            total_epochs=epochs,
+                                            placement_centers=wrong_centers,
+                                            t_override=t_wrong,
+                                        )
+                                    wrong_local_batch["ligand_atom"].pos = x_t_wrong
+                                    wrong_local_batch.t = t_wrong
+                                    wrong_pred = model(wrong_local_batch, t_wrong)
+                                    wrong_rank_logit = select_pose_rank_logit(wrong_pred)
+                                    pose_rank_wrong = compute_pose_rank_target(
+                                        x_t_wrong,
+                                        x_1_wrong,
+                                        batch_idx=wrong_local_batch["ligand_atom"].batch,
+                                        samples=wrong_local_batch_samples,
+                                        dataset_raw_dir=dataset.raw_dir,
+                                    )
+                                    anchor_clash = predictions.get("steric_clash_batch")
+                                    wrong_clash = wrong_pred.get("steric_clash_batch")
+                                    if anchor_clash is None:
+                                        anchor_clash = torch.zeros_like(t)
+                                    if wrong_clash is None:
+                                        wrong_clash = torch.zeros_like(t)
+                                    low_clash_mask = wrong_center_valid & (
+                                        wrong_clash.view(-1) <= (anchor_clash.view(-1) + 1.0)
+                                    )
+                                    loss_wrong, count_wrong = pairwise_ranking_loss_from_pairs(
+                                        current_rank_logit,
+                                        targets["pose_rank_target"],
+                                        wrong_rank_logit,
+                                        pose_rank_wrong,
+                                        margin=pose_ranking_margin,
+                                        extra_mask=low_clash_mask,
+                                    )
+                                    if count_wrong > 0:
+                                        rank_terms.append(loss_wrong)
+                                        epoch_rank_pair_counts["wrong_center_low_clash"] += count_wrong
+
+                                    misleading_center_mask = low_clash_mask & (
+                                        wrong_center_scores >= (proposal_top_scores - 0.25)
+                                    )
+                                    loss_center_hard, count_center_hard = pairwise_ranking_loss_from_pairs(
+                                        current_rank_logit,
+                                        targets["pose_rank_target"],
+                                        wrong_rank_logit,
+                                        pose_rank_wrong,
+                                        margin=pose_ranking_margin,
+                                        extra_mask=misleading_center_mask,
+                                    )
+                                    if count_center_hard > 0:
+                                        rank_terms.append(loss_center_hard)
+                                        epoch_rank_pair_counts["misleading_center"] += count_center_hard
+
+                                    anchor_aff = predictions.get("binding_affinity")
+                                    wrong_aff = wrong_pred.get("binding_affinity")
+                                    if anchor_aff is not None and wrong_aff is not None:
+                                        misleading_aff_mask = low_clash_mask & (
+                                            wrong_aff.view(-1) >= (anchor_aff.view(-1) - 0.25)
+                                        )
+                                        loss_aff_hard, count_aff_hard = pairwise_ranking_loss_from_pairs(
+                                            current_rank_logit,
+                                            targets["pose_rank_target"],
+                                            wrong_rank_logit,
+                                            pose_rank_wrong,
+                                            margin=pose_ranking_margin,
+                                            extra_mask=misleading_aff_mask,
+                                        )
+                                        if count_aff_hard > 0:
+                                            rank_terms.append(loss_aff_hard)
+                                            epoch_rank_pair_counts["misleading_affinity"] += count_aff_hard
+                                    del wrong_local_batch, x_1_wrong, t_wrong, x_t_wrong, wrong_pred, pose_rank_wrong
+                                except torch.cuda.OutOfMemoryError:
+                                    root_event_rank_oom = True
+                                    epoch_rank_oom_skips += 1
+                                    ranking_budget_controller.mark_offender(current_root_indices)
+                                    logger.warning(
+                                        "Batch %d: wrong-center ranking OOM, downgrading to same-center-only.",
+                                        batch_idx,
+                                    )
+                                    gc.collect()
+                                    if use_configured_cuda:
+                                        torch.cuda.empty_cache()
+
+                            if rank_terms:
+                                loss_pose_rank = torch.stack(rank_terms).mean()
+                            loss_dict["loss_pose_rank"] = loss_pose_rank.detach()
+                            loss_dict["rank_pairs_same_center"] = torch.tensor(0.0, device=device)
+                            loss_dict["rank_pairs_wrong_center"] = torch.tensor(
+                                epoch_rank_pair_counts["wrong_center_low_clash"], device=device
+                            )
+                            if use_configured_cuda:
+                                epoch_rank_peak_mem_mb = max(
+                                    epoch_rank_peak_mem_mb,
+                                    float(torch.cuda.max_memory_allocated(device=device) / (1024 ** 2)),
+                                )
+                            else:
+                                loss_dict["loss_pose_rank"] = loss_pose_rank.detach()
+                                loss_dict["rank_pairs_same_center"] = torch.tensor(0.0, device=device)
+                                loss_dict["rank_pairs_wrong_center"] = torch.tensor(0.0, device=device)
+
+                    loss_pose_bootstrap = torch.tensor(0.0, device=device)
+                    teacher_model = ema_model if ema_model is not None else model
+                    if pose_bootstrap_weight > 0.0 and should_run_bootstrap(
+                        epoch=epoch,
+                        batch_idx=batch_idx,
+                        total_epochs=epochs,
+                        frequency=pose_bootstrap_frequency,
+                        start_ratio=pose_bootstrap_start,
+                    ):
+                        loss_pose_bootstrap = compute_bootstrap_pose_rank_loss(
+                            student_model=model,
+                            teacher_model=teacher_model,
+                            matcher=matcher,
+                            source_batch=source_batch,
+                            placement_centers=bootstrap_centers,
+                            epoch=epoch,
+                            ode_steps=pose_bootstrap_ode_steps,
+                        ode_method=ode_method,
+                            graph_builder=graph_builder,
+                            collator=collator,
+                            crop_radius=float(crop_radius),
+                            crop_min_residues=crop_min_residues,
+                            crop_atom_margin=crop_atom_margin,
+                            dataset_raw_dir=dataset.raw_dir,
                         )
-                        same_center_rank_logit = select_pose_ranking_logit(same_center_pred)
-                        loss_same, count_same = pairwise_ranking_loss_from_pairs(
-                            current_rank_logit,
-                            targets["pose_quality_target"],
-                            same_center_rank_logit,
-                            pose_quality_same,
-                            margin=pose_ranking_margin,
+                        loss_dict["loss_pose_bootstrap"] = loss_pose_bootstrap.detach()
+
+                    loss_dict["loss_center_value"] = torch.tensor(0.0, device=device)
+                    loss_dict["weight_center_value"] = torch.tensor(center_proposal_weight, device=device)
+                    loss_dict["weight_pose_rank_pair"] = torch.tensor(pose_ranking_pair_weight, device=device)
+                    loss_dict["weight_pose_bootstrap"] = torch.tensor(pose_bootstrap_weight, device=device)
+                    loss = (
+                        loss_dict["total"]
+                        + pose_ranking_pair_weight * loss_pose_rank
+                        + pose_bootstrap_weight * loss_pose_bootstrap
+                    )
+
+                    if loss.grad_fn is None:
+                        logger.warning(f"Batch {batch_idx}: loss has no grad_fn, skipping.")
+                        continue
+
+                    if torch.isnan(loss) or loss > 200:
+                        logger.warning(f"{'NaN' if torch.isnan(loss) else 'Huge'} Loss on batch {batch_idx}, skipping.")
+                        for k, v in loss_dict.items():
+                            logger.warning(f"  {k}: {v}")
+                        _log_nonfinite_training_debug(
+                            reason="nonfinite_loss" if torch.isnan(loss) else "huge_loss",
+                            batch_idx=batch_idx,
+                            source_batch_obj=source_batch,
+                            local_batch_obj=batch,
+                            loss_items=loss_dict,
+                            combined_loss=loss,
                         )
-                        if count_same > 0:
-                            rank_terms.append(loss_same)
-                            epoch_rank_pair_counts["same_center"] += count_same
+                        continue
 
-                        if bool(wrong_center_valid.any()):
-                            wrong_local_batch = build_local_batch_from_centers(
-                                source_batch,
-                                centers=wrong_centers_cpu,
-                                crop_radius=float(crop_radius),
-                                crop_min_residues=crop_min_residues,
-                                crop_atom_margin=crop_atom_margin,
-                                graph_builder=graph_builder,
-                                collator=collator,
-                            ).to(device)
-                            x_1_wrong = wrong_local_batch["ligand_atom"].pos
-                            with torch.no_grad():
-                                t_wrong = torch.clamp(
-                                    t * (0.65 + 0.25 * torch.rand_like(t)),
-                                    min=1e-3,
-                                    max=0.9,
+                    loss_sum = loss * num_graphs
+                    loss_terms_for_debug = {
+                        "base_total": loss_dict["total"] * num_graphs,
+                        "base_trans": (
+                            loss_dict["weight_trans"] * loss_dict["_raw_loss_trans"] * num_graphs
+                        ),
+                        "base_rot": (
+                            loss_dict["weight_rot"] * loss_dict["_raw_loss_rot"] * num_graphs
+                        ),
+                        "base_torsion": (
+                            loss_dict["weight_torsion"] * loss_dict["_raw_loss_torsion"] * num_graphs
+                        ),
+                        "base_energy": (
+                            loss_dict["weight_energy"] * loss_dict["_raw_loss_energy"] * num_graphs
+                        ),
+                        "base_clash": (
+                            loss_dict["weight_clash"] * loss_dict["_raw_loss_clash"] * num_graphs
+                        ),
+                        "base_pose_rank_bce": (
+                            loss_dict["weight_pose_rank"] * loss_dict["_raw_loss_pose_rank_bce"] * num_graphs
+                        ),
+                        "pose_rank_pair": (
+                            pose_ranking_pair_weight * loss_pose_rank * num_graphs
+                            if pose_ranking_pair_weight > 0.0
+                            else None
+                        ),
+                        "pose_bootstrap": (
+                            pose_bootstrap_weight * loss_pose_bootstrap * num_graphs
+                            if pose_bootstrap_weight > 0.0
+                            else None
+                        ),
+                    }
+                    loss_sum.backward()
+                    if same_center_ranking_active and local_batch_samples:
+                        (
+                            same_center_monitored_loss,
+                            same_center_pair_count,
+                            same_center_had_oom,
+                            same_center_irreducible_oom,
+                        ) = _run_same_center_auxiliary_step(
+                            local_samples=local_batch_samples,
+                            placement_centers_cpu=crop_centers_cpu,
+                            root_indices=current_root_indices,
+                            batch_idx=batch_idx,
+                        )
+                        if same_center_pair_count > 0:
+                            epoch_rank_pair_counts["same_center"] += same_center_pair_count
+                        if same_center_had_oom:
+                            root_event_same_center_oom = True
+                            root_event_same_center_irreducible_oom = (
+                                root_event_same_center_irreducible_oom
+                                or same_center_irreducible_oom
+                            )
+                            if same_center_irreducible_oom:
+                                same_center_budget_controller.mark_offender(
+                                    current_root_indices,
+                                    severe=True,
                                 )
-                                _, x_t_wrong, _ = matcher.sample_location_and_target(
-                                    x_1=x_1_wrong,
-                                    data=wrong_local_batch,
-                                    current_epoch=epoch,
-                                    total_epochs=epochs,
-                                    placement_centers=wrong_centers,
-                                    t_override=t_wrong,
-                                )
-                            wrong_local_batch["ligand_atom"].pos = x_t_wrong
-                            wrong_local_batch.t = t_wrong
-                            wrong_pred = model(wrong_local_batch, t_wrong)
-                            wrong_rank_logit = select_pose_ranking_logit(wrong_pred)
-                            pose_quality_wrong = compute_pose_quality_target(
-                                x_t_wrong,
-                                x_1_wrong,
-                                batch_idx=wrong_local_batch["ligand_atom"].batch,
+                            epoch_rank_oom_skips += 1
+                            logger.warning(
+                                "Batch %d: same-center ranking OOM, falling back to smaller same-center micro-batches.",
+                                batch_idx,
                             )
-                            anchor_clash = predictions.get("steric_clash_batch")
-                            wrong_clash = wrong_pred.get("steric_clash_batch")
-                            if anchor_clash is None:
-                                anchor_clash = torch.zeros_like(t)
-                            if wrong_clash is None:
-                                wrong_clash = torch.zeros_like(t)
-                            low_clash_mask = wrong_center_valid & (
-                                wrong_clash.view(-1) <= (anchor_clash.view(-1) + 1.0)
+                        total_rank_display = loss_pose_rank.detach()
+                        if same_center_pair_count > 0:
+                            total_rank_display = total_rank_display + (
+                                same_center_monitored_loss / same_center_pair_count
                             )
-                            loss_wrong, count_wrong = pairwise_ranking_loss_from_pairs(
-                                current_rank_logit,
-                                targets["pose_quality_target"],
-                                wrong_rank_logit,
-                                pose_quality_wrong,
-                                margin=pose_ranking_margin,
-                                extra_mask=low_clash_mask,
-                            )
-                            if count_wrong > 0:
-                                rank_terms.append(loss_wrong)
-                                epoch_rank_pair_counts["wrong_center_low_clash"] += count_wrong
-
-                            misleading_center_mask = low_clash_mask & (
-                                wrong_center_scores >= (proposal_top_scores - 0.25)
-                            )
-                            loss_center_hard, count_center_hard = pairwise_ranking_loss_from_pairs(
-                                current_rank_logit,
-                                targets["pose_quality_target"],
-                                wrong_rank_logit,
-                                pose_quality_wrong,
-                                margin=pose_ranking_margin,
-                                extra_mask=misleading_center_mask,
-                            )
-                            if count_center_hard > 0:
-                                rank_terms.append(loss_center_hard)
-                                epoch_rank_pair_counts["misleading_center"] += count_center_hard
-
-                            anchor_aff = predictions.get("binding_affinity")
-                            wrong_aff = wrong_pred.get("binding_affinity")
-                            if anchor_aff is not None and wrong_aff is not None:
-                                misleading_aff_mask = low_clash_mask & (
-                                    wrong_aff.view(-1) >= (anchor_aff.view(-1) - 0.25)
-                                )
-                                loss_aff_hard, count_aff_hard = pairwise_ranking_loss_from_pairs(
-                                    current_rank_logit,
-                                    targets["pose_quality_target"],
-                                    wrong_rank_logit,
-                                    pose_quality_wrong,
-                                    margin=pose_ranking_margin,
-                                    extra_mask=misleading_aff_mask,
-                                )
-                                if count_aff_hard > 0:
-                                    rank_terms.append(loss_aff_hard)
-                                    epoch_rank_pair_counts["misleading_affinity"] += count_aff_hard
-
-                            del wrong_local_batch, x_1_wrong, t_wrong, x_t_wrong, wrong_pred, pose_quality_wrong
-
-                        if rank_terms:
-                            loss_pose_rank = torch.stack(rank_terms).mean()
-                        loss_dict["loss_pose_rank"] = loss_pose_rank.detach()
+                        loss_dict["loss_pose_rank"] = total_rank_display
                         loss_dict["rank_pairs_same_center"] = torch.tensor(
-                            epoch_rank_pair_counts["same_center"], device=device
+                            same_center_pair_count,
+                            device=device,
                         )
-                        loss_dict["rank_pairs_wrong_center"] = torch.tensor(
-                            epoch_rank_pair_counts["wrong_center_low_clash"], device=device
-                        )
-                        if torch.cuda.is_available():
+                        if use_configured_cuda:
                             epoch_rank_peak_mem_mb = max(
                                 epoch_rank_peak_mem_mb,
                                 float(torch.cuda.max_memory_allocated(device=device) / (1024 ** 2)),
                             )
-                        del same_center_batch, same_center_pred, pose_quality_same, t_same, x_t_same
-                    except torch.cuda.OutOfMemoryError:
-                        logger.warning(f"Batch {batch_idx}: ranking forward OOM, skipping pairwise loss.")
-                        loss_pose_rank = torch.tensor(0.0, device=device)
-                        epoch_rank_oom_skips += 1
-                        gc.collect()
+
+                except torch.cuda.OutOfMemoryError:
+                    root_event_had_oom = True
+                    optimizer.zero_grad(set_to_none=True)
+                    accumulated_graphs = 0
+                    accumulated_batches = 0
+                    gc.collect()
+                    if use_configured_cuda:
                         torch.cuda.empty_cache()
-
-                loss_pose_bootstrap = torch.tensor(0.0, device=device)
-                teacher_model = ema_model if ema_model is not None else model
-                if pose_bootstrap_weight > 0.0 and should_run_bootstrap(
-                    epoch=epoch,
-                    batch_idx=batch_idx,
-                    total_epochs=epochs,
-                    frequency=pose_bootstrap_frequency,
-                    start_ratio=0.30,
-                ):
-                    loss_pose_bootstrap = compute_bootstrap_pose_quality_loss(
-                        student_model=model,
-                        teacher_model=teacher_model,
-                        matcher=matcher,
-                        source_batch=source_batch,
-                        placement_centers=bootstrap_centers,
-                        epoch=epoch,
-                        ode_steps=pose_bootstrap_ode_steps,
-                        graph_builder=graph_builder,
-                        collator=collator,
-                        crop_radius=float(crop_radius),
-                        crop_min_residues=crop_min_residues,
-                        crop_atom_margin=crop_atom_margin,
+                    split_batches = (
+                        split_collated_batch(source_batch, collator=collator)
+                        if source_batch is not None and split_depth < max_oom_retry_splits
+                        else None
                     )
-                    loss_dict["loss_pose_bootstrap"] = loss_pose_bootstrap.detach()
+                    if split_batches is not None:
+                        logger.warning(
+                            f"Batch {batch_idx}: CUDA OOM, retrying with split depth {split_depth + 1}."
+                        )
+                        pending_batches = [
+                            (split_batches[0], split_depth + 1),
+                            (split_batches[1], split_depth + 1),
+                        ] + pending_batches
+                        continue
+                    root_event_irreducible_oom = True
+                    logger.warning(
+                        f"Batch {batch_idx}: irreducible CUDA OOM, skipping batch "
+                        f"(cost={batch_cost_units}, limit={runtime_train_cost_limit})."
+                    )
+                    continue
 
-                loss_dict["loss_center_value"] = torch.tensor(0.0, device=device)
-                loss_dict["weight_center_value"] = torch.tensor(center_proposal_weight, device=device)
-                loss_dict["weight_pose_rank"] = torch.tensor(pose_ranking_pair_weight, device=device)
-                loss_dict["weight_pose_bootstrap"] = torch.tensor(pose_bootstrap_weight, device=device)
-                loss = (
-                    loss_dict["total"]
-                    + pose_ranking_pair_weight * loss_pose_rank
-                    + pose_bootstrap_weight * loss_pose_bootstrap
+                actual_batches += 1
+                accumulated_graphs += num_graphs
+                accumulated_batches += 1
+
+                is_last_in_cycle = (
+                    accumulated_batches >= accumulation_steps and accumulated_graphs > 0
                 )
 
-                if loss.grad_fn is None:
-                    logger.warning(f"Batch {batch_idx}: loss has no grad_fn, skipping.")
-                    continue
+                if is_last_in_cycle:
+                    for param in model.parameters():
+                        if param.grad is not None:
+                            param.grad /= accumulated_graphs
 
-                if torch.isnan(loss) or loss > 200:
-                    logger.warning(f"{'NaN' if torch.isnan(loss) else 'Huge'} Loss on batch {batch_idx}, skipping.")
-                    for k, v in loss_dict.items():
-                        logger.warning(f"  {k}: {v}")
-                    continue
-
-                loss_sum = loss * num_graphs
-                loss_sum.backward()
-
-            except torch.cuda.OutOfMemoryError:
-                epoch_oom_batches += 1
-                total_oom_batches += 1
-                consecutive_oom += 1
-
-                optimizer.zero_grad(set_to_none=True)
-                accumulated_graphs = 0
-                batch = None
-                source_batch = None
-                local_batch = None
-                predictions = None
-                loss_dict = None
-                loss = None
-                loss_sum = None
-                targets = None
-                x_1 = None
-                x_t = None
-                t = None
-                ligand_centers = None
-                proposal_logits = None
-                residue_prior_feat = None
-                proposal_logits_cpu = None
-                center_guidance_logits_cpu = None
-                proposal_top_scores = None
-                proposal_top_scores_cpu = None
-                residue_pos_for_crop = None
-                residue_batch_for_crop = None
-                residue_prior_feat_cpu = None
-                residue_pos_cpu = None
-                residue_batch_cpu = None
-                crop_centers = None
-                crop_centers_cpu = None
-                wrong_centers = None
-                wrong_centers_cpu = None
-                wrong_center_scores = None
-                wrong_center_scores_cpu = None
-                wrong_center_valid = None
-                wrong_center_valid_cpu = None
-                bootstrap_centers = None
-                bootstrap_centers_cpu = None
-                gc.collect()
-                torch.cuda.empty_cache()
-
-                if consecutive_oom >= 3:
-                    torch.cuda.synchronize()
-                    torch.cuda.reset_peak_memory_stats()
-                    gc.collect()
-                    torch.cuda.empty_cache()
-
-                if consecutive_oom == 5:
-                    logger.warning(
-                        f"Batch {batch_idx}: {consecutive_oom} consecutive OOMs, "
-                        f"skipping model CPU roundtrip to avoid secondary OOM during restore."
-                    )
-
-                newly_blacklisted: list[str] = []
-                if batch_pdb_ids:
-                    for pid in batch_pdb_ids:
-                        count = oom_counts_by_pdb.get(pid, 0) + 1
-                        oom_counts_by_pdb[pid] = count
-                        if count >= OOM_BLACKLIST_THRESHOLD and pid not in oom_blacklisted_pdb_ids:
-                            oom_blacklisted_pdb_ids.add(pid)
-                            newly_blacklisted.append(pid)
-
-                if newly_blacklisted:
-                    consecutive_oom = 0
-                    logger.warning(
-                        f"Batch {batch_idx}: blacklisted {len(newly_blacklisted)} repeatedly OOM samples; "
-                        f"total blacklisted={len(oom_blacklisted_pdb_ids)}."
-                    )
-
-                if consecutive_oom >= CIRCUIT_BREAKER_LIMIT:
-                    logger.error(
-                        f"Epoch {epoch+1}: circuit breaker triggered after {consecutive_oom} "
-                        f"consecutive OOMs at batch {batch_idx}. Breaking out of epoch."
-                    )
-                    epoch_fused = True
-                    break
-
-                if consecutive_oom <= 2:
-                    logger.warning(
-                        f"Batch {batch_idx}: CUDA OOM, skipping and clearing cache "
-                        f"(batch_total_edges={total_edges_cpu}, edge_guard_limit={edge_guard_limit})."
-                    )
-                continue
-
-            consecutive_oom = 0
-            actual_batches += 1
-            accumulated_graphs += num_graphs
-            accumulated_batches += 1
-
-            is_last_in_cycle = accumulated_batches >= accumulation_steps and accumulated_graphs > 0
-
-            if is_last_in_cycle:
-                for param in model.parameters():
-
-                    if param.grad is not None:
-                        param.grad /= accumulated_graphs
-
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
-
-                if torch.isnan(grad_norm) or torch.isinf(grad_norm):
-                    logger.warning(f"Batch {batch_idx}: grad_norm={grad_norm:.4g}, skipping optimizer step.")
-
-                else:
-                    optimizer.step()
-                    if ema_model is None:
-                        ema_model = AveragedModel(
-                            model,
-                            avg_fn=lambda avg_p, p, _: ema_decay * avg_p + (1.0 - ema_decay) * p,
+                    preclip_nonfinite = _collect_nonfinite_grad_param_names()
+                    if preclip_nonfinite["count"] > 0:
+                        logger.warning(
+                            "Batch %d: detected non-finite gradients before clipping, skipping optimizer step.",
+                            batch_idx,
                         )
-                    ema_model.update_parameters(model)
-                    scheduler.step()
+                        _log_nonfinite_training_debug(
+                            reason="preclip_nonfinite_grad",
+                            batch_idx=batch_idx,
+                            source_batch_obj=source_batch,
+                            local_batch_obj=batch,
+                            loss_items=loss_dict,
+                            combined_loss=loss,
+                            branch_probe=_probe_loss_branch_gradients(loss_terms_for_debug),
+                        )
+                        optimizer.zero_grad()
+                        accumulated_graphs = 0
+                        accumulated_batches = 0
+                        train_loss_meter += loss.item()
+                        continue
 
-                optimizer.zero_grad()
-                accumulated_graphs = 0
-                accumulated_batches = 0
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
 
-            train_loss_meter += loss.item()
-            pbar.set_postfix(
-                {
-                    "Loss": f"{loss.item():.4f}",
-                    "L_tr": f"{loss_dict.get('loss_trans', torch.tensor(0)).item():.3f}",
-                    "L_rot": f"{loss_dict.get('loss_rot', torch.tensor(0)).item():.3f}",
-                    "L_tor": f"{loss_dict.get('loss_torsion', torch.tensor(0)).item():.3f}",
-                    "L_ene": f"{loss_dict.get('loss_energy', torch.tensor(0)).item():.3f}",
-                    "L_cls": f"{loss_dict.get('loss_clash', torch.tensor(0)).item():.3f}",
-                    "L_rank": f"{loss_dict.get('loss_pose_rank', torch.tensor(0)).item():.3f}",
-                    "LR": f"{scheduler.get_last_lr()[0]:.2e}",
-                }
+                    if torch.isnan(grad_norm) or torch.isinf(grad_norm):
+                        logger.warning(
+                            f"Batch {batch_idx}: grad_norm={grad_norm:.4g}, skipping optimizer step."
+                        )
+                        _log_nonfinite_training_debug(
+                            reason="nonfinite_grad_norm",
+                            batch_idx=batch_idx,
+                            source_batch_obj=source_batch,
+                            local_batch_obj=batch,
+                            loss_items=loss_dict,
+                            combined_loss=loss,
+                            grad_norm=grad_norm,
+                            branch_probe=_probe_loss_branch_gradients(loss_terms_for_debug),
+                        )
+                    else:
+                        optimizer.step()
+                        if ema_model is None:
+                            ema_model = AveragedModel(
+                                model,
+                                avg_fn=lambda avg_p, p, _: ema_decay * avg_p + (1.0 - ema_decay) * p,
+                            )
+                        ema_model.update_parameters(model)
+                        scheduler.step()
+
+                    optimizer.zero_grad()
+                    accumulated_graphs = 0
+                    accumulated_batches = 0
+
+                train_loss_meter += loss.item()
+                pbar.set_postfix(
+                    {
+                        "Loss": f"{loss.item():.4f}",
+                        "L_tr": f"{loss_dict.get('loss_trans', torch.tensor(0)).item():.3f}",
+                        "L_rot": f"{loss_dict.get('loss_rot', torch.tensor(0)).item():.3f}",
+                        "L_tor": f"{loss_dict.get('loss_torsion', torch.tensor(0)).item():.3f}",
+                        "L_ene": f"{loss_dict.get('loss_energy', torch.tensor(0)).item():.3f}",
+                        "L_cls": f"{loss_dict.get('loss_clash', torch.tensor(0)).item():.3f}",
+                        "L_rank": f"{loss_dict.get('loss_pose_rank', torch.tensor(0)).item():.3f}",
+                        "LR": f"{scheduler.get_last_lr()[0]:.2e}",
+                    }
+                )
+
+                del predictions, loss_dict, loss, loss_sum, targets, x_1, x_t, t, batch, source_batch
+                del proposal_logits, proposal_logits_cpu, proposal_top_scores, proposal_top_scores_cpu
+                del residue_pos_for_crop, residue_batch_for_crop, residue_pos_cpu, residue_batch_cpu
+                del crop_centers, crop_centers_cpu, crop_modes
+                del wrong_centers, wrong_centers_cpu, wrong_center_scores, wrong_center_scores_cpu
+                del wrong_center_valid, wrong_center_valid_cpu, bootstrap_centers, bootstrap_centers_cpu
+
+            train_adjustment = train_budget_controller.record_root_event(
+                root_indices=root_batch_indices,
+                had_oom=root_event_had_oom,
+                irreducible=root_event_irreducible_oom,
             )
-
-            del predictions, loss_dict, loss, loss_sum, targets, x_1, x_t, t, batch, source_batch
-            del proposal_logits, proposal_logits_cpu, proposal_top_scores, proposal_top_scores_cpu
-            del residue_pos_for_crop, residue_batch_for_crop, residue_pos_cpu, residue_batch_cpu
-            del crop_centers, crop_centers_cpu, crop_modes
-            del wrong_centers, wrong_centers_cpu, wrong_center_scores, wrong_center_scores_cpu
-            del wrong_center_valid, wrong_center_valid_cpu, bootstrap_centers, bootstrap_centers_cpu
+            if root_event_had_oom:
+                epoch_root_oom_events += 1
+                total_oom_batches += 1
+            _log_budget_adjustment(
+                train_adjustment,
+                budget_label="train_cost_budget",
+                rebuild_loader=True,
+            )
+            if pose_ranking_pair_weight > 0.0:
+                same_center_adjustment = same_center_budget_controller.record_root_event(
+                    root_indices=root_batch_indices,
+                    had_oom=root_event_same_center_oom,
+                    irreducible=root_event_same_center_irreducible_oom,
+                )
+                _log_budget_adjustment(
+                    same_center_adjustment,
+                    budget_label="same_center_micro_batch_size",
+                )
+                ranking_adjustment = ranking_budget_controller.record_root_event(
+                    root_indices=root_batch_indices,
+                    had_oom=root_event_rank_oom,
+                    irreducible=False,
+                )
+                _log_budget_adjustment(
+                    ranking_adjustment,
+                    budget_label="ranking_wrong_center_cap",
+                )
 
         if accumulated_graphs > 0:
             for param in model.parameters():
@@ -1476,7 +2326,7 @@ def train(
 
         pbar.close()
         gc.collect()
-        if torch.cuda.is_available():
+        if use_configured_cuda:
             torch.cuda.empty_cache()
         avg_train_loss = train_loss_meter / max(1, actual_batches)
         if epoch_local_losses:
@@ -1493,13 +2343,16 @@ def train(
             )
         logger.info(
             "Ranking stats | same_center=%d | wrong_center_low_clash=%d | misleading_center=%d | "
-            "misleading_affinity=%d | rank_oom_skips=%d | rank_peak_mem_mb=%.1f",
+            "misleading_affinity=%d | rank_oom_skips=%d | rank_peak_mem_mb=%.1f | "
+            "same_center_micro_batch=%d | wrong_center_cap=%d",
             epoch_rank_pair_counts["same_center"],
             epoch_rank_pair_counts["wrong_center_low_clash"],
             epoch_rank_pair_counts["misleading_center"],
             epoch_rank_pair_counts["misleading_affinity"],
             epoch_rank_oom_skips,
             epoch_rank_peak_mem_mb,
+            same_center_budget_controller.current_budget,
+            ranking_budget_controller.current_budget,
         )
         if epoch_energy_nan_skips > 0:
             logger.warning(
@@ -1507,203 +2360,140 @@ def train(
                 epoch_energy_nan_skips,
             )
 
-        if epoch_oom_batches > 0:
+        if epoch_root_oom_events > 0:
             logger.warning(
-                f"Epoch {epoch+1}: encountered {epoch_oom_batches} CUDA OOM batches "
-                f"(total OOM batches={total_oom_batches})"
-                + (" [circuit breaker triggered]" if epoch_fused else "")
-                + "."
+                "Epoch %d: encountered %d root CUDA OOM events (total root OOM events=%d).",
+                epoch + 1,
+                epoch_root_oom_events,
+                total_oom_batches,
+            )
+        if epoch_cooldown_skips > 0:
+            logger.warning(
+                "Epoch %d: skipped %d cooldown-isolated singleton batches.",
+                epoch + 1,
+                epoch_cooldown_skips,
             )
 
-        should_reduce = (
-            enable_oom_adaptive_batch
-            and (epoch_fused or epoch_oom_batches >= oom_reduce_threshold)
-            and current_train_max_nodes_per_batch > effective_min_train_nodes_per_batch
-        )
-        if should_reduce:
-            factor = min(oom_reduce_factor, 0.7) if epoch_fused else oom_reduce_factor
-            reduced_max_nodes = max(
-                int(current_train_max_nodes_per_batch * factor),
-                int(effective_min_train_nodes_per_batch),
-            )
-
-            if reduced_max_nodes < current_train_max_nodes_per_batch:
-                logger.warning(
-                    f"Epoch {epoch+1}: OOM threshold reached ({epoch_oom_batches}/{oom_reduce_threshold}). "
-                    f"Reducing train max_nodes_per_batch: {current_train_max_nodes_per_batch} -> {reduced_max_nodes}."
-                )
-                current_train_max_nodes_per_batch = reduced_max_nodes
-                train_loader, val_loader = _build_loaders(
-                    current_train_max_nodes_per_batch,
-                    current_val_max_nodes_per_batch,
-                )
-                logger.info("Rebuilt loaders with tighter node budget; keeping scheduler state continuous.")
-
-                try:
-                    total_val_batches = len(val_loader)
-
-                except ValueError:
-                    total_val_batches = max(1, len(val_set) // 4)
-                rmsd_check_batches = int(total_val_batches * rmsd_check_ratio)
-
-                if rmsd_check_ratio > 0 and rmsd_check_batches < 1:
-                    rmsd_check_batches = 1
-                logger.info(
-                    f"Updated validation sampling: {rmsd_check_batches}/{total_val_batches} batches for RMSD."
-                )
-                consecutive_clean_epochs = 0
-
-        if epoch_oom_batches == 0:
-            consecutive_clean_epochs += 1
-
-        else:
-            consecutive_clean_epochs = 0
-
-        if (
-            enable_oom_adaptive_batch
-            and consecutive_clean_epochs >= oom_recover_epochs
-            and current_train_max_nodes_per_batch < configured_train_max_nodes_per_batch
-        ):
-            recovered_max_nodes = min(
-                int(current_train_max_nodes_per_batch * oom_recover_factor),
-                int(configured_train_max_nodes_per_batch),
-            )
-            if recovered_max_nodes > current_train_max_nodes_per_batch:
-                logger.info(
-                    f"Epoch {epoch+1}: {consecutive_clean_epochs} consecutive clean epochs. "
-                    f"Recovering train max_nodes_per_batch: {current_train_max_nodes_per_batch} -> {recovered_max_nodes}."
-                )
-                current_train_max_nodes_per_batch = recovered_max_nodes
-                train_loader, val_loader = _build_loaders(
-                    current_train_max_nodes_per_batch,
-                    current_val_max_nodes_per_batch,
-                )
-                logger.info("Rebuilt loaders with recovered budget; keeping scheduler state continuous.")
-
-                try:
-                    total_val_batches = len(val_loader)
-
-                except ValueError:
-                    total_val_batches = max(1, len(val_set) // 4)
-                rmsd_check_batches = int(total_val_batches * rmsd_check_ratio)
-
-                if rmsd_check_ratio > 0 and rmsd_check_batches < 1:
-                    rmsd_check_batches = 1
-
-                consecutive_clean_epochs = 0
-
-        if torch.cuda.is_available():
+        if use_configured_cuda:
             torch.cuda.empty_cache()
 
         gc.collect()
-        if torch.cuda.is_available():
+        if use_configured_cuda:
             torch.cuda.empty_cache()
 
-        blind_eval = evaluate_topn_success(
+        val_plan = _resolve_validation_plan(epoch)
+        val_monitor_subset = val_plan["subset"]
+        is_full_val = bool(val_plan["is_full"])
+        active_val_controller = (
+            val_full_budget_controller
+            if is_full_val
+            else val_partial_budget_controller
+        )
+        active_val_budget = (
+            active_val_controller.current_budget
+        )
+        val_monitor_loader = _build_eval_loader(
+            val_monitor_subset,
+            active_val_budget,
+            phase_multiplier=float(val_plan["phase_multiplier"]),
+        )
+        logger.info(
+            "Starting validation for epoch %d/%d | mode=%s | trigger=%s | subset=%d/%d graphs (%.2f%%) | ode=%s.",
+            epoch + 1,
+            epochs,
+            val_plan["mode"],
+            val_plan["trigger"],
+            val_plan["subset_size"],
+            len(val_set),
+            100.0 * float(val_plan["subset_ratio"]),
+            val_plan["ode_method"],
+        )
+        val_metrics = cast(dict[str, float], compute_validation_loss(
             model=ema_model if ema_model is not None else model,
             matcher=matcher,
-            loader=val_loader,
+            criterion=criterion,
+            loader=val_monitor_loader,
             device=device,
+            epoch=epoch,
+            total_epochs=epochs,
+            max_rmsd_batches=None,
+            dataset=dataset,
+            warmup_epochs=warmup_epochs,
             graph_builder=graph_builder,
             collator=collator,
-            topk_values=test_topk_values,
-            num_pose_samples=max(test_pose_samples, max(test_topk_values)),
-            center_topk=center_proposal_topk,
-            refine_topk=center_refine_topk,
-            center_nms_radius=center_nms_radius,
-            stage1_pose_samples=stage1_pose_samples,
-            stage2_pose_samples=stage2_pose_samples,
             crop_radius=float(crop_radius),
-            ode_steps=val_ode_steps,
-            warmup_epochs=warmup_epochs,
-            edge_guard_limit=max(1, int(
-                current_val_max_nodes_per_batch * train_edge_budget_factor * 1.5
-            )),
-            center_hit_radius=center_positive_radius,
             crop_min_residues=crop_min_residues,
             crop_atom_margin=crop_atom_margin,
-            fusion_weights=current_fusion_weights,
-            return_candidate_records=True,
+            cost_guard_limit=max(1, int(active_val_budget)),
+            ode_steps=val_ode_steps,
+            ode_method=cast(str, val_plan["ode_method"]),
+            progress_desc=cast(str, val_plan["progress_desc"]),
+            num_gnn_blocks=num_gnn_blocks,
+            dynamic_inter_max_neighbors=dynamic_inter_max_neighbors,
+            dynamic_residue_max_neighbors=dynamic_residue_max_neighbors,
+            dynamic_residue_candidate_topk=dynamic_residue_candidate_topk,
+            phase_multiplier=float(val_plan["phase_multiplier"]),
+            max_oom_retry_splits=max_oom_retry_splits,
+        ))
+        logger.info(
+            "Finished validation for epoch %d/%d | mode=%s | subset=%d/%d graphs.",
+            epoch + 1,
+            epochs,
+            val_plan["mode"],
+            val_plan["subset_size"],
+            len(val_set),
         )
-        blind_candidate_records = cast(list[dict[str, Any]], blind_eval.get("candidate_records", []))
-        if enable_fusion_calibration and blind_candidate_records:
-            current_fusion_weights = calibrate_linear_fusion_weights(
-                blind_candidate_records,
-                topk_values=test_topk_values,
-                search_center_weights=fusion_search_center_weights,
-                search_aff_weights=fusion_search_aff_weights,
-                search_clash_weights=fusion_search_clash_weights,
-            )
-        blind_metrics = summarize_blind_candidate_records(
-            blind_candidate_records,
-            topk_values=test_topk_values,
-            fusion_weights=current_fusion_weights,
+        val_metrics["val_subset_size"] = float(val_plan["subset_size"])
+        val_metrics["val_subset_ratio"] = float(val_plan["subset_ratio"])
+        val_metrics["val_is_full"] = 1.0 if bool(val_plan["is_full"]) else 0.0
+        val_metrics["fusion_pose_weight"] = float(current_fusion_weights["pose_weight"])
+        val_metrics["fusion_center_weight"] = float(current_fusion_weights["center_weight"])
+        val_metrics["fusion_aff_weight"] = float(current_fusion_weights.get("aff_weight", 0.0))
+        val_metrics["fusion_clash_weight"] = float(current_fusion_weights.get("clash_weight", 0.0))
+        val_metrics["fusion_bias"] = float(current_fusion_weights["bias"])
+        epoch_seconds = max(time.perf_counter() - epoch_start_time, 1e-6)
+        runtime_benchmark_history.append(
+            {
+                "epoch": epoch + 1,
+                "train_loss": float(avg_train_loss),
+                "val_loss": float(val_metrics.get("val_loss", float("nan"))),
+                "mean_rmsd_final": float(val_metrics.get("mean_rmsd_final", float("inf"))),
+                "single_shot_success_2a": float(val_metrics.get("single_shot_success_2a", 0.0)),
+                "single_shot_success_5a": float(val_metrics.get("single_shot_success_5a", 0.0)),
+                "train_oom_batches": int(epoch_root_oom_events),
+                "val_oom_batches": int(val_metrics.get("oom_batches", 0.0)),
+                "cost_guard_skips": int(epoch_cost_guard_skips),
+                "epoch_seconds": float(epoch_seconds),
+                "graphs_per_second": float(len(train_set) / epoch_seconds),
+                "train_cost_budget": int(train_budget_controller.current_budget),
+                "val_cost_budget": int(active_val_budget),
+                "val_partial_cost_budget": int(val_partial_budget_controller.current_budget),
+                "val_full_cost_budget": int(val_full_budget_controller.current_budget),
+                "validation_mode": str(val_plan["mode"]),
+                "validation_trigger": str(val_plan["trigger"]),
+                "validation_ode_method": str(val_plan["ode_method"]),
+            }
         )
-        blind_metrics["topn_edge_guard_skips"] = float(blind_eval.get("topn_edge_guard_skips", 0.0))
-        blind_metrics["topn_pose_samples"] = float(blind_eval.get("topn_pose_samples", 0.0))
-        blind_metrics["fusion_pose_weight"] = float(current_fusion_weights["pose_weight"])
-        blind_metrics["fusion_center_weight"] = float(current_fusion_weights["center_weight"])
-        blind_metrics["fusion_aff_weight"] = float(current_fusion_weights.get("aff_weight", 0.0))
-        blind_metrics["fusion_clash_weight"] = float(current_fusion_weights.get("clash_weight", 0.0))
-        blind_metrics["fusion_bias"] = float(current_fusion_weights["bias"])
+        runtime_report_path = os.path.join(report_dir, "runtime_benchmark_history.json")
+        with open(runtime_report_path, "w", encoding="utf-8") as f:
+            json.dump(runtime_benchmark_history, f, ensure_ascii=False, indent=2)
 
         gc.collect()
-        if torch.cuda.is_available():
+        if use_configured_cuda:
             torch.cuda.empty_cache()
 
-        avg_val_loss_scalar = float(blind_metrics.get("reranked_top1_mean_best_rmsd", float("nan")))
-        mean_rmsd = float(blind_metrics.get("reranked_top1_mean_best_rmsd", float("inf")))
-        val_metrics = dict(blind_metrics)
-        val_metrics["val_loss"] = avg_val_loss_scalar
-        val_metrics["mean_rmsd_final"] = mean_rmsd
-
-        val_oom_batches = 0
-
-        if (
-            enable_val_oom_adaptive_batch
-            and val_oom_batches >= val_oom_reduce_threshold
-            and current_val_max_nodes_per_batch > effective_min_val_nodes_per_batch
-        ):
-            reduced_val_max_nodes = max(
-                int(current_val_max_nodes_per_batch * val_oom_reduce_factor),
-                int(effective_min_val_nodes_per_batch),
-            )
-            if reduced_val_max_nodes < current_val_max_nodes_per_batch:
-                logger.warning(
-                    f"Epoch {epoch+1}: validation OOM threshold reached ({val_oom_batches}/{val_oom_reduce_threshold}). "
-                    f"Reducing val max_nodes_per_batch: {current_val_max_nodes_per_batch} -> {reduced_val_max_nodes}."
-                )
-                current_val_max_nodes_per_batch = reduced_val_max_nodes
-                train_loader, val_loader = _build_loaders(
-                    current_train_max_nodes_per_batch,
-                    current_val_max_nodes_per_batch,
-                )
-
-        if val_oom_batches == 0:
-            consecutive_clean_val_epochs += 1
-        else:
-            consecutive_clean_val_epochs = 0
-
-        if (
-            enable_val_oom_adaptive_batch
-            and consecutive_clean_val_epochs >= oom_recover_epochs
-            and current_val_max_nodes_per_batch < configured_val_max_nodes_per_batch
-        ):
-            recovered_val_max_nodes = min(
-                int(current_val_max_nodes_per_batch * oom_recover_factor),
-                int(configured_val_max_nodes_per_batch),
-            )
-            if recovered_val_max_nodes > current_val_max_nodes_per_batch:
-                logger.info(
-                    f"Epoch {epoch+1}: {consecutive_clean_val_epochs} consecutive validation clean epochs. "
-                    f"Recovering val max_nodes_per_batch: {current_val_max_nodes_per_batch} -> {recovered_val_max_nodes}."
-                )
-                current_val_max_nodes_per_batch = recovered_val_max_nodes
-                train_loader, val_loader = _build_loaders(
-                    current_train_max_nodes_per_batch,
-                    current_val_max_nodes_per_batch,
-                )
-                consecutive_clean_val_epochs = 0
+        avg_val_loss_scalar = float(val_metrics.get("val_loss", float("nan")))
+        mean_rmsd = float(val_metrics.get("mean_rmsd_final", float("inf")))
+        val_oom_batches = int(val_metrics.get("oom_batches", 0.0))
+        val_adjustment = active_val_controller.record_root_event(
+            root_indices=[],
+            had_oom=val_oom_batches > 0,
+            irreducible=False,
+        )
+        _log_budget_adjustment(
+            val_adjustment,
+            budget_label="val_cost_budget",
+        )
 
         if not (math.isnan(avg_val_loss_scalar) or math.isinf(avg_val_loss_scalar)):
             best_val_loss = min(best_val_loss, avg_val_loss_scalar)
@@ -1711,29 +2501,26 @@ def train(
 
         logger.info(
             f"Epoch {epoch+1} | Train Loss: {avg_train_loss:.4f} | "
-            f"Blind TieBreak Loss: {avg_val_loss_scalar:.4f} | "
-            f"Val-Blind Top1 RMSD: {mean_rmsd:.4f} | "
-            f"Oracle@1<2A: {val_metrics.get('oracle_top1_success_2a', 0.0):.2f} | "
-            f"Rerank@1<2A: {val_metrics.get('reranked_top1_success_2a', 0.0):.2f} | "
-            f"CenterRecall@8: {val_metrics.get('center_recall@8', 0.0):.2f} | "
-            f"OOM batches: epoch={epoch_oom_batches}, total={total_oom_batches} | "
-            f"Edge-guard skips: {epoch_edge_guard_skips} | "
-            f"OOM-blacklisted samples: {len(oom_blacklisted_pdb_ids)}"
+            f"Val Loss: {avg_val_loss_scalar:.4f} | "
+            f"Val Mean RMSD: {mean_rmsd:.4f} | "
+            f"Single-shot Success@2A: {val_metrics.get('single_shot_success_2a', 0.0):.2f} | "
+            f"Single-shot Success@5A: {val_metrics.get('single_shot_success_5a', 0.0):.2f} | "
+            f"Val mode: {val_plan['mode']} | "
+            f"Val subset: {int(val_metrics.get('val_subset_size', 0.0))} ({100.0 * val_metrics.get('val_subset_ratio', 0.0):.2f}%) | "
+            f"Root OOM events: epoch={epoch_root_oom_events}, total={total_oom_batches} | "
+            f"Cost-guard skips: {epoch_cost_guard_skips} | "
+            f"Cooldown skips: {epoch_cooldown_skips} | "
+            f"Train budget: {train_budget_controller.current_budget}"
         )
 
         selection_metrics = build_selection_metrics(val_metrics)
         logger.info(
             "Checkpoint selection metrics | "
             f"Composite: {selection_metrics['composite_score']:.4f} | "
-            f"BlindCombo: {selection_metrics['blind_combo_score']:.4f} | "
-            f"Rerank@1<2A: {selection_metrics['success_2a']:.2f} | "
-            f"Rerank@5<2A: {selection_metrics['success_5a']:.2f} | "
-            f"Oracle@5<2A: {selection_metrics['oracle_top5_success_2a']:.2f} | "
-            f"CenterRecall@8: {selection_metrics['center_recall@8']:.2f} | "
-            f"ProposalGap: {selection_metrics['proposal_gap']:.2f} | "
-            f"RankingGap: {selection_metrics['ranking_gap']:.2f} | "
+            f"Single-shot Success@2A: {selection_metrics['single_shot_success_2a']:.2f} | "
+            f"Single-shot Success@5A: {selection_metrics['single_shot_success_5a']:.2f} | "
             f"Mean RMSD: {selection_metrics['mean_rmsd']:.4f} | "
-            f"TieBreak Loss: {selection_metrics['val_loss']:.4f}"
+            f"Val Loss: {selection_metrics['val_loss']:.4f}"
         )
         logger.info(
             "Checkpoint selection mode | mode=%s | primary=%s | value=%.4f",
@@ -1795,8 +2582,11 @@ def train(
             protein_residue_fallback_k=protein_residue_fallback_k,
             dynamic_inter_cutoff=dynamic_inter_cutoff,
             dynamic_inter_knn_k=dynamic_inter_knn_k,
+            dynamic_inter_max_neighbors=dynamic_inter_max_neighbors,
             dynamic_residue_cutoff=dynamic_residue_cutoff,
             dynamic_residue_knn_k=dynamic_residue_knn_k,
+            dynamic_residue_max_neighbors=dynamic_residue_max_neighbors,
+            dynamic_residue_candidate_topk=dynamic_residue_candidate_topk,
         )
 
         torch.save(checkpoint, os.path.join(save_dir, "latest_model.pt"))
@@ -1814,12 +2604,12 @@ def train(
                 torch.save(checkpoint, os.path.join(save_dir, "best_selected_model.pt"))
                 torch.save(checkpoint, os.path.join(save_dir, "best_model.pt"))
                 logger.info(
-                    "Saved best selected model | mode=%s | %s=%.4f | Rerank@1<2A=%.2f | Oracle@5<2A=%.2f",
+                    "Saved best selected model | mode=%s | %s=%.4f | Single-shot Success@2A=%.2f | Mean RMSD=%.4f",
                     checkpoint_selection_mode,
                     selected_metric_label,
                     selection_metrics[selected_primary_key],
-                    selection_metrics["success_2a"],
-                    selection_metrics["oracle_top5_success_2a"],
+                    selection_metrics["single_shot_success_2a"],
+                    selection_metrics["mean_rmsd"],
                 )
             if is_better_checkpoint(
                 selection_metrics,
@@ -1832,23 +2622,23 @@ def train(
                 logger.info(
                     "Saved best composite model | "
                     f"Composite={selection_metrics['composite_score']:.4f}, "
-                    f"Rerank@1<2A={selection_metrics['success_2a']:.2f}, "
-                    f"Rerank@5<2A={selection_metrics['success_5a']:.2f}, "
+                    f"Single-shot Success@2A={selection_metrics['single_shot_success_2a']:.2f}, "
+                    f"Single-shot Success@5A={selection_metrics['single_shot_success_5a']:.2f}, "
                     f"Mean RMSD={selection_metrics['mean_rmsd']:.4f}."
                 )
 
             if is_better_checkpoint(
                 selection_metrics,
-                best_success2a_metrics,
-                primary_key="success_2a",
+                best_single_shot_success2a_metrics,
+                primary_key="single_shot_success_2a",
                 primary_higher_is_better=True,
             ):
-                best_success2a_metrics = dict(selection_metrics)
-                torch.save(checkpoint, os.path.join(save_dir, "best_success2a_model.pt"))
+                best_single_shot_success2a_metrics = dict(selection_metrics)
+                torch.save(checkpoint, os.path.join(save_dir, "best_single_shot_success2a_model.pt"))
                 logger.info(
-                    "Saved best Success@2A model | "
-                    f"Rerank@1<2A={selection_metrics['success_2a']:.2f}, "
-                    f"Rerank@5<2A={selection_metrics['success_5a']:.2f}, "
+                    "Saved best single-shot Success@2A model | "
+                    f"Single-shot Success@2A={selection_metrics['single_shot_success_2a']:.2f}, "
+                    f"Single-shot Success@5A={selection_metrics['single_shot_success_5a']:.2f}, "
                     f"Mean RMSD={selection_metrics['mean_rmsd']:.4f}."
                 )
 
@@ -1872,10 +2662,15 @@ def train(
             refresh_every=blind_pool_refresh_every,
             min_start_epoch=blind_pool_start_epoch,
             best_updated_this_epoch=best_selected_updated_this_epoch,
+            refresh_on_best_update=blind_pool_refresh_on_best_update,
         ):
             logger.info("Refreshing blind candidate pool at epoch %d ...", epoch + 1)
             pool_model = ema_model if ema_model is not None else model
-            pool_loader = _build_eval_loader(train_set, configured_topn_max_nodes_per_batch)
+            pool_loader = _build_eval_loader(
+                train_set,
+                configured_blind_pool_cost_budget,
+                phase_multiplier=topn_phase_multiplier,
+            )
             try:
                 new_pool = refresh_blind_candidate_pool(
                     model=pool_model,
@@ -1891,15 +2686,29 @@ def train(
                     stage2_pose_samples=stage2_pose_samples,
                     crop_radius=float(crop_radius),
                     ode_steps=val_ode_steps,
+                    ode_method=ode_method,
                     warmup_epochs=warmup_epochs,
                     center_hit_radius=center_positive_radius,
                     crop_min_residues=crop_min_residues,
                     crop_atom_margin=crop_atom_margin,
                     max_complexes=blind_pool_max_complexes,
                     fusion_weights=current_fusion_weights,
-                    use_learned_center_scores=bool(cached_blind_pool),
+                    use_learned_center_scores=(
+                        epoch_progress >= center_guidance_learned_start
+                    ),
+                    cost_guard_limit=max(
+                        1,
+                        int(configured_blind_pool_cost_budget * eval_cost_guard_headroom),
+                    ),
+                    num_gnn_blocks=num_gnn_blocks,
+                    dynamic_inter_max_neighbors=dynamic_inter_max_neighbors,
+                    dynamic_residue_max_neighbors=dynamic_residue_max_neighbors,
+                    dynamic_residue_candidate_topk=dynamic_residue_candidate_topk,
+                    phase_multiplier=topn_phase_multiplier,
+                    max_oom_retry_splits=max_oom_retry_splits,
                     pool_epoch=epoch,
                     generator_ckpt_id=f"epoch_{epoch}",
+                    dataset_raw_dir=dataset.raw_dir,
                 )
                 if new_pool:
                     cached_blind_pool = new_pool
@@ -1912,6 +2721,7 @@ def train(
                             "stage1_pose_samples": stage1_pose_samples,
                             "stage2_pose_samples": stage2_pose_samples,
                             "ode_steps": val_ode_steps,
+                            "ode_method": ode_method,
                             "crop_radius": float(crop_radius),
                         },
                     )
@@ -1923,10 +2733,14 @@ def train(
             finally:
                 del pool_loader
                 gc.collect()
-                if torch.cuda.is_available():
+                if use_configured_cuda:
                     torch.cuda.empty_cache()
 
-        if cached_blind_pool and blind_pool_cache_rank_weight > 0:
+        if (
+            cached_blind_pool
+            and blind_pool_cache_rank_weight > 0
+            and epoch_progress >= replay_start_ratio
+        ):
             try:
                 import random as _rng
                 replay_dataset = BlindCandidateReplayDataset(
@@ -1956,7 +2770,9 @@ def train(
                         lambda_pair=blind_pool_cache_rank_weight,
                         lambda_list=0.5,
                         lambda_center_value=center_proposal_weight,
-                        use_pose_rank_head=True,
+                        micro_batch_size=replay_budget_controller.current_budget,
+                        max_candidates_per_complex=replay_max_candidates_per_complex,
+                        budget_controller=replay_budget_controller,
                     )
 
                     replay_total = replay_losses["rerank_total"]
@@ -1975,13 +2791,16 @@ def train(
 
                     logger.info(
                         "Replay reranker | bce=%.4f | pairwise=%.4f | listwise=%.4f | "
-                        "center_value=%.4f | n_pairs=%d | total=%.4f",
+                        "center_value=%.4f | n_pairs=%d | total=%.4f | micro_batch=%d | oom_events=%d | cooldown_skips=%d",
                         replay_losses["rerank_bce"].item(),
                         replay_losses["rerank_pairwise"].item(),
                         replay_losses["rerank_listwise"].item(),
                         center_val_loss.item(),
                         int(replay_losses["rerank_n_pairs"].item()),
                         combined_replay_loss.item(),
+                        replay_budget_controller.current_budget,
+                        int(replay_losses.get("replay_oom_events", torch.tensor(0.0, device=device)).item()),
+                        int(replay_losses.get("replay_cooldown_skips", torch.tensor(0.0, device=device)).item()),
                     )
                     model.eval()
 
@@ -1994,6 +2813,9 @@ def train(
         if len(test_set) == 0:
             logger.warning("Test set is empty; skipping final test evaluation.")
         else:
+            gc.collect()
+            if use_configured_cuda:
+                torch.cuda.empty_cache()
             preferred_ckpt_paths = [
                 os.path.join(save_dir, "best_selected_model.pt"),
                 os.path.join(save_dir, "best_composite_model.pt"),
@@ -2009,10 +2831,14 @@ def train(
                         logger.info(f"Loaded best checkpoint for final test evaluation: {best_ckpt_path}")
                         break
 
-            test_loader = _build_eval_loader(test_set, configured_test_max_nodes_per_batch)
-            topn_loader = _build_eval_loader(test_set, configured_topn_max_nodes_per_batch)
+            topn_loader = _build_eval_loader(
+                test_set,
+                configured_final_topn_cost_budget,
+                phase_multiplier=topn_phase_multiplier,
+            )
             test_metrics: dict[str, float] = {}
 
+            logger.info("Starting final blind Top-N test evaluation.")
             topn_eval = evaluate_topn_success(
                 model=model,
                 matcher=matcher,
@@ -2021,7 +2847,6 @@ def train(
                 graph_builder=graph_builder,
                 collator=collator,
                 topk_values=test_topk_values,
-                num_pose_samples=max(test_pose_samples, max(test_topk_values)),
                 center_topk=center_proposal_topk,
                 refine_topk=center_refine_topk,
                 center_nms_radius=center_nms_radius,
@@ -2029,16 +2854,26 @@ def train(
                 stage2_pose_samples=stage2_pose_samples,
                 crop_radius=float(crop_radius),
                 ode_steps=val_ode_steps,
+                ode_method=ode_method,
                 warmup_epochs=warmup_epochs,
-                edge_guard_limit=max(1, int(
-                    configured_topn_max_nodes_per_batch * train_edge_budget_factor * eval_edge_guard_headroom
+                cost_guard_limit=max(1, int(
+                    configured_final_topn_cost_budget * eval_cost_guard_headroom
                 )),
+                num_gnn_blocks=num_gnn_blocks,
+                dynamic_inter_max_neighbors=dynamic_inter_max_neighbors,
+                dynamic_residue_max_neighbors=dynamic_residue_max_neighbors,
+                dynamic_residue_candidate_topk=dynamic_residue_candidate_topk,
+                phase_multiplier=topn_phase_multiplier,
+                max_oom_retry_splits=max_oom_retry_splits,
                 center_hit_radius=center_positive_radius,
                 crop_min_residues=crop_min_residues,
                 crop_atom_margin=crop_atom_margin,
                 fusion_weights=current_fusion_weights,
                 return_candidate_records=True,
+                progress_desc="Final [Test-TopN]",
+                dataset_raw_dir=dataset.raw_dir,
             )
+            logger.info("Finished final blind Top-N test evaluation.")
             test_candidate_records = cast(list[dict[str, Any]], topn_eval.get("candidate_records", []))
             topn_metrics = summarize_blind_candidate_records(
                 test_candidate_records,
@@ -2050,9 +2885,9 @@ def train(
             topn_metrics["fusion_aff_weight"] = float(current_fusion_weights.get("aff_weight", 0.0))
             topn_metrics["fusion_clash_weight"] = float(current_fusion_weights.get("clash_weight", 0.0))
             topn_metrics["fusion_bias"] = float(current_fusion_weights["bias"])
-            topn_metrics["topn_edge_guard_skips"] = float(topn_eval.get("topn_edge_guard_skips", 0.0))
-            topn_metrics["topn_pose_samples"] = float(topn_eval.get("topn_pose_samples", 0.0))
-            topn_metrics["val_loss"] = float(topn_metrics.get("reranked_top1_mean_best_rmsd", float("nan")))
+            topn_metrics["topn_cost_guard_skips"] = float(topn_eval.get("topn_cost_guard_skips", 0.0))
+            topn_metrics["topn_oom_batches"] = float(topn_eval.get("topn_oom_batches", 0.0))
+            topn_metrics["topn_failed_batches"] = float(topn_eval.get("topn_failed_batches", 0.0))
             test_metrics.update(topn_metrics)
 
             report_dir = os.path.join(save_dir, "reports")
