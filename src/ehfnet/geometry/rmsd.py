@@ -13,7 +13,6 @@ from typing import Any
 
 import torch
 from rdkit import Chem
-from rdkit.Chem import rdMolAlign
 from rdkit.Geometry import Point3D
 from ehfnet.data.datasets.layout import ligand_path
 from ehfnet.data.datasets.ligand_sanitize import load_ligand_mol
@@ -96,13 +95,20 @@ def compute_symmetry_aware_rmsd(
     """
     计算考虑对称原子等价关系的 RMSD。
 
+    使用分子自身的自同构映射（automorphism）枚举所有对称等价原子排列，
+    对每种排列在不施加额外平移或旋转的前提下计算原始坐标 RMSD，
+    返回所有排列中的最小值。
+
+    此口径与 DiffDock 等对接论文保持一致：只允许对称原子重标记，
+    不允许全局叠合，确保评估结果反映真实的三维定位精度。
+
     Args:
-        current_pos: 当前构象坐标。
-        target_pos: 目标构象坐标。
-        ligand_file: 配体文件路径。
+        current_pos: 当前构象坐标，shape [N, 3]。
+        target_pos: 目标构象坐标，shape [N, 3]。
+        ligand_file: 配体文件路径，用于读取分子拓扑与对称信息。
 
     Returns:
-        float: RDKit `GetBestRMS` 计算得到的对称感知 RMSD。
+        float: 最优对称映射下的原始坐标 RMSD（Å）。
 
     Raises:
         ValueError: 当配体文件不可用或原子数不匹配时抛出。
@@ -112,9 +118,26 @@ def compute_symmetry_aware_rmsd(
         remove_hs=True,
         require_conformer=False,
     )
-    ref_mol = _clone_mol_with_positions(mol, target_pos)
-    pred_mol = _clone_mol_with_positions(mol, current_pos)
-    return float(rdMolAlign.GetBestRMS(pred_mol, ref_mol))
+    num_atoms = mol.GetNumAtoms()
+    if int(current_pos.size(0)) != num_atoms or int(target_pos.size(0)) != num_atoms:
+        raise ValueError(
+            f"Atom count mismatch for symmetry-aware RMSD: "
+            f"mol={num_atoms}, current={int(current_pos.size(0))}, target={int(target_pos.size(0))}."
+        )
+
+    # 枚举分子自同构（对称等价原子映射），不做额外平移/旋转
+    mappings = mol.GetSubstructMatches(mol, useChirality=False)
+    pred_cpu = current_pos.detach().cpu().to(dtype=torch.float64)
+    ref_cpu = target_pos.detach().cpu().to(dtype=torch.float64)
+
+    best_rmsd = float("inf")
+    for mapping in mappings:
+        reordered = pred_cpu[list(mapping)]
+        diff = reordered - ref_cpu
+        rmsd = float(torch.sqrt((diff ** 2).sum(dim=-1).mean()).item())
+        if rmsd < best_rmsd:
+            best_rmsd = rmsd
+    return best_rmsd
 
 
 def compute_batch_symmetry_aware_rmsd(

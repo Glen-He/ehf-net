@@ -10,7 +10,6 @@ import random
 from dataclasses import dataclass, field
 from typing import Any
 
-import torch
 from torch.utils.data import Sampler, Subset
 from torch_geometric.data import HeteroData
 

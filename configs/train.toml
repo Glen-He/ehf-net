@@ -51,10 +51,10 @@ split_cache_file = "cache/splits/hiqbind_scaffold_split.json"
 force_resplit = false
 
 [batching]
-train_cost_budget = 1300000
-val_cost_budget = 1300000
-blind_pool_cost_budget = 1600000
-final_topn_cost_budget = 1600000
+train_cost_budget = 1800000
+val_cost_budget = 1800000
+blind_pool_cost_budget = 1800000
+final_topn_cost_budget = 1800000
 eval_cost_guard_headroom = 1.5
 dataloader_num_workers = 4
 dataloader_pin_memory = true

@@ -257,6 +257,34 @@ _RESIDUE_ALIASES: dict[str, str] = {
 }
 
 
+def _normalize_residue_name(resname: str | None) -> str:
+    """
+    规范化残基三字母名称。
+
+    将原始残基名统一转为去空白、去数字后缀、全大写的三字母形式，
+    供蛋白编码与 ESM 序列构建共享同一套残基语义入口。
+
+    Args:
+        resname: 原始残基名称，可能来自 PDB 或解析库对象。
+
+    Returns:
+        str: 规范化后的残基名称；无法解析时返回 `UNK`。
+    """
+
+    if resname is None:
+        return "UNK"
+
+    normalized = str(resname).strip().upper()
+    if not normalized:
+        return "UNK"
+
+    normalized = "".join(ch for ch in normalized if ch.isalpha())
+    if not normalized:
+        return "UNK"
+
+    return normalized[:3]
+
+
 def resolve_protein_residue_type(resname: str | None) -> ResidueResolution:
     """
     解析蛋白残基类型。
@@ -293,7 +321,7 @@ def resolve_protein_residue_type(resname: str | None) -> ResidueResolution:
         residue_type=ResidueType.UNK,
         original_resname=normalized,
         normalized_resname="UNK",
-        source="fallback",
+        source="unknown",
     )
 
 

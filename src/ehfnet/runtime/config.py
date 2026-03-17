@@ -17,7 +17,7 @@ def flatten_config(
     config: Mapping[str, Any],
     *,
     prefix: str = "",
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """
     展开嵌套配置字典。
 
@@ -29,10 +29,10 @@ def flatten_config(
         prefix: 递归展开配置时附加在键名前的前缀。
 
     Returns:
-        dict[str, object]: 返回按点号路径展开后的单层配置字典。
+        dict[str, Any]: 返回按点号路径展开后的单层配置字典。
     """
 
-    flat: dict[str, object] = {}
+    flat: dict[str, Any] = {}
     for key, value in config.items():
         full_key = f"{prefix}{key}" if not prefix else f"{prefix}.{key}"
         if isinstance(value, Mapping):
@@ -42,7 +42,7 @@ def flatten_config(
     return flat
 
 
-def config_to_arg_defaults(config: Mapping[str, Any]) -> dict[str, object]:
+def config_to_arg_defaults(config: Mapping[str, Any]) -> dict[str, Any]:
     """
     转换 argparse 默认值映射。
 
@@ -53,11 +53,11 @@ def config_to_arg_defaults(config: Mapping[str, Any]) -> dict[str, object]:
         config: 待展开或转换的配置字典。
 
     Returns:
-        dict[str, object]: 返回可直接作为命令行默认值使用的键值映射。
+        dict[str, Any]: 返回可直接作为命令行默认值使用的键值映射。
     """
 
     flat = flatten_config(config)
-    defaults: dict[str, object] = {}
+    defaults: dict[str, Any] = {}
     for key, value in flat.items():
         defaults[key.split(".")[-1]] = value
     return defaults
@@ -67,7 +67,7 @@ def load_flattened_toml_config(
     config_path: str | Path | None,
     *,
     project_root: Path | None = None,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """
     读取并展开 TOML 配置。
 
@@ -79,7 +79,7 @@ def load_flattened_toml_config(
         project_root: 项目根目录路径。
 
     Returns:
-        dict[str, object]: 返回从 TOML 文件读取并拍平后的配置字典。
+        dict[str, Any]: 返回从 TOML 文件读取并拍平后的配置字典。
     """
 
     if config_path is None:
@@ -100,7 +100,7 @@ def load_train_defaults(
     *,
     config_path: str | Path | None,
     project_root: Path,
-) -> dict[str, object]:
+) -> dict[str, Any]:
     """
     加载训练默认配置。
 
@@ -112,7 +112,7 @@ def load_train_defaults(
         project_root: 项目根目录路径。
 
     Returns:
-        dict[str, object]: 返回合并训练配置与模型配置后的默认参数字典。
+        dict[str, Any]: 返回合并训练配置与模型配置后的默认参数字典。
     """
 
     defaults = load_flattened_toml_config(

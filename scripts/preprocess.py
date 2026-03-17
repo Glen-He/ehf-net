@@ -97,8 +97,8 @@ def _configure_logging(command: str, *, smoke: bool) -> str:
     """
 
     log_file, _ = configure_text_logging(
-        category="preprocess",
-        file_stem=f"preprocess_{command}",
+        category=f"preprocess/{command}",
+        file_stem=command,
         smoke=smoke,
     )
     logger.info("Logging to %s", log_file)
@@ -277,12 +277,12 @@ def cmd_stats(args: argparse.Namespace) -> None:
     index_file = str(data_root / "index.csv")
     output_file = args.output or str(data_root / "dataset_profile.json")
 
+    stats_dataset_kwargs = {**args.dataset_build_kwargs, "esm": "off"}
     dataset = build_dataset(
         root=str(data_root),
         index_file=index_file,
         esm_root=None,
-        esm="off",
-        **args.dataset_build_kwargs,
+        **stats_dataset_kwargs,
     )
     processed_dir = Path(dataset.processed_dir)
     if not processed_dir.exists():

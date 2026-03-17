@@ -16,21 +16,64 @@ from rdkit.Chem import AllChem
 from ehfnet.data.datasets.ligand_sanitize import load_ligand_mol
 
 
-def remove_all_hs_safe(mol: Chem.Mol) -> Chem.Mol:
+def _embed_molecule(mol: Chem.Mol, *, random_seed: int) -> int:
     """
-    安全移除分子中的氢原子。
+    带降级策略的 ETKDG 三维坐标嵌入。
 
-    先执行 RDKit 的标准去氢流程，再移除剩余显式氢，
-    为后续生成仅含重原子的初始坐标提供稳定分子对象。
+    对稠环、多手性中心等困难分子，``enforceChirality=True`` 常因约束冲突导致嵌入失败。
+    依次尝试以下策略，返回第一个成功时的状态码（0 表示成功，-1 表示失败）：
+
+    1. ``enforceChirality=True``：优先保留立体信息；
+    2. ``enforceChirality=False``：放宽手性约束，覆盖稠环多手性中心分子；
+    3. 不同随机种子 × ``enforceChirality=False``：应对极端困难分子。
 
     Args:
-        mol: 待读取或处理的 RDKit 分子对象。
+        mol: 已添加氢、已移除构象的 RDKit 分子对象（原地修改）。
+        random_seed: 基准随机种子。
 
     Returns:
-        Chem.Mol: 返回移除氢原子后的 RDKit 分子对象。
+        int: 最终嵌入状态码；0 表示成功，-1 表示所有策略均失败。
     """
-    mol_no_h = Chem.RemoveHs(mol, sanitize=True)
-    return AllChem.RemoveAllHs(mol_no_h)
+    base_params = AllChem.ETKDGv3()
+    base_params.randomSeed = int(random_seed)
+    base_params.useRandomCoords = True
+
+    # 策略一：严格立体约束
+    base_params.enforceChirality = True
+    if AllChem.EmbedMolecule(mol, base_params) == 0:
+        return 0
+
+    # 策略二：放宽手性约束（覆盖稠环多手性中心分子）
+    base_params.enforceChirality = False
+    if AllChem.EmbedMolecule(mol, base_params) == 0:
+        return 0
+
+    # 策略三：换种子重试（应对极端困难构型）
+    for offset in (1, 2, 3):
+        base_params.randomSeed = int(random_seed) + offset
+        if AllChem.EmbedMolecule(mol, base_params) == 0:
+            return 0
+
+    return -1
+
+
+def remove_hs_consistent(mol: Chem.Mol) -> Chem.Mol:
+    """
+    与预处理管线一致地移除氢原子。
+
+    使用 ``Chem.RemoveHs(sanitize=False)`` 保守策略，与 ``load_ligand_mol(remove_hs=True)``
+    保持相同的去氢行为：保留立体氢、极性氢等特殊显式氢，
+    确保生成的重原子集合与图缓存中 ``ligand_atom.pos`` 的原子数严格一致。
+
+    Args:
+        mol: 待处理的 RDKit 分子对象（通常为 ETKDG 嵌入后含氢的构象）。
+
+    Returns:
+        Chem.Mol: 返回移除普通氢后、属性缓存已更新的分子对象。
+    """
+    mol_no_h = Chem.RemoveHs(mol, sanitize=False)
+    mol_no_h.UpdatePropertyCache(strict=False)
+    return mol_no_h
 
 
 def get_positions(mol: Chem.Mol) -> np.ndarray:
@@ -79,12 +122,7 @@ def generate_decoupled_ligand_positions(
     start_mol.RemoveAllConformers()
     start_mol = AllChem.AddHs(start_mol, addCoords=True)
 
-    params = AllChem.ETKDGv3()
-    params.randomSeed = int(random_seed)
-    params.useRandomCoords = True
-    params.enforceChirality = True
-
-    status = AllChem.EmbedMolecule(start_mol, params)
+    status = _embed_molecule(start_mol, random_seed=random_seed)
     if status != 0:
         raise ValueError(f"RDKit ETKDG embedding failed for ligand: {ligand_path}")
 
@@ -97,7 +135,7 @@ def generate_decoupled_ligand_positions(
             pass
 
     if remove_hs:
-        start_mol = remove_all_hs_safe(start_mol)
+        start_mol = remove_hs_consistent(start_mol)
 
     return get_positions(start_mol).astype(np.float32, copy=False)
 

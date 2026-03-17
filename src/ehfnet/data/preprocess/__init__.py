@@ -5,6 +5,14 @@
 统一预处理侧公开组件的访问方式。
 """
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ehfnet.data.preprocess.build_graph_sample import get_esm_model, prepare_graph_sample
+    from ehfnet.data.preprocess.context_repair import ensure_context_features
+    from ehfnet.data.preprocess.hf_runtime import configure_hf_cache_env, resolve_esm_device
+    from ehfnet.data.preprocess.metadata import extract_ligand_sanitize_metadata, normalize_ligand_sanitize_mode
+
 
 __all__ = [
     "configure_hf_cache_env",

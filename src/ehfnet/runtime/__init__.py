@@ -7,6 +7,24 @@
 
 
 from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ehfnet.runtime.factories import (
+        build_dataset,
+        build_dataset_from_model_config,
+        build_model,
+        build_model_from_config,
+    )
+    from ehfnet.runtime.logging import build_run_suffix, configure_text_logging
+    from ehfnet.runtime.config import (
+        flatten_config,
+        get_configured_device,
+        get_configured_smoke,
+        load_flattened_toml_config,
+        load_train_defaults,
+        resolve_interaction_profile,
+    )
 
 __all__ = [
     "build_run_suffix",

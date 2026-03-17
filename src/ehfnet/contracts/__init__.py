@@ -7,6 +7,23 @@
 
 
 from importlib import import_module
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ehfnet.contracts.blind_pool import BLIND_POOL_SCHEMA_TAG, build_blind_pool_signature
+    from ehfnet.contracts.cache import (
+        ESM_CACHE_VERSION_TAG,
+        GRAPH_CACHE_DIRNAME,
+        GRAPH_CACHE_SCHEMA_TAG,
+        PREPROCESS_METADATA_DIRNAME,
+        PREPROCESS_SUMMARY_FILENAME,
+    )
+    from ehfnet.contracts.checkpoint import (
+        CHECKPOINT_FEATURE_SCHEMA_TAG,
+        build_feature_signature,
+        build_model_config,
+        validate_checkpoint_contract,
+    )
 
 __all__ = [
     "BLIND_POOL_SCHEMA_TAG",

@@ -20,6 +20,7 @@ outputs/
 checkpoints/
 nohup.out
 .hf-cache/
+docs/
 
 # 系统临时文件
 .DS_Store

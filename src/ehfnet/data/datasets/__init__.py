@@ -5,6 +5,19 @@
 统一上层调用这些数据组件的导入方式。
 """
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ehfnet.data.datasets.ligand_sanitize import (
+        LigandSanitizationError,
+        load_ligand_mol,
+        read_ligand_file,
+        sanitize_ligand_mol_with_mode,
+    )
+    from ehfnet.data.datasets.pose_initialization import generate_decoupled_ligand_positions
+    from ehfnet.data.datasets.protein_ligand import ProteinLigandDataset
+    from ehfnet.data.datasets.splitter import ScaffoldSplitter
+
 
 __all__ = [
     "LigandSanitizationError",

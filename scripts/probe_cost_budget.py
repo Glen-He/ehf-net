@@ -22,10 +22,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.append(str(PROJECT_ROOT / "src"))
 
-from ehfnet.data.datasets import ScaffoldSplitter
-from ehfnet.graph import estimate_graph_cost_units
-from ehfnet.runtime import build_dataset, load_train_defaults, resolve_interaction_profile
-from ehfnet.training.adaptive_batching import (
+from ehfnet.data.datasets import ScaffoldSplitter  # noqa: E402
+from ehfnet.graph import estimate_graph_cost_units  # noqa: E402
+from ehfnet.runtime import build_dataset, load_train_defaults, resolve_interaction_profile  # noqa: E402
+from ehfnet.training.adaptive_batching import (  # noqa: E402
     AdaptiveCostBatchSampler,
     resolve_subset_root_indices,
 )

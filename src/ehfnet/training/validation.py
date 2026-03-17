@@ -101,6 +101,10 @@ def compute_validation_loss(
     """
     model.eval()
     use_configured_cuda = device.type == "cuda"
+
+    if use_configured_cuda:
+        torch.cuda.empty_cache()
+
     total_loss = 0.0
     all_rmsd_init: list[torch.Tensor] = []
     all_rmsd_final: list[torch.Tensor] = []
@@ -125,11 +129,12 @@ def compute_validation_loss(
         raise ValueError("graph_builder and collator are required for runtime local cropping.")
 
     for i, batch in enumerate(loader):
-        num_graphs = int(batch["ligand_atom"].batch.max().item()) + 1
-        pbar.update(num_graphs)
+        orig_num_graphs = int(batch["ligand_atom"].batch.max().item()) + 1
+        pbar.update(orig_num_graphs)
         pending_batches: list[tuple[HeteroData, int]] = [(batch, 0)]
         while pending_batches:
             batch, split_depth = pending_batches.pop(0)
+            num_graphs = int(batch["ligand_atom"].batch.max().item()) + 1
             batch_samples = (
                 batch.to_data_list() if hasattr(batch, "to_data_list") else [batch]
             )
@@ -162,67 +167,79 @@ def compute_validation_loss(
                 )
                 continue
 
+            ligand_centers = None
+            local_batch = None
+            crop_centers = None
+            x_1 = None
+            x_t = None
+            t = None
+            targets = None
+            predictions = None
+            loss_dict = None
+            loss = None
+
             try:
                 if use_configured_cuda:
                     torch.cuda.reset_peak_memory_stats(device=device)
-                ligand_centers = scatter_mean(
-                    batch["ligand_atom"].pos,
-                    batch["ligand_atom"].batch,
-                    dim=0,
-                    dim_size=num_graphs,
-                )
-                local_batch = build_local_batch_from_centers(
-                    batch,
-                    centers=ligand_centers,
-                    crop_radius=crop_radius,
-                    crop_min_residues=crop_min_residues,
-                    crop_atom_margin=crop_atom_margin,
-                    graph_builder=graph_builder,
-                    collator=collator,
-                )
-                batch = local_batch.to(device)
-                local_batch_samples = (
-                    local_batch.to_data_list()
-                    if hasattr(local_batch, "to_data_list")
-                    else [local_batch]
-                )
-                crop_centers = ligand_centers.to(
-                    device=device,
-                    dtype=batch["ligand_atom"].pos.dtype,
-                )
-                apply_loss_context(
-                    batch,
-                    current_epoch=epoch if epoch is not None else total_epochs - 1,
-                    total_epochs_count=total_epochs,
-                    warmup_epochs_count=warmup_epochs,
-                    training=False,
-                )
-                x_1 = batch["ligand_atom"].pos
+                with torch.no_grad():
+                    ligand_centers = scatter_mean(
+                        batch["ligand_atom"].pos,
+                        batch["ligand_atom"].batch,
+                        dim=0,
+                        dim_size=num_graphs,
+                    )
+                    local_batch = build_local_batch_from_centers(
+                        batch,
+                        centers=ligand_centers,
+                        crop_radius=crop_radius,
+                        crop_min_residues=crop_min_residues,
+                        crop_atom_margin=crop_atom_margin,
+                        graph_builder=graph_builder,
+                        collator=collator,
+                    )
+                    batch = local_batch.to(device)
+                    local_batch_samples = (
+                        local_batch.to_data_list()
+                        if hasattr(local_batch, "to_data_list")
+                        else [local_batch]
+                    )
+                    crop_centers = ligand_centers.to(
+                        device=device,
+                        dtype=batch["ligand_atom"].pos.dtype,
+                    )
+                    apply_loss_context(
+                        batch,
+                        current_epoch=epoch if epoch is not None else total_epochs - 1,
+                        total_epochs_count=total_epochs,
+                        warmup_epochs_count=warmup_epochs,
+                        training=False,
+                    )
+                    x_1 = batch["ligand_atom"].pos
 
-                t, x_t, targets = matcher.sample_location_and_target(
-                    x_1=x_1,
-                    data=batch,
-                    current_epoch=epoch if epoch is not None else 0,
-                    total_epochs=total_epochs,
-                    placement_centers=crop_centers,
-                )
+                    t, x_t, targets = matcher.sample_location_and_target(
+                        x_1=x_1,
+                        data=batch,
+                        current_epoch=epoch if epoch is not None else 0,
+                        total_epochs=total_epochs,
+                        placement_centers=crop_centers,
+                    )
 
-                batch["ligand_atom"].pos = x_t
-                batch.t = t
+                    batch["ligand_atom"].pos = x_t
+                    batch.t = t
 
-                predictions = model(batch, t)
+                    predictions = model(batch, t)
 
-                targets["binding_affinity_target"] = batch.get("y_energy", None)
-                targets["pose_rank_target"] = compute_pose_rank_target(
-                    x_t,
-                    x_1,
-                    batch_idx=batch["ligand_atom"].batch,
-                    samples=local_batch_samples,
-                    dataset_raw_dir=dataset.raw_dir,
-                )
+                    targets["binding_affinity_target"] = batch.get("y_energy", None)
+                    targets["pose_rank_target"] = compute_pose_rank_target(
+                        x_t,
+                        x_1,
+                        batch_idx=batch["ligand_atom"].batch,
+                        samples=local_batch_samples,
+                        dataset_raw_dir=dataset.raw_dir,
+                    )
 
-                loss_dict = criterion(predictions, targets, batch)
-                loss = loss_dict["total"]
+                    loss_dict = criterion(predictions, targets, batch)
+                    loss = loss_dict["total"]
 
                 if not torch.isnan(loss) and not torch.isinf(loss) and loss.item() < 1e6:
                     total_loss += loss.item()
@@ -256,101 +273,107 @@ def compute_validation_loss(
 
                 if max_rmsd_batches is None or i < max_rmsd_batches:
                     try:
-                        infer_batch = batch.clone()
-                        infer_batch["ligand_atom"].pos = x_1
+                        with torch.no_grad():
+                            infer_batch = batch.clone()
+                            infer_batch["ligand_atom"].pos = x_1
 
-                        x_0_infer = matcher._generate_random_pose(
-                            x_ref=x_1,
-                            batch=infer_batch["ligand_atom"].batch,
-                            B=int(infer_batch["ligand_atom"].batch.max().item()) + 1,
-                            masses=infer_batch["ligand_atom"].masses,
-                            torsion_indices=getattr(
-                                infer_batch,
-                                "torsion_indices",
-                                None,
-                            ),
-                            torsion_moving_mask=getattr(
-                                infer_batch,
-                                "torsion_moving_mask",
-                                None,
-                            ),
-                            seed_pos=infer_batch["ligand_atom"].get(
-                                "start_pos",
-                                None,
-                            ),
-                            protein_pos=infer_batch["protein_atom"].pos,
-                            protein_batch=getattr(
-                                infer_batch["protein_atom"],
-                                "batch",
-                                None,
-                            ),
-                            placement_centers=crop_centers,
-                            epoch=warmup_epochs,
-                        )
+                            x_0_infer = matcher._generate_random_pose(
+                                x_ref=x_1,
+                                batch=infer_batch["ligand_atom"].batch,
+                                B=int(infer_batch["ligand_atom"].batch.max().item()) + 1,
+                                masses=infer_batch["ligand_atom"].masses,
+                                torsion_indices=getattr(
+                                    infer_batch,
+                                    "torsion_indices",
+                                    None,
+                                ),
+                                torsion_moving_mask=getattr(
+                                    infer_batch,
+                                    "torsion_moving_mask",
+                                    None,
+                                ),
+                                seed_pos=infer_batch["ligand_atom"].get(
+                                    "start_pos",
+                                    None,
+                                ),
+                                protein_pos=infer_batch["protein_atom"].pos,
+                                protein_batch=getattr(
+                                    infer_batch["protein_atom"],
+                                    "batch",
+                                    None,
+                                ),
+                                placement_centers=crop_centers,
+                                epoch=warmup_epochs,
+                            )
 
-                        all_rmsd_init.append(
-                            torch.sqrt(
-                                scatter_mean(
-                                    ((x_0_infer - x_1) ** 2).sum(dim=-1),
-                                    infer_batch["ligand_atom"].batch,
-                                    dim=0,
-                                )
-                            ).detach().cpu()
-                        )
+                            all_rmsd_init.append(
+                                torch.sqrt(
+                                    scatter_mean(
+                                        ((x_0_infer - x_1) ** 2).sum(dim=-1),
+                                        infer_batch["ligand_atom"].batch,
+                                        dim=0,
+                                    )
+                                ).detach().cpu()
+                            )
 
-                        infer_batch["ligand_atom"].pos = x_0_infer
-                        final_pos, _ = matcher.ode_solve(
-                            model=model,
-                            data=infer_batch,
-                            steps=ode_steps,
-                            method=ode_method,
-                            store_trajectory=False,
-                        )
+                            infer_batch["ligand_atom"].pos = x_0_infer
+                            final_pos, _ = matcher.ode_solve(
+                                model=model,
+                                data=infer_batch,
+                                steps=ode_steps,
+                                method=ode_method,
+                                store_trajectory=False,
+                            )
 
-                        all_rmsd_final.append(
-                            compute_batch_symmetry_aware_rmsd(
-                                current_pos=final_pos,
-                                target_pos=x_1,
-                                batch_idx=infer_batch["ligand_atom"].batch,
-                                samples=local_batch_samples,
-                                dataset_raw_dir=dataset.raw_dir,
-                            ).detach().cpu()
-                        )
+                            all_rmsd_final.append(
+                                compute_batch_symmetry_aware_rmsd(
+                                    current_pos=final_pos,
+                                    target_pos=x_1,
+                                    batch_idx=infer_batch["ligand_atom"].batch,
+                                    samples=local_batch_samples,
+                                    dataset_raw_dir=dataset.raw_dir,
+                                ).detach().cpu()
+                            )
 
-                        B_infer = int(infer_batch["ligand_atom"].batch.max().item()) + 1
-                        pred_centroid = scatter_mean(
-                            final_pos,
-                            infer_batch["ligand_atom"].batch,
-                            dim=0,
-                            dim_size=B_infer,
-                        )
-                        true_centroid = scatter_mean(
-                            x_1,
-                            infer_batch["ligand_atom"].batch,
-                            dim=0,
-                            dim_size=B_infer,
-                        )
-                        all_centroid_dist.append(
-                            torch.norm(pred_centroid - true_centroid, dim=-1).detach().cpu()
-                        )
+                            B_infer = int(infer_batch["ligand_atom"].batch.max().item()) + 1
+                            pred_centroid = scatter_mean(
+                                final_pos,
+                                infer_batch["ligand_atom"].batch,
+                                dim=0,
+                                dim_size=B_infer,
+                            )
+                            true_centroid = scatter_mean(
+                                x_1,
+                                infer_batch["ligand_atom"].batch,
+                                dim=0,
+                                dim_size=B_infer,
+                            )
+                            all_centroid_dist.append(
+                                torch.norm(pred_centroid - true_centroid, dim=-1).detach().cpu()
+                            )
 
                         del infer_batch, x_0_infer, final_pos
 
                     except Exception as e:
                         logger.warning(f"RMSD inference failed for batch {i}: {e}")
+                        gc.collect()
                         if use_configured_cuda:
                             torch.cuda.empty_cache()
 
             except torch.cuda.OutOfMemoryError:
                 oom_batches += 1
+                del predictions, loss_dict, loss, x_1, x_t, t, targets, ligand_centers, local_batch, crop_centers
                 gc.collect()
                 if use_configured_cuda:
                     torch.cuda.empty_cache()
-                split_batches = (
-                    split_collated_batch(batch, collator=collator)
-                    if split_depth < max_oom_retry_splits
-                    else None
-                )
+                split_batches: tuple[HeteroData, HeteroData] | None = None
+                if split_depth < max_oom_retry_splits:
+                    try:
+                        split_batches = split_collated_batch(batch, collator=collator)
+                    except Exception:
+                        gc.collect()
+                        if use_configured_cuda:
+                            torch.cuda.empty_cache()
                 if split_batches is not None:
                     logger.warning(
                         f"Validation batch {i}: CUDA OOM, retrying with split depth {split_depth + 1}."
@@ -365,6 +388,7 @@ def compute_validation_loss(
 
             except Exception as e:
                 logger.warning(f"Validation batch failed: {e}")
+                del predictions, loss_dict, loss, x_1, x_t, t, targets, ligand_centers, local_batch, crop_centers
                 gc.collect()
                 if use_configured_cuda:
                     torch.cuda.empty_cache()

@@ -470,6 +470,21 @@ class ProteinLigandDataset(Dataset):
                 metadata["graph_cost_profile"] = build_graph_cost_profile(data)
                 metadata["graph_cost_profile_version"] = GRAPH_COST_PROFILE_VERSION
                 torch.save(data, out_path)
+
+                # 预处理阶段同步生成 start_pos 缓存，保证训练时所有有效样本均有该属性。
+                # 此时原始配体文件必然存在（刚被 _process_one 使用），是生成的最可靠时机。
+                if hasattr(data["ligand_atom"], "pos"):
+                    expected_num_atoms = int(data["ligand_atom"].pos.size(0))
+                    start_pos = self._load_or_build_start_pos(pdb_id, expected_num_atoms)
+                    if start_pos is None:
+                        os.remove(out_path)
+                        logger.warning(
+                            "Skipping %s: start_pos generation failed, graph cache removed.",
+                            pdb_id,
+                        )
+                        error_count += 1
+                        continue
+
                 self._write_preprocess_metadata(pdb_id, metadata)
                 success_count += 1
 
@@ -581,7 +596,7 @@ class ProteinLigandDataset(Dataset):
         os.makedirs(self.processed_dir, exist_ok=True)
         processed_files = os.listdir(self.processed_dir)
         allowed = set(self.index_df["pdb_id"].tolist())
-        valid_pdb_ids = sorted(
+        candidates = sorted(
             [
                 f.replace("data_", "").replace(".pt", "")
                 for f in processed_files
@@ -590,6 +605,43 @@ class ProteinLigandDataset(Dataset):
                 and f.replace("data_", "").replace(".pt", "") in allowed
             ]
         )
+
+        valid_pdb_ids: list[str] = []
+        excluded = 0
+        for pdb_id in candidates:
+            cache_path = self._diffdock_like_cache_path(pdb_id)
+            if osp.exists(cache_path):
+                valid_pdb_ids.append(pdb_id)
+                continue
+
+            # start_pos 缓存缺失（来自旧版预处理）：尝试即时生成并过滤失败样本。
+            file_path = osp.join(self.processed_dir, f"data_{pdb_id}.pt")
+            try:
+                data = torch.load(file_path, weights_only=False)
+            except Exception as e:
+                logger.warning("Skipping %s: failed to load graph cache: %s", pdb_id, e)
+                excluded += 1
+                continue
+
+            if not hasattr(data["ligand_atom"], "pos"):
+                logger.warning("Skipping %s: ligand_atom.pos missing in graph cache.", pdb_id)
+                excluded += 1
+                continue
+
+            expected_num_atoms = int(data["ligand_atom"].pos.size(0))
+            start_pos = self._load_or_build_start_pos(pdb_id, expected_num_atoms)
+            if start_pos is None:
+                logger.warning("Skipping %s: start_pos unavailable.", pdb_id)
+                excluded += 1
+            else:
+                valid_pdb_ids.append(pdb_id)
+
+        if excluded:
+            logger.warning(
+                "%d samples excluded: start_pos unavailable. "
+                "Re-run preprocessing to rebuild missing caches.",
+                excluded,
+            )
         self._valid_pdb_ids = valid_pdb_ids
         self._pdb_to_idx = {pdb: i for i, pdb in enumerate(valid_pdb_ids)}
         logger.info("Dataset ready: %d valid samples", len(valid_pdb_ids))
@@ -610,17 +662,22 @@ class ProteinLigandDataset(Dataset):
     ) -> torch.Tensor | None:
         cache_path = self._diffdock_like_cache_path(pdb_id)
         if osp.exists(cache_path):
-            cached = torch.load(cache_path, map_location="cpu", weights_only=False)
-            start_pos = (
-                cached.get("ligand_start_pos") if isinstance(cached, dict) else cached
-            )
-            if (
-                isinstance(start_pos, torch.Tensor)
-                and start_pos.ndim == 2
-                and start_pos.size(1) == 3
-                and int(start_pos.size(0)) == expected_num_atoms
-            ):
-                return start_pos.float()
+            try:
+                cached = torch.load(cache_path, map_location="cpu", weights_only=False)
+            except Exception as e:
+                logger.warning("Corrupted start_pos cache for %s, will rebuild: %s", pdb_id, e)
+                cached = None
+            if cached is not None:
+                start_pos = (
+                    cached.get("ligand_start_pos") if isinstance(cached, dict) else cached
+                )
+                if (
+                    isinstance(start_pos, torch.Tensor)
+                    and start_pos.ndim == 2
+                    and start_pos.size(1) == 3
+                    and int(start_pos.size(0)) == expected_num_atoms
+                ):
+                    return start_pos.float()
 
         pdb_dir = osp.join(self.raw_dir, pdb_id)
         lig_path = ligand_path(pdb_id, pdb_dir)
@@ -628,11 +685,22 @@ class ProteinLigandDataset(Dataset):
             return None
 
         seed = zlib.adler32(pdb_id.encode("utf-8")) & 0xFFFFFFFF
-        start_pos_np = build_start_positions(
-            lig_path,
-            random_seed=seed,
-        )
+        try:
+            start_pos_np = build_start_positions(
+                lig_path,
+                random_seed=seed,
+            )
+        except Exception as e:
+            logger.warning("build_start_positions failed for %s: %s", pdb_id, e)
+            return None
         start_pos = torch.as_tensor(start_pos_np, dtype=torch.float32)
+        if start_pos.ndim != 2 or start_pos.size(1) != 3:
+            logger.warning(
+                "Start pose has unexpected shape for %s: %s.",
+                pdb_id,
+                tuple(start_pos.shape),
+            )
+            return None
         if int(start_pos.size(0)) != expected_num_atoms:
             logger.warning(
                 "Start pose atom count mismatch for %s: expected %d, got %d.",
@@ -682,8 +750,11 @@ class ProteinLigandDataset(Dataset):
         if hasattr(data["ligand_atom"], "pos"):
             expected_num_atoms = int(data["ligand_atom"].pos.size(0))
             start_pos = self._load_or_build_start_pos(pdb_id, expected_num_atoms)
-            if start_pos is not None:
-                data["ligand_atom"]["start_pos"] = start_pos
+            # _build_valid_index 已保证 start_pos 缓存存在；此处 pos 回退仅作防御性兜底，
+            # 语义上等价于 flow_matcher 中 seed_pos=None 的行为（同样以 x_ref 为基准）。
+            data["ligand_atom"]["start_pos"] = (
+                start_pos if start_pos is not None else data["ligand_atom"].pos.clone()
+            )
 
         data = ensure_context_features(data, self.graph_builder)
         data.dataset_index = int(idx)
