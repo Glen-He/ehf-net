@@ -305,3 +305,50 @@ def compute_center_value_loss(
     targets = center_value_targets.clamp(0.0, 1.0)
     weight = 1.0 + 2.0 * targets
     return F.binary_cross_entropy_with_logits(center_logits, targets, weight=weight)
+
+
+def build_center_value_targets(
+    residue_pos: Tensor,
+    residue_batch: Tensor,
+    ligand_centers: Tensor,
+    *,
+    positive_radius: float,
+) -> Tensor:
+    """
+    根据真实配体中心构建残基层 center-value 监督目标。
+
+    监督目标与 blind pool 中心价值标签保持一致：
+    命中半径内记为强正例，近邻区域记为弱正例，其余记为负例。
+
+    Args:
+        residue_pos: 残基坐标张量，shape 为 [N_residue, 3]。
+        residue_batch: 残基所属复合物索引，shape 为 [N_residue]。
+        ligand_centers: 每个复合物的真实配体中心，shape 为 [B, 3]。
+        positive_radius: 强正例命中半径，单位为 Å。
+
+    Returns:
+        Tensor: 每个残基对应的 center-value 软目标，shape 为 [N_residue]。
+    """
+    if residue_pos.numel() == 0:
+        return residue_pos.new_zeros((0,))
+
+    if residue_batch.numel() == 0 or ligand_centers.numel() == 0:
+        return residue_pos.new_zeros((residue_pos.size(0),))
+
+    dist_to_center = torch.norm(
+        residue_pos - ligand_centers[residue_batch],
+        dim=-1,
+    )
+    targets = residue_pos.new_zeros(dist_to_center.shape)
+    targets = torch.where(
+        dist_to_center <= float(positive_radius),
+        targets.new_full(targets.shape, 1.0),
+        targets,
+    )
+    targets = torch.where(
+        (dist_to_center > float(positive_radius))
+        & (dist_to_center <= float(positive_radius) * 2.0),
+        targets.new_full(targets.shape, 0.5),
+        targets,
+    )
+    return targets

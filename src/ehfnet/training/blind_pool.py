@@ -88,7 +88,7 @@ def refresh_blind_candidate_pool(
     crop_atom_margin: float,
     max_complexes: int | None = None,
     fusion_weights: dict[str, float] | None = None,
-    use_learned_center_scores: bool = True,
+    learned_score_fraction: float = 1.0,
     cost_guard_limit: int | None = None,
     num_gnn_blocks: int = 1,
     dynamic_inter_max_neighbors: int = 1,
@@ -127,7 +127,7 @@ def refresh_blind_candidate_pool(
         crop_atom_margin: 基于原子距离扩展残基裁剪范围的边界。
         max_complexes: 本轮最多处理的复合物数量。
         fusion_weights: 融合不同分支分数时使用的权重字典。
-        use_learned_center_scores: 是否优先使用模型学习得到的中心分数。
+        learned_score_fraction: 学习分数在中心排序中的融合占比。
         cost_guard_limit: 候选生成阶段的成本保护上限。
         num_gnn_blocks: 主干 GNN 块数量，用于估计运行时成本。
         dynamic_inter_max_neighbors: 动态原子跨图边的单源邻居上限。
@@ -163,7 +163,7 @@ def refresh_blind_candidate_pool(
         crop_atom_margin=crop_atom_margin,
         max_complexes=max_complexes,
         fusion_weights=fusion_weights,
-        use_learned_center_scores=use_learned_center_scores,
+        learned_score_fraction=learned_score_fraction,
         cost_guard_limit=cost_guard_limit,
         num_gnn_blocks=num_gnn_blocks,
         dynamic_inter_max_neighbors=dynamic_inter_max_neighbors,
@@ -487,6 +487,8 @@ def replay_and_compute_losses(
     micro_batch_size: int,
     max_candidates_per_complex: int,
     budget_controller: WindowAimdBudgetController | None = None,
+    backward_losses: bool = False,
+    backward_normalizer: float | None = None,
 ) -> dict[str, Tensor]:
     """
     将缓存候选通过当前模型重放并计算 rerank 损失。
@@ -517,6 +519,8 @@ def replay_and_compute_losses(
         micro_batch_size: replay 候选打分的初始微批大小。
         max_candidates_per_complex: 每个复合物保留的最大 replay 候选数。
         budget_controller: replay 微批回调控制器；为 `None` 时仅使用固定微批。
+        backward_losses: 是否在函数内部按组即时执行反向传播。
+        backward_normalizer: 即时反传时用于缩放每个 replay 条目的归一化因子。
 
     Returns:
         dict[str, Tensor]: 当前模型在 blind pool 回放样本上的损失与统计信息。
@@ -524,21 +528,27 @@ def replay_and_compute_losses(
     Raises:
         RuntimeError: 当回放过程中没有得到任何有效局部样本时抛出。
     """
-    per_group_totals: list[Tensor] = []
-    per_group_bce: list[Tensor] = []
-    per_group_pair: list[Tensor] = []
-    per_group_list: list[Tensor] = []
+    rerank_total_sum = torch.tensor(0.0, device=device)
+    rerank_bce_sum = torch.tensor(0.0, device=device)
+    rerank_pair_sum = torch.tensor(0.0, device=device)
+    rerank_list_sum = torch.tensor(0.0, device=device)
     total_pairs = 0
-    all_center_logits: list[Tensor] = []
-    all_center_targets: list[Tensor] = []
     resolved_groups = 0
     candidate_successes = 0
     candidate_failures = 0
     sample_failures = 0
     center_value_failures = 0
+    center_value_weighted_sum = torch.tensor(0.0, device=device)
+    center_value_target_count = 0
     cooldown_skips = 0
     replay_oom_events = 0
     use_configured_cuda = device.type == "cuda"
+    replay_item_normalizer = max(
+        1.0,
+        float(backward_normalizer)
+        if backward_normalizer is not None
+        else float(max(1, len(replay_items))),
+    )
 
     def _score_candidate_chunk(
         *,
@@ -655,6 +665,7 @@ def replay_and_compute_losses(
         valid_candidates: list[dict[str, Any]] = []
         complex_had_oom = False
         complex_irreducible_oom = False
+        item_backward_terms: list[Tensor] = []
         chunk_size = (
             budget_controller.current_budget
             if budget_controller is not None
@@ -739,11 +750,14 @@ def replay_and_compute_losses(
                 lambda_pair=lambda_pair,
                 lambda_list=lambda_list,
             )
-            per_group_totals.append(rerank_results["rerank_total"])
-            per_group_bce.append(rerank_results["rerank_bce"])
-            per_group_pair.append(rerank_results["rerank_pairwise"])
-            per_group_list.append(rerank_results["rerank_listwise"])
+            rerank_total_sum = rerank_total_sum + rerank_results["rerank_total"].detach()
+            rerank_bce_sum = rerank_bce_sum + rerank_results["rerank_bce"].detach()
+            rerank_pair_sum = rerank_pair_sum + rerank_results["rerank_pairwise"].detach()
+            rerank_list_sum = rerank_list_sum + rerank_results["rerank_listwise"].detach()
             total_pairs += int(rerank_results["rerank_n_pairs"].item())
+            if backward_losses and rerank_results["rerank_total"].requires_grad:
+                item_backward_terms.append(rerank_results["rerank_total"])
+            del logits_cat, rmsd_cat, pair_indices, rerank_results
 
         if lambda_center_value > 0 and center_values:
             try:
@@ -753,6 +767,8 @@ def replay_and_compute_losses(
                     sample_batch,
                     device=device,
                 )
+                sample_center_logits: list[Tensor] = []
+                sample_center_targets: list[Tensor] = []
 
                 for cid, cv_target in center_values.items():
                     center_rec = None
@@ -769,14 +785,40 @@ def replay_and_compute_losses(
                     )
                     dists = torch.norm(res_pos - center_xyz_t.unsqueeze(0), dim=-1)
                     nearest_idx = dists.argmin()
-                    all_center_logits.append(prop_logits[nearest_idx].view(-1))
-                    all_center_targets.append(
+                    sample_center_logits.append(prop_logits[nearest_idx].view(-1))
+                    sample_center_targets.append(
                         torch.tensor([cv_target], device=device, dtype=torch.float32)
                     )
 
-                del sample_batch
+                if sample_center_logits:
+                    center_logits_cat = torch.cat(sample_center_logits)
+                    center_targets_cat = torch.cat(sample_center_targets)
+                    sample_center_loss = compute_center_value_loss(
+                        center_logits_cat,
+                        center_targets_cat,
+                    )
+                    center_value_weighted_sum = (
+                        center_value_weighted_sum
+                        + sample_center_loss.detach() * center_targets_cat.numel()
+                    )
+                    center_value_target_count += int(center_targets_cat.numel())
+                    if backward_losses and sample_center_loss.requires_grad:
+                        item_backward_terms.append(lambda_center_value * sample_center_loss)
+                    del center_logits_cat, center_targets_cat, sample_center_loss
+
+                del (
+                    sample_batch,
+                    prop_logits,
+                    res_pos,
+                    res_batch,
+                    sample_center_logits,
+                    sample_center_targets,
+                )
             except Exception as exc:
                 center_value_failures += 1
+                gc.collect()
+                if use_configured_cuda:
+                    torch.cuda.empty_cache()
                 if center_value_failures <= 5:
                     logger.warning(
                         "Center-value replay failed for complex=%s: %s",
@@ -784,13 +826,18 @@ def replay_and_compute_losses(
                         exc,
                     )
 
+        if backward_losses and item_backward_terms:
+            item_backward_loss = torch.stack(item_backward_terms).sum() / replay_item_normalizer
+            item_backward_loss.backward()
+            del item_backward_loss, item_backward_terms
+
     result: dict[str, Tensor] = {}
 
-    if per_group_totals:
-        result["rerank_total"] = torch.stack(per_group_totals).mean()
-        result["rerank_bce"] = torch.stack(per_group_bce).mean()
-        result["rerank_pairwise"] = torch.stack(per_group_pair).mean()
-        result["rerank_listwise"] = torch.stack(per_group_list).mean()
+    if resolved_groups > 0:
+        result["rerank_total"] = rerank_total_sum / float(resolved_groups)
+        result["rerank_bce"] = rerank_bce_sum / float(resolved_groups)
+        result["rerank_pairwise"] = rerank_pair_sum / float(resolved_groups)
+        result["rerank_listwise"] = rerank_list_sum / float(resolved_groups)
         result["rerank_n_pairs"] = torch.tensor(float(total_pairs), device=device)
     else:
         result["rerank_total"] = torch.tensor(0.0, device=device)
@@ -799,10 +846,10 @@ def replay_and_compute_losses(
         result["rerank_listwise"] = torch.tensor(0.0, device=device)
         result["rerank_n_pairs"] = torch.tensor(0.0, device=device)
 
-    if all_center_logits and lambda_center_value > 0:
-        center_logits_cat = torch.cat(all_center_logits)
-        center_targets_cat = torch.cat(all_center_targets)
-        result["center_value_loss"] = compute_center_value_loss(center_logits_cat, center_targets_cat)
+    if center_value_target_count > 0 and lambda_center_value > 0:
+        result["center_value_loss"] = (
+            center_value_weighted_sum / float(center_value_target_count)
+        )
     else:
         result["center_value_loss"] = torch.tensor(0.0, device=device)
 

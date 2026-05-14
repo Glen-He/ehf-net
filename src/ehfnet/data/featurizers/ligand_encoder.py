@@ -204,12 +204,12 @@ def _extract_torsion_info(
     strict: bool = True,
 ) -> tuple[list[list[int]], list[list[bool]]]:
     pattern_str = ROTATABLE_PATTERN_STRICT if strict else ROTATABLE_PATTERN_NON_STRICT
-    rot_pattern = Chem.MolFromSmarts(pattern_str)
-    if rot_pattern is None:
+    rotatable_pattern = Chem.MolFromSmarts(pattern_str)
+    if rotatable_pattern is None:
         logger.error("Failed to create query molecule from SMARTS pattern")
         return [], []
 
-    matches = mol.GetSubstructMatches(rot_pattern)
+    matches = mol.GetSubstructMatches(rotatable_pattern)
     torsion_indices: list[list[int]] = []
     moving_masks: list[list[bool]] = []
     num_atoms = mol.GetNumAtoms()
@@ -227,7 +227,7 @@ def _extract_torsion_info(
             continue
         seen_bonds.add(bid)
 
-        moving_atoms, axis_fix, axis_rot = get_moving_atoms(
+        moving_atoms, axis_fix, axis_rotation = get_moving_atoms(
             mol,
             bid,
             canonical_ranks=canonical_ranks,
@@ -238,7 +238,7 @@ def _extract_torsion_info(
         dihedral = _get_dihedral_indices(
             mol,
             axis_fix,
-            axis_rot,
+            axis_rotation,
             canonical_ranks=canonical_ranks,
         )
         if not dihedral:

@@ -73,7 +73,7 @@ def generate_blind_candidates(
     crop_min_residues: int,
     crop_atom_margin: float,
     fusion_weights: dict[str, float] | None = None,
-    use_learned_center_scores: bool = True,
+    learned_score_fraction: float = 1.0,
     dataset_raw_dir: str | None = None,
     dataset_indices: list[int] | None = None,
     pool_epoch: int = -1,
@@ -105,7 +105,7 @@ def generate_blind_candidates(
         crop_min_residues: 局部裁剪后至少保留的残基数量。
         crop_atom_margin: 基于原子距离扩展残基裁剪范围的边界。
         fusion_weights: 融合不同分支分数时使用的权重字典。
-        use_learned_center_scores: 是否优先使用模型学习得到的中心分数。
+        learned_score_fraction: 学习分数在中心排序中的融合占比。
         dataset_raw_dir: 数据集原始样本目录，用于计算对称感知 RMSD。
         dataset_indices: 与样本一一对应的原始数据集索引。
         pool_epoch: 当前候选池对应的训练轮次。
@@ -131,7 +131,7 @@ def generate_blind_candidates(
             graph_logits = compute_center_guidance_scores(
                 proposal_logits.detach().cpu().view(-1),
                 residue_prior_feat.detach().cpu(),
-                use_learned_scores=use_learned_center_scores,
+                learned_score_fraction=learned_score_fraction,
             )
             graph_positions = residue_pos_device.detach().cpu()
 
@@ -461,7 +461,7 @@ def generate_candidates_from_loader(
     crop_min_residues: int,
     crop_atom_margin: float,
     fusion_weights: dict[str, float] | None = None,
-    use_learned_center_scores: bool = True,
+    learned_score_fraction: float = 1.0,
     cost_guard_limit: int | None = None,
     num_gnn_blocks: int = 1,
     dynamic_inter_max_neighbors: int = 1,
@@ -501,7 +501,7 @@ def generate_candidates_from_loader(
         crop_min_residues: 局部裁剪后至少保留的残基数量。
         crop_atom_margin: 基于原子距离扩展残基裁剪范围的边界。
         fusion_weights: 融合不同分支分数时使用的权重字典。
-        use_learned_center_scores: 是否优先使用模型学习得到的中心分数。
+        learned_score_fraction: 学习分数在中心排序中的融合占比。
         cost_guard_limit: 候选生成阶段的成本保护上限。
         num_gnn_blocks: 主干 GNN 块数量，用于估计运行时成本。
         dynamic_inter_max_neighbors: 动态原子跨图边的单源邻居上限。
@@ -628,7 +628,7 @@ def generate_candidates_from_loader(
                         crop_min_residues=crop_min_residues,
                         crop_atom_margin=crop_atom_margin,
                         fusion_weights=fusion_weights,
-                        use_learned_center_scores=use_learned_center_scores,
+                        learned_score_fraction=learned_score_fraction,
                         dataset_raw_dir=dataset_raw_dir,
                         dataset_indices=(
                             batch_dataset_indices

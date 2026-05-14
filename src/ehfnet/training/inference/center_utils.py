@@ -26,33 +26,69 @@ def compute_center_guidance_scores(
     proposal_logits: torch.Tensor,
     residue_prior_feat: torch.Tensor | None,
     *,
-    use_learned_scores: bool,
+    learned_score_fraction: float,
 ) -> torch.Tensor:
     """
     计算中心引导分数。
 
-    将模型输出的提议 logit 与残基先验结合成中心排序分数，
+    将模型输出的提议 logit 与残基先验按进度平滑融合，
     用于候选中心选择阶段的打分。
 
     Args:
         proposal_logits: 中心提议分支输出的 logits。
         residue_prior_feat: 残基级几何先验特征。
-        use_learned_scores: 是否直接使用模型学习到的中心分数。
+        learned_score_fraction: 学习分数的融合占比，0 表示纯先验，1 表示纯学习分数。
 
     Returns:
         Tensor: 用于中心排序的最终引导分数张量。
     """
-    scores = proposal_logits.view(-1)
-    if use_learned_scores or residue_prior_feat is None or residue_prior_feat.numel() == 0:
-        return scores
+    learned_scores = proposal_logits.view(-1)
+    alpha = float(max(0.0, min(1.0, learned_score_fraction)))
+    if residue_prior_feat is None or residue_prior_feat.numel() == 0:
+        return learned_scores
 
     if residue_prior_feat.ndim != 2 or residue_prior_feat.size(-1) < 4:
-        return scores
+        return learned_scores
 
     density = residue_prior_feat[:, 0]
     cavity = residue_prior_feat[:, 3]
     heuristic_prob = (0.30 * density + 0.70 * cavity).clamp(1e-4, 1.0 - 1e-4)
-    return torch.logit(heuristic_prob)
+    heuristic_scores = torch.logit(heuristic_prob)
+    if alpha <= 0.0:
+        return heuristic_scores
+    if alpha >= 1.0:
+        return learned_scores
+    return torch.lerp(heuristic_scores, learned_scores, alpha)
+
+
+def compute_center_guidance_fraction(
+    *,
+    progress: float,
+    learned_start: float,
+    learned_end: float,
+) -> float:
+    """
+    计算中心引导中学习分数的融合占比。
+
+    通过平滑的课程调度控制 heuristic prior 与 learned score 的交接，
+    避免训练过程中因过早全量切换导致局部裁剪中心突然失稳。
+
+    Args:
+        progress: 当前训练进度，范围 [0, 1]。
+        learned_start: 学习分数开始进入融合的训练进度。
+        learned_end: 学习分数完全接管的训练进度。
+
+    Returns:
+        float: 学习分数融合占比，范围 [0, 1]。
+    """
+    clamped_progress = float(max(0.0, min(1.0, progress)))
+    start = float(max(0.0, min(1.0, learned_start)))
+    end = float(max(start, min(1.0, learned_end)))
+    if end <= start:
+        return 1.0 if clamped_progress >= end else 0.0
+    alpha = (clamped_progress - start) / max(end - start, 1e-8)
+    alpha = float(max(0.0, min(1.0, alpha)))
+    return alpha * alpha * (3.0 - 2.0 * alpha)
 
 
 def compute_residue_proposal_priors(

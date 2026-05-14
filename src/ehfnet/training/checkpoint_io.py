@@ -7,9 +7,111 @@ Checkpoint 工具。
 
 
 import math
+import random
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
+import torch
+
 from ehfnet.contracts import build_feature_signature, build_model_config
+
+CHECKPOINT_SCHEMA_VERSION = 3
+CHECKPOINT_MODEL_CONFIG_KEYS = (
+    "hidden_dim",
+    "num_gnn_blocks",
+    "lig_atom_cont_count",
+    "lig_mol_cont_count",
+    "pro_atom_cont_count",
+    "pro_res_cont_count",
+    "esm_dim",
+    "interaction_profile",
+    "m_dim_scalar",
+    "dropout_rate",
+    "num_rbf",
+    "r_cutoff",
+    "force_cutoff",
+    "frame_refine_threshold",
+    "frame_refine_temperature",
+    "energy_guide_threshold",
+    "energy_guide_temperature",
+    "clash_threshold",
+    "clash_push_threshold",
+    "clash_push_force",
+    "score_clamp_min",
+    "score_clamp_max",
+    "force_limit",
+    "prediction_max_neighbors",
+    "prediction_min_max_neighbors",
+    "prediction_knn_fallback_k",
+    "r_cutoff_intra",
+    "max_neighbors_intra",
+    "atom_neighbor_cap",
+    "residue_neighbor_cap",
+    "residue_radius_scale",
+    "residue_radius_bias",
+    "ligand_atom_fallback_k",
+    "protein_atom_fallback_k",
+    "protein_residue_fallback_k",
+    "dynamic_inter_cutoff",
+    "dynamic_inter_knn_k",
+    "dynamic_inter_max_neighbors",
+    "dynamic_residue_cutoff",
+    "dynamic_residue_knn_k",
+    "dynamic_residue_max_neighbors",
+    "dynamic_residue_candidate_topk",
+)
+
+
+@dataclass(frozen=True)
+class CheckpointModelState:
+    """
+    Checkpoint 依赖的训练组件状态。
+
+    Attributes:
+        model: 当前训练模型。
+        ema_model: EMA 模型；若尚未启用则为 `None`。
+        criterion: 当前损失函数对象。
+        optimizer: 当前优化器对象。
+        scheduler: 当前学习率调度器对象。
+    """
+
+    model: Any
+    ema_model: Any | None
+    criterion: Any
+    optimizer: Any
+    scheduler: Any
+
+
+@dataclass(frozen=True)
+class CheckpointEpochState:
+    """
+    单轮 checkpoint 的运行时状态。
+
+    Attributes:
+        epoch_idx: 当前 0-based epoch 索引。
+        avg_train_loss_value: 当前轮平均训练损失。
+        val_metrics_obj: 当前轮验证指标字典。
+        selection_metrics: 当前轮模型选优指标字典。
+        best_val_loss: 训练至今最佳验证损失。
+        best_rmsd: 训练至今最佳 mean RMSD。
+        current_fusion_weights: 当前 top-n 重排融合权重。
+        normalization_stats: 当前训练使用的归一化统计。
+        run_name: 当前运行名称。
+        run_log_file: 当前运行日志路径。
+    """
+
+    epoch_idx: int
+    avg_train_loss_value: float
+    val_metrics_obj: dict[str, Any]
+    selection_metrics: dict[str, float]
+    best_val_loss: float
+    best_rmsd: float
+    current_fusion_weights: dict[str, float]
+    normalization_stats: dict[str, Any]
+    run_name: str | None
+    run_log_file: str | None
 
 
 def safe_metric(value: Any, default: float, *, higher_is_better: bool = True) -> float:
@@ -186,6 +288,177 @@ def is_better_checkpoint(
     return False
 
 
+def capture_rng_state() -> dict[str, Any]:
+    """
+    捕获当前进程的随机数生成状态。
+
+    Returns:
+        dict[str, Any]: 适合写入 checkpoint 的 RNG 状态字典。
+    """
+    rng_state: dict[str, Any] = {
+        "python_random_state": random.getstate(),
+        "numpy_random_state": np.random.get_state(),
+        "torch_cpu_rng_state": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        rng_state["torch_cuda_rng_state_all"] = torch.cuda.get_rng_state_all()
+    return rng_state
+
+
+def restore_rng_state(
+    rng_state: Mapping[str, Any] | None,
+    *,
+    restore_cuda: bool,
+) -> None:
+    """
+    恢复 checkpoint 中保存的随机数生成状态。
+
+    Args:
+        rng_state: checkpoint 中保存的 RNG 状态字典。
+        restore_cuda: 当前运行是否需要恢复 CUDA RNG 状态。
+    """
+    if rng_state is None:
+        return
+    python_random_state = rng_state.get("python_random_state")
+    if python_random_state is not None:
+        random.setstate(python_random_state)
+    numpy_random_state = rng_state.get("numpy_random_state")
+    if numpy_random_state is not None:
+        np.random.set_state(numpy_random_state)
+    torch_cpu_rng_state = rng_state.get("torch_cpu_rng_state")
+    if torch_cpu_rng_state is not None:
+        torch.set_rng_state(torch_cpu_rng_state)
+    if restore_cuda and torch.cuda.is_available():
+        torch_cuda_rng_state_all = rng_state.get("torch_cuda_rng_state_all")
+        if isinstance(torch_cuda_rng_state_all, list):
+            available_gpu_count = torch.cuda.device_count()
+            for device_idx, device_state in enumerate(
+                torch_cuda_rng_state_all[:available_gpu_count]
+            ):
+                torch.cuda.set_rng_state(device_state, device=device_idx)
+
+
+def build_checkpoint_model_config_kwargs(
+    source_values: Mapping[str, Any],
+) -> dict[str, Any]:
+    """
+    从训练上下文提取 checkpoint 所需的模型配置参数。
+
+    Args:
+        source_values: 训练上下文或 `locals()` 形成的参数映射。
+
+    Returns:
+        dict[str, Any]: 适合传给 `compose_*_checkpoint` 的模型配置字典。
+    """
+    model_config_kwargs = {
+        key: source_values[key]
+        for key in CHECKPOINT_MODEL_CONFIG_KEYS
+    }
+    model_config_kwargs["time_dim"] = source_values["hidden_dim"]
+    model_config_kwargs["max_neighbors"] = model_config_kwargs.pop(
+        "prediction_max_neighbors"
+    )
+    model_config_kwargs["min_max_neighbors"] = model_config_kwargs.pop(
+        "prediction_min_max_neighbors"
+    )
+    model_config_kwargs["knn_fallback_k"] = model_config_kwargs.pop(
+        "prediction_knn_fallback_k"
+    )
+    return model_config_kwargs
+
+
+def compose_selection_checkpoint(
+    *,
+    epoch_state: CheckpointEpochState,
+    model_state: CheckpointModelState,
+    model_config_kwargs: Mapping[str, Any],
+    training_config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """
+    组装仅用于选优的 checkpoint。
+
+    Args:
+        epoch_state: 当前轮的运行时状态。
+        model_state: 当前训练组件状态。
+        model_config_kwargs: 模型配置签名所需参数。
+        training_config: 当前训练配置快照。
+
+    Returns:
+        dict[str, Any]: 仅用于 `best_*` 选优保存的 checkpoint。
+    """
+    return compose_checkpoint(
+        epoch_idx=epoch_state.epoch_idx,
+        avg_train_loss_value=epoch_state.avg_train_loss_value,
+        val_metrics_obj=epoch_state.val_metrics_obj,
+        selection_metrics=epoch_state.selection_metrics,
+        model=model_state.model,
+        ema_model=model_state.ema_model,
+        criterion=model_state.criterion,
+        optimizer=model_state.optimizer,
+        scheduler=model_state.scheduler,
+        best_val_loss=epoch_state.best_val_loss,
+        best_rmsd=epoch_state.best_rmsd,
+        current_fusion_weights=epoch_state.current_fusion_weights,
+        normalization_stats=epoch_state.normalization_stats,
+        run_name=epoch_state.run_name,
+        run_log_file=epoch_state.run_log_file,
+        checkpoint_role="selection",
+        resume_capable=False,
+        epoch_boundary_complete=False,
+        training_config=dict(training_config) if training_config is not None else None,
+        **dict(model_config_kwargs),
+    )
+
+
+def compose_resume_checkpoint(
+    *,
+    epoch_state: CheckpointEpochState,
+    model_state: CheckpointModelState,
+    model_config_kwargs: Mapping[str, Any],
+    training_config: Mapping[str, Any],
+    trainer_state: Mapping[str, Any],
+    rng_state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """
+    组装完整的可恢复 epoch 边界 checkpoint。
+
+    Args:
+        epoch_state: 当前轮的运行时状态。
+        model_state: 当前训练组件状态。
+        model_config_kwargs: 模型配置签名所需参数。
+        training_config: 当前训练配置快照。
+        trainer_state: 当前训练主循环的可恢复状态。
+        rng_state: 保存点对应的 RNG 状态。
+
+    Returns:
+        dict[str, Any]: 可用于严格 resume 的完整 checkpoint。
+    """
+    return compose_checkpoint(
+        epoch_idx=epoch_state.epoch_idx,
+        avg_train_loss_value=epoch_state.avg_train_loss_value,
+        val_metrics_obj=epoch_state.val_metrics_obj,
+        selection_metrics=epoch_state.selection_metrics,
+        model=model_state.model,
+        ema_model=model_state.ema_model,
+        criterion=model_state.criterion,
+        optimizer=model_state.optimizer,
+        scheduler=model_state.scheduler,
+        best_val_loss=epoch_state.best_val_loss,
+        best_rmsd=epoch_state.best_rmsd,
+        current_fusion_weights=epoch_state.current_fusion_weights,
+        normalization_stats=epoch_state.normalization_stats,
+        run_name=epoch_state.run_name,
+        run_log_file=epoch_state.run_log_file,
+        checkpoint_role="resume",
+        resume_capable=True,
+        epoch_boundary_complete=True,
+        training_config=dict(training_config),
+        trainer_state=dict(trainer_state),
+        rng_state=dict(rng_state),
+        **dict(model_config_kwargs),
+    )
+
+
 def compose_checkpoint(
     *,
     epoch_idx: int,
@@ -245,6 +518,12 @@ def compose_checkpoint(
     dynamic_residue_knn_k: int,
     dynamic_residue_max_neighbors: int,
     dynamic_residue_candidate_topk: int,
+    checkpoint_role: str,
+    resume_capable: bool,
+    epoch_boundary_complete: bool,
+    training_config: dict[str, Any] | None = None,
+    trainer_state: dict[str, Any] | None = None,
+    rng_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     组装 checkpoint 内容。
@@ -310,6 +589,12 @@ def compose_checkpoint(
         dynamic_residue_knn_k: 动态配体-残基边回退到 kNN 时的邻居数。
         dynamic_residue_max_neighbors: 动态配体-残基边的单源邻居上限。
         dynamic_residue_candidate_topk: 动态配体-残基边每个复合物保留的候选残基数。
+        checkpoint_role: checkpoint 角色，区分 resume 边界快照与选优快照。
+        resume_capable: 当前 checkpoint 是否允许用于严格 resume。
+        epoch_boundary_complete: 当前 checkpoint 是否已经覆盖完整 epoch 边界状态。
+        training_config: 用于严格 resume 校验的训练配置快照。
+        trainer_state: 训练主循环的可恢复状态。
+        rng_state: 训练保存时的随机数生成状态。
 
     Returns:
         dict[str, Any]: 可直接保存到磁盘的完整 checkpoint 字典。
@@ -359,7 +644,11 @@ def compose_checkpoint(
         dynamic_residue_max_neighbors=dynamic_residue_max_neighbors,
         dynamic_residue_candidate_topk=dynamic_residue_candidate_topk,
     )
-    return {
+    checkpoint = {
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "checkpoint_role": str(checkpoint_role),
+        "resume_capable": bool(resume_capable),
+        "epoch_boundary_complete": bool(epoch_boundary_complete),
         "epoch": epoch_idx,
         "run_name": run_name,
         "run_log_file": run_log_file,
@@ -378,3 +667,10 @@ def compose_checkpoint(
         "fusion_weights": dict(current_fusion_weights),
         "normalization_stats": normalization_stats,
     }
+    if training_config is not None:
+        checkpoint["training_config"] = dict(training_config)
+    if trainer_state is not None:
+        checkpoint["trainer_state"] = dict(trainer_state)
+    if rng_state is not None:
+        checkpoint["rng_state"] = dict(rng_state)
+    return checkpoint

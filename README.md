@@ -26,7 +26,7 @@ $$x_t = (1 - t)\,x_0 + t\,x_1, \quad t \in [0, 1]$$
 
 模型学习条件速度场 $v_\theta(x_t, t)$，使 ODE 积分 $\dot{x} = v_\theta(x, t)$ 从 $x_0$ 恢复 $x_1$。训练目标由 Kabsch 对齐 + 有限差分从插值路径分解得到，分别对应：
 
-- **平移速度** $v_{\mathrm{trans}} \in \mathbb{R}^3$（质心刚体平移）
+- **平移速度** $v_{\mathrm{translation}} \in \mathbb{R}^3$（质心刚体平移）
 - **旋转角速度** $\omega \in \mathbb{R}^3$（Rodrigues 参数化，轴角表示）
 - **扭转角速度** $\dot{\tau} \in \mathbb{R}^T$（每个可旋转键一个标量）
 
@@ -61,9 +61,9 @@ $$(Q\hat{R}_j)^\top (Q\hat{r}_{ij}) = \hat{R}_j^\top Q^\top Q\hat{r}_{ij} = \hat
 
 *旋转*：体帧角速度 MLP + 主惯量帧投影，规避角动量 $L$ 与角速度 $\omega = I^{-1}L$ 的量纲不匹配：
 
-$$v_{\mathrm{rot}} = R_{\mathrm{frame}} \cdot \frac{\omega_{\mathrm{body}}}{\|\omega_{\mathrm{body}}\|} \cdot \mathrm{softplus}(g_s(h_{\mathrm{mol}}))$$
+$$v_{\mathrm{rotation}} = R_{\mathrm{frame}} \cdot \frac{\omega_{\mathrm{body}}}{\|\omega_{\mathrm{body}}\|} \cdot \mathrm{softplus}(g_s(h_{\mathrm{mol}}))$$
 
-$R_{\mathrm{frame}} \in \mathrm{SO}(3)$ 由当前坐标 SVD 主轴确定（detach）， $h_{\mathrm{mol}}$ 为 SE(3)-不变量，保证 $v_{\mathrm{rot}}$ 等变。
+$R_{\mathrm{frame}} \in \mathrm{SO}(3)$ 由当前坐标 SVD 主轴确定（detach）， $h_{\mathrm{mol}}$ 为 SE(3)-不变量，保证 $v_{\mathrm{rotation}}$ 等变。
 
 *扭转*：以旋转键两端原子特征拼接输入，MLP 直接输出标量（旋转不变量），无需坐标投影。
 
@@ -95,11 +95,12 @@ $R_{\mathrm{frame}} \in \mathrm{SO}(3)$ 由当前坐标 SVD 主轴确定（detac
 - **RMSD-first 主链路**：默认先强化 `translation / rotation / torsion` 几何主损失，再在中后期逐步引入 ranking、bootstrap 和 blind-pool replay；训练期排序软标签与验证指标统一基于 symmetry-aware RMSD。
 - **单一 `pose_rank_score` 头**：仍然统一承担构象质量估计与最终排序，但默认只在几何主链基本收敛后再逐步放大监督强度。
 - **亲和力与位阻分支**：二者共享同一套平滑时间门控，仅在训练后期和较大 `t` 区域逐步增强权重；验证时亲和力误差只在 `t > 0.8` 的样本上统计。
+- **中心提议监督**：训练主循环会直接用真实 ligand center 对 residue proposal logits 做在线 center-value supervision；blind-pool replay 在后期继续补充更贴近 blind 场景的中心价值监督。
 - **blind-pool replay**：定位为后置 reranker 增强阶段；除 pose 排序损失外，还包含 center-value supervision，用于把 proposal 质量与后续 pose 成功率重新耦合。
 
 ### Validation Protocol
 
-- **日常监控**：默认对验证集做 `30%` partial lightweight validation；验证、bootstrap 与 blind 推理统一使用 `ode_method`，默认值为 `euler`。
+- **日常监控**：默认对验证集做 `30%` partial lightweight validation；该验证使用真实 ligand center 做 local crop，主要监控“已知 pocket 条件下”的几何与打分质量；验证、bootstrap 与 blind 推理统一使用 `ode_method`，默认值为 `euler`。
 - **周期全量验证**：每隔 `val_full_every` 个 epoch 执行一次 `100%` full lightweight validation。
 - **尾段高覆盖验证**：最后 `val_full_last_epochs` 个 epoch 始终执行 `100%` full lightweight validation，但积分方法仍遵循同一个 `ode_method` 配置。
 - **checkpoint 选择**：训练中所有 checkpoint 选择均基于 lightweight validation，默认使用 `rmsd_priority` 规则，优先考虑 `Success@2A / Success@5A / Mean RMSD`；完整 blind Top-N 仅在训练结束后运行。
@@ -283,6 +284,48 @@ uv run python train.py \
     --smoke
 ```
 
+### 断点续训
+
+训练入口现已支持从已有 checkpoint 恢复**完整训练状态**，包括：
+
+- 模型参数、优化器、学习率调度器与 EMA；
+- 训练期 budget controller 的内部窗口状态与 offender 冷却状态；
+- 历史最佳指标、累计 OOM 计数与 runtime benchmark history；
+- Python / NumPy / Torch 的随机数状态。
+
+继续训练默认仍会写入**新的**运行目录，避免覆盖旧实验。推荐用于 resume 的 checkpoint 是：
+
+- `latest_model.pt`
+- `model_epoch_XX.pt`
+
+这两类 checkpoint 现在都在**整轮训练真正结束后**写出，因此可以恢复到完整 epoch 边界状态。`best_*` 系列 checkpoint 主要用于评估与选模，不建议作为 resume 主入口；新版训练器也会显式把它们标记为**非 resume checkpoint**，误用时会直接报错，而不是做不完整恢复。
+
+最小恢复验证示例：从 `epoch 80` 的 checkpoint 接着跑到 `epoch 90`，同时复用旧运行中已有的 blind pool 缓存。
+
+```bash
+uv run python train.py \
+    --config configs/train.toml \
+    --resume_ckpt checkpoints/train_2026-03-17_17-37-44/model_epoch_80.pt \
+    --resume_blind_pool_dir checkpoints/train_2026-03-17_17-37-44/blind_pool_cache \
+    --stop_after_epoch 90 \
+    --val_full_every 0 \
+    --val_full_last_epochs 0 \
+    --blind_pool_refresh_every 1000 \
+    --skip_test_after_training
+```
+
+说明：
+
+- `--resume_ckpt` 会从 checkpoint 中恢复训练状态，并从 `checkpoint["epoch"] + 1` 对应的轮次继续执行。
+- `--resume_blind_pool_dir` 仅在当前新运行目录还没有自己的 `blind_pool_cache/` 时生效，用于加载旧运行中已有的候选池缓存。
+- `--stop_after_epoch` 使用 **1-based** 绝对 epoch 编号，且包含该轮；例如传 `90` 会在第 90 轮结束后退出。
+- 为保证学习率调度、课程进度和 replay 阈值一致，**继续训练时应保持相同的 `--epochs` 总轮数**，不要把 `100` 改成 `10`。
+- 新版 resume 默认会对 checkpoint 中保存的训练配置做**严格校验**。除少量明确允许的评估类覆盖项外，若当前参数与 checkpoint 训练配置不一致，程序会直接报错。
+- 当前允许覆盖的主要参数包括：`val_subset_ratio`、`val_full_every`、`val_full_last_epochs`、`run_test_after_training`、`blind_pool_refresh_every`、`blind_pool_refresh_on_best_update`、`blind_pool_max_complexes`、`blind_pool_cost_budget`、`final_topn_cost_budget`、`eval_cost_guard_headroom`、`test_topk`。
+- `latest_model.pt` 与 `model_epoch_XX.pt` 会写入完整的 `trainer_state`、RNG 状态以及 checkpoint 角色标记；`best_*` checkpoint 仅保存选优所需状态，不再被视为合法 resume 入口。
+- 对于旧版 checkpoint，若其中缺少 `training_config`、`trainer_state` 或 `rng_state`，程序会显式进入 `best_effort` 模式，并在日志中列出缺失项。
+- `best_effort` 模式下仍会恢复模型、优化器、scheduler、EMA 与基础指标；但缺失的预算控制器窗口状态、OOM 历史、runtime benchmark history、随机数状态等部分会退回当前运行默认值，而不是假装已经完整恢复。
+
 常改训练参数已整理到 `configs/train.toml`，模型/图拓扑/flow-matching/loss 相关参数已整理到 `configs/model.toml`；这些模型内部参数需要在配置中显式给出，不再依赖代码层隐式兜底。命令行参数会覆盖配置文件。
 
 训练阶段默认采用“分层轻量验证 + 最终完整测试”拆分：
@@ -408,6 +451,9 @@ tail -f "logs/smoke/nohup/nohup_train_${run_suffix}.log"
 |------|------|--------|------|
 | `--data_root` | str | 见下 | **必填**（config 或 CLI）。数据根目录（一个文件夹），**必须**内含 `index.csv`，如 `data/processed/hiqbind`。不允许自定义 index 路径。 |
 | `--save_dir` | str | `./checkpoints` | 运行产物根目录。每次训练会自动创建与日志同名的子目录，如 `checkpoints/train_2026-03-07_15-30-00/`。 |
+| `--resume_ckpt` | str | `None` | 继续训练时加载的 checkpoint 路径；会恢复模型、优化器、调度器与 EMA 状态。 |
+| `--resume_blind_pool_dir` | str | `None` | 继续训练时用于读取旧 blind pool 缓存的目录；若未提供且 `resume_ckpt` 同目录下存在 `blind_pool_cache/`，则自动推断。 |
+| `--stop_after_epoch` | int | `None` | 提前停止训练的绝对 epoch 编号，按 1-based 计数且包含该轮。 |
 | `--device` | str | `configs/train.toml` 中的 `device` | 训练设备（`cuda:0`、`cuda:1`、`cpu` 等） |
 | `--run_suffix` | str | 自动生成 | 可选运行后缀；用于让训练正式日志、`nohup` 日志和产物目录共享同一次运行标识。 |
 | `--smoke` | flag | `false` | 将文本日志重定向到 `logs/smoke/...`，便于集中清理 smoke 运行日志；不影响 checkpoint 目录。 |
@@ -461,9 +507,9 @@ tail -f "logs/smoke/nohup/nohup_train_${run_suffix}.log"
 | `--ablation_mode` | str | `none` | 消融模式：`none` / `inter_multiscale_off` |
 | `--run_test_after_training` | flag | 启用 | 训练后自动运行独立 test 评估 |
 | `--test_topk` | str | `1,5,10` | Top-N 成功率统计阈值列表 |
-| `--center_proposal_weight` | float | 0.15 | blind-pool replay 中 center value supervision 的损失权重 |
+| `--center_proposal_weight` | float | 0.15 | 在线 center proposal supervision 与 blind-pool replay center value supervision 的共享损失权重 |
 | `--center_positive_radius` | float | 4.0 | crop curriculum 与 blind center 指标使用的命中半径（Å） |
-| `--center_guidance_learned_start` | float | 0.35 | 中心打分从几何先验切换到学习分数的训练进度阈值 |
+| `--center_guidance_learned_start` | float | 0.35 | 中心打分开始从几何先验平滑过渡到学习分数的训练进度阈值；在 `replay_start_ratio` 前逐步完成接管 |
 | `--center_proposal_topk` | int | 8 | stage-1 保留的候选中心数量 |
 | `--center_refine_topk` | int | 3 | stage-2 深化对接的中心数量 |
 | `--center_nms_radius` | float | 6.0 | 候选中心去冗余半径（Å） |
@@ -538,7 +584,7 @@ tail -f "logs/smoke/nohup/nohup_train_${run_suffix}.log"
 
 每轮训练结束后自动输出训练期轻量验证结果：
 
-- **分项损失**：`loss_trans` / `loss_rot` / `loss_torsion` / `loss_energy` / `loss_clash`
+- **分项损失**：`loss_translation` / `loss_rotation` / `loss_torsion` / `loss_energy` / `loss_clash`
 - **轻量验证指标**：`val_loss`、`mean_rmsd_final`、`single_shot_success_2a/5a`、`cost_guard_skips`
 - **日志文件**：默认为 `logs/train/train_{timestamp}.log`；若启用 `--smoke`，则为 `logs/smoke/train/train_{timestamp}.log`
 - **运行目录**：`checkpoints/train_{timestamp}/`

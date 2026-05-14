@@ -266,8 +266,8 @@ class TangentTargetProjector:
 
 
         Returns:
-            v_trans: 平移速度 [B, 3]
-            v_rot: 旋转速度（轴角表示）[B, 3]
+            v_translation: 平移速度 [B, 3]
+            v_rotation: 旋转速度（轴角表示）[B, 3]
             v_torsion: 扭转角速度 [T]
         """
 
@@ -297,13 +297,13 @@ class TangentTargetProjector:
             else torch.zeros(0, device=device, dtype=batch.dtype)
         )
 
-        v_trans = torch.zeros(B, 3, device=device, dtype=dtype)
-        v_rot = torch.zeros(B, 3, device=device, dtype=dtype)
+        v_translation = torch.zeros(B, 3, device=device, dtype=dtype)
+        v_rotation = torch.zeros(B, 3, device=device, dtype=dtype)
         v_torsion = torch.zeros(T, device=device, dtype=dtype)
 
         if not torch.isfinite(pos_const).all() or not torch.isfinite(vel).all():
             logger.debug("Numerical instability in decompose: non-finite coordinates or velocities.")
-            return v_trans, v_rot, v_torsion
+            return v_translation, v_rotation, v_torsion
 
         for b in range(B):
             atom_ids = torch.nonzero(batch == b, as_tuple=False).squeeze(-1)
@@ -316,14 +316,14 @@ class TangentTargetProjector:
             masses_b = masses[atom_ids].clamp(min=self.eps)
 
             basis_fields: list[Tensor] = []
-            trans_basis = self._translation_velocity_basis(
+            translation_basis = self._translation_velocity_basis(
                 int(atom_ids.numel()),
                 device=device,
                 dtype=dtype,
             )
-            rot_basis = self._angular_velocity_basis(rel_pos_b)
-            basis_fields.extend([trans_basis[:, :, k] for k in range(3)])
-            basis_fields.extend([rot_basis[:, :, k] for k in range(3)])
+            rotation_basis = self._angular_velocity_basis(rel_pos_b)
+            basis_fields.extend([translation_basis[:, :, k] for k in range(3)])
+            basis_fields.extend([rotation_basis[:, :, k] for k in range(3)])
 
             local_torsion_ids = (
                 torch.nonzero(torsion_batch == b, as_tuple=False).squeeze(-1)
@@ -345,9 +345,9 @@ class TangentTargetProjector:
                     field = torch.zeros((atom_ids.numel(), 3), device=device, dtype=dtype)
                     moving_mask = local_masks[local_idx]
                     if bool(moving_mask.any()):
-                        rel_rot = pos_b[moving_mask] - u[local_idx]
-                        axis_vec = axis[local_idx].unsqueeze(0).expand_as(rel_rot)
-                        field[moving_mask] = torch.cross(axis_vec, rel_rot, dim=-1)
+                        relative_rotation = pos_b[moving_mask] - u[local_idx]
+                        axis_vec = axis[local_idx].unsqueeze(0).expand_as(relative_rotation)
+                        field[moving_mask] = torch.cross(axis_vec, relative_rotation, dim=-1)
                     basis_fields.append(field)
 
             solution = self._solve_local_weighted_system(
@@ -358,12 +358,12 @@ class TangentTargetProjector:
             if solution.numel() < 6:
                 continue
 
-            v_trans[b] = solution[:3]
-            v_rot[b] = solution[3:6]
+            v_translation[b] = solution[:3]
+            v_rotation[b] = solution[3:6]
             if local_torsion_ids.numel() > 0:
                 v_torsion[local_torsion_ids] = solution[6 : 6 + int(local_torsion_ids.numel())]
 
-        return v_trans, v_rot, v_torsion
+        return v_translation, v_rotation, v_torsion
 
 
 class PoseUpdater:
@@ -391,8 +391,8 @@ class PoseUpdater:
         pos: Tensor,
         masses: Tensor,
         batch: Tensor,
-        v_trans: Tensor,
-        v_rot: Tensor,
+        v_translation: Tensor,
+        v_rotation: Tensor,
         v_torsion: Tensor | None,
         torsion_indices: Tensor | None,
         torsion_moving_mask: Tensor | None,
@@ -406,8 +406,8 @@ class PoseUpdater:
             pos: 节点坐标张量。
             masses: masses。
             batch: batch。
-            v_trans: v平移。
-            v_rot: v旋转。
+            v_translation: 平移速度。
+            v_rotation: 旋转速度。
             v_torsion: 扭转角速度或扭转更新量。
             torsion_indices: 扭转角对应的原子索引张量。
             torsion_moving_mask: 扭转更新时需要跟随旋转的原子掩码。
@@ -421,7 +421,7 @@ class PoseUpdater:
         if masses.dim() == 1:
             masses = masses.unsqueeze(-1)
 
-        B = v_trans.shape[0]
+        B = v_translation.shape[0]
         T = torsion_indices.shape[0] if torsion_indices is not None else 0
         new_pos = pos.clone()
 
@@ -457,19 +457,19 @@ class PoseUpdater:
                 if not mask.any():
                     continue
 
-                rot_mat = self._axis_angle_to_matrix(axis, angle)
+                rotation_matrix = self._axis_angle_to_matrix(axis, angle)
                 rel_pts = new_pos[mask] - origin
 
-                new_pos[mask] = torch.matmul(rel_pts, rot_mat.T) + origin
+                new_pos[mask] = torch.matmul(rel_pts, rotation_matrix.T) + origin
 
         com = compute_center_of_mass(new_pos, batch, masses, dim_size=B)
 
-        d_trans = v_trans * dt
-        d_rot_vec = v_rot * dt
-        theta = torch.norm(d_rot_vec, dim=-1, keepdim=True)
-        rot_axis = d_rot_vec / (theta + self.eps)
+        delta_translation = v_translation * dt
+        delta_rotation_vector = v_rotation * dt
+        theta = torch.norm(delta_rotation_vector, dim=-1, keepdim=True)
+        rotation_axis = delta_rotation_vector / (theta + self.eps)
 
-        R_all = self._axis_angle_to_matrix_batched(rot_axis, theta.squeeze(-1))
+        R_all = self._axis_angle_to_matrix_batched(rotation_axis, theta.squeeze(-1))
 
         small_angle = theta.squeeze(-1) <= PhysicsConstants.MIN_ROTATION_ANGLE
         eye_B = torch.eye(3, device=new_pos.device, dtype=new_pos.dtype).unsqueeze(0).expand(B, -1, -1)
@@ -477,11 +477,11 @@ class PoseUpdater:
 
         com_per_atom = com[batch]
         R_per_atom = R_all[batch]
-        d_trans_per_atom = d_trans[batch]
+        delta_translation_per_atom = delta_translation[batch]
 
         pos_centered = new_pos - com_per_atom
         pos_rotated = torch.einsum('nij,nj->ni', R_per_atom, pos_centered)
-        new_pos = pos_rotated + com_per_atom + d_trans_per_atom
+        new_pos = pos_rotated + com_per_atom + delta_translation_per_atom
 
         return new_pos
 
@@ -608,7 +608,7 @@ class PathInterpolator:
 
         com_0 = compute_center_of_mass(pos_0, batch, masses, dim_size=B)
         com_1 = compute_center_of_mass(pos_1, batch, masses, dim_size=B)
-        delta_trans = com_1 - com_0
+        delta_translation = com_1 - com_0
 
         pos_0_centered = pos_0 - com_0[batch]
         pos_1_centered = pos_1 - com_1[batch]
@@ -617,7 +617,7 @@ class PathInterpolator:
             logger.warning("NaN detected in centered positions during path parameter computation.")
             return {
                 "com_0": com_0,
-                "delta_trans": delta_trans,
+                "delta_translation": delta_translation,
                 "R_total": torch.eye(3, device=device, dtype=dtype).unsqueeze(0).repeat(B, 1, 1),
                 "delta_torsions": torch.zeros(T, device=device, dtype=dtype),
                 "pos_0_centered": torch.zeros_like(pos_0_centered),
@@ -657,10 +657,10 @@ class PathInterpolator:
                     Vh = Vh.clone()
                     Vh[det < 0, -1, :] *= -1
                     R_valid = torch.matmul(Vh.transpose(-2, -1), U.transpose(-2, -1))
-                finite_rot = torch.isfinite(R_valid).all(dim=-1).all(dim=-1)
-                if bool(finite_rot.any()):
-                    R[valid_indices[finite_rot]] = R_valid[finite_rot].to(device=device, dtype=dtype)
-                fallback_indices = valid_indices[~finite_rot]
+                finite_rotation = torch.isfinite(R_valid).all(dim=-1).all(dim=-1)
+                if bool(finite_rotation.any()):
+                    R[valid_indices[finite_rotation]] = R_valid[finite_rotation].to(device=device, dtype=dtype)
+                fallback_indices = valid_indices[~finite_rotation]
             except RuntimeError as exc:
                 logger.warning("Batched Kabsch SVD failed: %s. Falling back to per-molecule solve.", exc)
                 fallback_indices = valid_indices
@@ -692,7 +692,7 @@ class PathInterpolator:
 
         return {
             "com_0": com_0,
-            "delta_trans": delta_trans,
+            "delta_translation": delta_translation,
             "R_total": R,
             "delta_torsions": delta_torsions,
             "pos_0_centered": pos_0_centered,
@@ -738,10 +738,10 @@ class PathInterpolator:
 
         batch = params["batch"]
 
-        com_t = params["com_0"] + t * params["delta_trans"]
+        com_t = params["com_0"] + t * params["delta_translation"]
 
-        rot_vec = self._matrix_to_axis_angle(params["R_total"])
-        R_t = self._rotation_vector_to_matrix(rot_vec * t)
+        rotation_vector = self._matrix_to_axis_angle(params["R_total"])
+        R_t = self._rotation_vector_to_matrix(rotation_vector * t)
 
         pos_torsioned = params["pos_0_centered"].clone()
 
@@ -760,10 +760,10 @@ class PathInterpolator:
                 axis = F.normalize(v - u, dim=0, eps=PhysicsConstants.EPSILON)
 
                 mask = params["torsion_moving_mask"][i]
-                rot_mat = PoseUpdater._axis_angle_to_matrix(axis, ang)
+                rotation_matrix = PoseUpdater._axis_angle_to_matrix(axis, ang)
 
                 pts = pos_torsioned[mask] - u
-                pos_torsioned[mask] = torch.matmul(pts, rot_mat.T) + u
+                pos_torsioned[mask] = torch.matmul(pts, rotation_matrix.T) + u
 
         R_t_expanded = R_t[batch]
         return torch.einsum("nij,nj->ni", R_t_expanded, pos_torsioned) + com_t[batch]
@@ -833,7 +833,7 @@ class PathInterpolator:
 
 
     @staticmethod
-    def _rotation_vector_to_matrix(rot_vec: Tensor) -> Tensor:
+    def _rotation_vector_to_matrix(rotation_vector: Tensor) -> Tensor:
         """
         指数映射（exp map）：so(3) -> SO(3)（batch 版本）
 
@@ -841,12 +841,18 @@ class PathInterpolator:
             Tensor: 返回计算得到的张量结果。
         """
 
-        angle = torch.norm(rot_vec, dim=-1, keepdim=True)
+        angle = torch.norm(rotation_vector, dim=-1, keepdim=True)
         mask = angle.squeeze(-1) < PhysicsConstants.MIN_ROTATION_ANGLE
-        axis = rot_vec / (angle + PhysicsConstants.EPSILON)
+        axis = rotation_vector / (angle + PhysicsConstants.EPSILON)
 
-        B = rot_vec.shape[0]
-        K = torch.zeros(B, 3, 3, device=rot_vec.device, dtype=rot_vec.dtype)
+        B = rotation_vector.shape[0]
+        K = torch.zeros(
+            B,
+            3,
+            3,
+            device=rotation_vector.device,
+            dtype=rotation_vector.dtype,
+        )
         K[:, 0, 1] = -axis[:, 2]
         K[:, 0, 2] = axis[:, 1]
         K[:, 1, 0] = axis[:, 2]
@@ -854,7 +860,11 @@ class PathInterpolator:
         K[:, 2, 0] = -axis[:, 1]
         K[:, 2, 1] = axis[:, 0]
 
-        identity_mat = torch.eye(3, device=rot_vec.device, dtype=rot_vec.dtype).unsqueeze(0)
+        identity_mat = torch.eye(
+            3,
+            device=rotation_vector.device,
+            dtype=rotation_vector.dtype,
+        ).unsqueeze(0)
         R = (
             identity_mat
             + torch.sin(angle).unsqueeze(2) * K
@@ -862,6 +872,10 @@ class PathInterpolator:
         )
 
         if mask.any():
-            R[mask] = torch.eye(3, device=rot_vec.device, dtype=rot_vec.dtype)
+            R[mask] = torch.eye(
+                3,
+                device=rotation_vector.device,
+                dtype=rotation_vector.dtype,
+            )
 
         return R

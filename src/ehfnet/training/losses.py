@@ -29,9 +29,9 @@ class FlowMatchingLoss(nn.Module):
     def __init__(
         self,
         characteristic_scale: float,
-        weight_trans: float,
+        weight_translation: float,
         *,
-        weight_rot: float,
+        weight_rotation: float,
         weight_torsion: float,
         weight_energy: float,
         weight_clash: float,
@@ -49,8 +49,8 @@ class FlowMatchingLoss(nn.Module):
 
         Args:
             characteristic_scale: 平衡平移与旋转量纲的特征长度尺度。
-            weight_trans: 平移损失权重。
-            weight_rot: 旋转损失权重。
+            weight_translation: 平移损失权重。
+            weight_rotation: 旋转损失权重。
             weight_torsion: 扭转损失权重。
             weight_energy: 亲和力损失权重。
             weight_clash: 位阻损失权重。
@@ -68,8 +68,8 @@ class FlowMatchingLoss(nn.Module):
         self.L = characteristic_scale
 
         self.weights = {
-            "trans": weight_trans,
-            "rot": weight_rot,
+            "translation": weight_translation,
+            "rotation": weight_rotation,
             "torsion": weight_torsion,
             "energy": weight_energy,
             "clash": weight_clash,
@@ -188,46 +188,58 @@ class FlowMatchingLoss(nn.Module):
 
         loss_dict: dict[str, Tensor] = {}
 
-        pred_trans = predictions.get("v_translation")
+        pred_translation = predictions.get("v_translation")
 
-        if pred_trans is None:
+        if pred_translation is None:
             raise ValueError("Key 'v_translation' is missing in predictions.")
 
-        device = pred_trans.device
+        device = pred_translation.device
         schedule = self._get_loss_schedule(data)
 
-        gt_trans = targets.get("v_trans_target")
+        target_translation = targets.get("v_translation_target")
 
-        if gt_trans is None:
-            raise ValueError("Key 'v_trans_target' is missing in targets.")
+        if target_translation is None:
+            raise ValueError("Key 'v_translation_target' is missing in targets.")
 
-        loss_trans = F.huber_loss(pred_trans, gt_trans, delta=1.0)
-        loss_dict["loss_trans"] = loss_trans.detach()
-        loss_dict["_raw_loss_trans"] = loss_trans
+        loss_translation = F.huber_loss(
+            pred_translation,
+            target_translation,
+            delta=1.0,
+        )
+        loss_dict["loss_translation"] = loss_translation.detach()
+        loss_dict["_raw_loss_translation"] = loss_translation
 
-        pred_rot = predictions.get("v_rotation")
-        gt_rot = targets.get("v_rot_target")
+        pred_rotation = predictions.get("v_rotation")
+        target_rotation = targets.get("v_rotation_target")
 
-        if pred_rot is None or gt_rot is None:
+        if pred_rotation is None or target_rotation is None:
             raise ValueError("Missing rotation data in predictions or targets.")
 
-        loss_rot = F.huber_loss(pred_rot * self.L, gt_rot * self.L, delta=1.0)
-        loss_dict["loss_rot"] = loss_rot.detach()
-        loss_dict["_raw_loss_rot"] = loss_rot
+        loss_rotation = F.huber_loss(
+            pred_rotation * self.L,
+            target_rotation * self.L,
+            delta=1.0,
+        )
+        loss_dict["loss_rotation"] = loss_rotation.detach()
+        loss_dict["_raw_loss_rotation"] = loss_rotation
 
         loss_torsion = torch.tensor(0.0, device=device)
-        pred_tor = predictions.get("v_torsion")
-        gt_tor = targets.get("v_torsion_target")
+        pred_torsion = predictions.get("v_torsion")
+        target_torsion = targets.get("v_torsion_target")
 
-        if pred_tor is not None and gt_tor is not None and gt_tor.numel() > 0:
+        if (
+            pred_torsion is not None
+            and target_torsion is not None
+            and target_torsion.numel() > 0
+        ):
 
-            if pred_tor.dim() == 1:
-                pred_tor = pred_tor.view(-1, 1)
+            if pred_torsion.dim() == 1:
+                pred_torsion = pred_torsion.view(-1, 1)
 
-            if gt_tor.dim() == 1:
-                gt_tor = gt_tor.view(-1, 1)
+            if target_torsion.dim() == 1:
+                target_torsion = target_torsion.view(-1, 1)
 
-            cos_diff = 1.0 - torch.cos(pred_tor - gt_tor)
+            cos_diff = 1.0 - torch.cos(pred_torsion - target_torsion)
             loss_torsion = torch.mean(cos_diff) * (self.L / 2.0)
 
         if torch.isnan(loss_torsion.detach()):
@@ -331,8 +343,14 @@ class FlowMatchingLoss(nn.Module):
                     loss_pose_rank = (per_sample_bce * weight).mean()
 
         loss_dict["loss_pose_rank_bce"] = loss_pose_rank.detach()
-        loss_dict["weight_trans"] = torch.tensor(schedule["trans"], device=device)
-        loss_dict["weight_rot"] = torch.tensor(schedule["rot"], device=device)
+        loss_dict["weight_translation"] = torch.tensor(
+            schedule["translation"],
+            device=device,
+        )
+        loss_dict["weight_rotation"] = torch.tensor(
+            schedule["rotation"],
+            device=device,
+        )
         loss_dict["weight_torsion"] = torch.tensor(schedule["torsion"], device=device)
         loss_dict["weight_energy"] = torch.tensor(schedule["energy"], device=device)
         loss_dict["weight_clash"] = torch.tensor(schedule["clash"], device=device)
@@ -340,8 +358,8 @@ class FlowMatchingLoss(nn.Module):
         loss_dict["_raw_loss_pose_rank_bce"] = loss_pose_rank
 
         total_loss = (
-            schedule["trans"] * loss_trans
-            + schedule["rot"] * loss_rot
+            schedule["translation"] * loss_translation
+            + schedule["rotation"] * loss_rotation
             + schedule["torsion"] * loss_torsion
             + schedule["energy"] * loss_energy
             + schedule["clash"] * loss_clash

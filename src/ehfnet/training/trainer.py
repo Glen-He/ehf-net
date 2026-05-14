@@ -13,7 +13,6 @@ import math
 import os
 import time
 import traceback
-from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
@@ -70,13 +69,19 @@ from ehfnet.training.center_sampling import (
 )
 from ehfnet.training.checkpoint_io import (
     build_selection_metrics,
-    compose_checkpoint,
+    build_checkpoint_model_config_kwargs,
+    capture_rng_state,
+    CheckpointEpochState,
+    CheckpointModelState,
+    compose_resume_checkpoint,
+    compose_selection_checkpoint,
     is_better_checkpoint,
     resolve_selection_rule,
 )
 from ehfnet.training.flow_matcher import ConditionalFlowMatcher
 from ehfnet.training.inference import (
     DEFAULT_FUSION_WEIGHTS,
+    compute_center_guidance_fraction,
     compute_center_guidance_scores,
     evaluate_topn_success,
     predict_center_proposal_logits,
@@ -85,7 +90,17 @@ from ehfnet.training.inference import (
 )
 from ehfnet.training.losses import FlowMatchingLoss
 from ehfnet.training.normalization import compute_train_split_normalization_stats
-from ehfnet.training.rerank_losses import pairwise_ranking_loss_from_pairs
+from ehfnet.training.resume import (
+    build_trainer_state_snapshot,
+    build_training_config_snapshot,
+    load_resume_checkpoint,
+    TrainerRuntimeState,
+)
+from ehfnet.training.rerank_losses import (
+    build_center_value_targets,
+    compute_center_value_loss,
+    pairwise_ranking_loss_from_pairs,
+)
 from ehfnet.training.validation import compute_validation_loss
 
 logger = logging.getLogger(__name__)
@@ -152,26 +167,26 @@ def train(
     flow_torsion_scale_min: float,
     flow_torsion_scale_max: float,
     loss_characteristic_scale: float,
-    loss_weight_trans: float,
-    loss_weight_rot: float,
+    loss_weight_translation: float,
+    loss_weight_rotation: float,
     loss_weight_torsion: float,
     loss_weight_energy: float,
     loss_weight_clash: float,
     loss_weight_pose_rank: float,
-    loss_coarse_trans: float,
-    loss_coarse_rot: float,
+    loss_coarse_translation: float,
+    loss_coarse_rotation: float,
     loss_coarse_torsion: float,
     loss_coarse_energy: float,
     loss_coarse_clash: float,
     loss_coarse_pose_rank: float,
-    loss_transition_trans: float,
-    loss_transition_rot: float,
+    loss_transition_translation: float,
+    loss_transition_rotation: float,
     loss_transition_torsion: float,
     loss_transition_energy: float,
     loss_transition_clash: float,
     loss_transition_pose_rank: float,
-    loss_refine_trans: float,
-    loss_refine_rot: float,
+    loss_refine_translation: float,
+    loss_refine_rotation: float,
     loss_refine_torsion: float,
     loss_refine_energy: float,
     loss_refine_clash: float,
@@ -273,6 +288,9 @@ def train(
     replay_budget_recover_window_count: int,
     replay_candidate_cooldown: int,
     replay_max_candidates_per_complex: int,
+    resume_ckpt: str | None = None,
+    resume_blind_pool_dir: str | None = None,
+    stop_after_epoch: int | None = None,
     esm_path: str | None = None,
     run_name: str | None = None,
     run_log_file: str | None = None,
@@ -340,26 +358,26 @@ def train(
         flow_torsion_scale_min: 课程初期的扭转扰动缩放系数。
         flow_torsion_scale_max: 课程后期的扭转扰动缩放系数。
         loss_characteristic_scale: 平衡平移与旋转量纲的特征长度尺度。
-        loss_weight_trans: 平移损失的全局权重。
-        loss_weight_rot: 旋转损失的全局权重。
+        loss_weight_translation: 平移损失的全局权重。
+        loss_weight_rotation: 旋转损失的全局权重。
         loss_weight_torsion: 扭转损失的全局权重。
         loss_weight_energy: 亲和力损失的全局权重。
         loss_weight_clash: 位阻损失的全局权重。
         loss_weight_pose_rank: 构象排序损失的全局权重。
-        loss_coarse_trans: 粗阶段平移损失权重。
-        loss_coarse_rot: 粗阶段旋转损失权重。
+        loss_coarse_translation: 粗阶段平移损失权重。
+        loss_coarse_rotation: 粗阶段旋转损失权重。
         loss_coarse_torsion: 粗阶段扭转损失权重。
         loss_coarse_energy: 粗阶段亲和力损失权重。
         loss_coarse_clash: 粗阶段位阻损失权重。
         loss_coarse_pose_rank: 粗阶段构象排序损失权重。
-        loss_transition_trans: 过渡阶段平移损失权重。
-        loss_transition_rot: 过渡阶段旋转损失权重。
+        loss_transition_translation: 过渡阶段平移损失权重。
+        loss_transition_rotation: 过渡阶段旋转损失权重。
         loss_transition_torsion: 过渡阶段扭转损失权重。
         loss_transition_energy: 过渡阶段亲和力损失权重。
         loss_transition_clash: 过渡阶段位阻损失权重。
         loss_transition_pose_rank: 过渡阶段构象排序损失权重。
-        loss_refine_trans: 细化阶段平移损失权重。
-        loss_refine_rot: 细化阶段旋转损失权重。
+        loss_refine_translation: 细化阶段平移损失权重。
+        loss_refine_rotation: 细化阶段旋转损失权重。
         loss_refine_torsion: 细化阶段扭转损失权重。
         loss_refine_energy: 细化阶段亲和力损失权重。
         loss_refine_clash: 细化阶段位阻损失权重。
@@ -413,9 +431,9 @@ def train(
         val_budget_recover_window_count: 验证预算回升所需的连续干净窗口数。
         val_budget_recover_step: 验证预算每次回升的加性步长。
         val_offender_cooldown: 验证坏样本冷却时长。
-        center_proposal_weight: 中心提议损失在验证汇总中的权重。
+        center_proposal_weight: 中心提议分支在线监督与 replay 监督的共享权重。
         center_positive_radius: 中心判定为正样本时使用的距离半径。
-        center_guidance_learned_start: 中心打分从几何先验切换到学习分数的进度阈值。
+        center_guidance_learned_start: 中心打分开始从几何先验平滑过渡到学习分数的进度阈值。
         center_proposal_topk: 中心提议阶段保留的 Top-K 数量。
         center_refine_topk: 中心细化阶段阶段保留的 Top-K 数量。
         center_nms_radius: 中心去重时使用的最小间距半径。
@@ -461,6 +479,9 @@ def train(
         replay_budget_recover_window_count: replay 微批回升所需的连续干净窗口数。
         replay_candidate_cooldown: replay 复杂样本冷却时长。
         replay_max_candidates_per_complex: replay 每个复合物保留的最大候选数。
+        resume_ckpt: 继续训练时要加载的 checkpoint 路径。
+        resume_blind_pool_dir: 继续训练时优先读取 blind pool 缓存的目录。
+        stop_after_epoch: 提前停止训练的绝对 epoch 编号，按 1-based 计数且包含该轮。
         esm_path: esm路径。
         run_name: 本次运行的名称标识。
         run_log_file: 本次运行对应的日志文件路径。
@@ -676,6 +697,17 @@ def train(
         raise ValueError(
             "ranking_same_center_start must be <= ranking_wrong_center_start."
         )
+    center_guidance_learned_end = max(
+        float(center_guidance_learned_start),
+        float(replay_start_ratio),
+    )
+
+    def _resolve_center_guidance_fraction(progress: float) -> float:
+        return compute_center_guidance_fraction(
+            progress=progress,
+            learned_start=center_guidance_learned_start,
+            learned_end=center_guidance_learned_end,
+        )
 
     if not (0.0 < oom_reduce_factor < 1.0):
         raise ValueError(f"Invalid oom_reduce_factor={oom_reduce_factor}.")
@@ -742,6 +774,8 @@ def train(
         raise ValueError(
             f"Invalid replay_max_candidates_per_complex={replay_max_candidates_per_complex}."
         )
+    if stop_after_epoch is not None and int(stop_after_epoch) < 1:
+        raise ValueError(f"Invalid stop_after_epoch={stop_after_epoch}.")
 
     if val_cost_budget is None:
         raise ValueError("val_cost_budget must be configured explicitly.")
@@ -757,6 +791,8 @@ def train(
     configured_blind_pool_cost_budget = max(1, int(blind_pool_cost_budget))
     configured_final_topn_cost_budget = max(1, int(final_topn_cost_budget))
     eval_cost_guard_headroom = max(1.0, float(eval_cost_guard_headroom))
+    training_config_snapshot = build_training_config_snapshot(locals())
+    checkpoint_model_config_kwargs = build_checkpoint_model_config_kwargs(locals())
 
 
     def _annotate_loss_context(batch_obj: Any, *, current_epoch: int, total_epochs_count: int, warmup_epochs_count: int, training: bool) -> None:
@@ -1422,6 +1458,11 @@ def train(
             "Blind pool refresh is configured to start very early and run every epoch; early-epoch pool quality may be noisy."
         )
     logger.info(
+        "Center guidance schedule: learned_start=%.2f | learned_full=%.2f | source=replay-aligned blend.",
+        center_guidance_learned_start,
+        center_guidance_learned_end,
+    )
+    logger.info(
         "Evaluation budgets: "
         f"blind_pool_cost_budget={configured_blind_pool_cost_budget} | "
         f"final_topn_cost_budget={configured_final_topn_cost_budget}."
@@ -1479,32 +1520,32 @@ def train(
     )
     criterion = FlowMatchingLoss(
         characteristic_scale=loss_characteristic_scale,
-        weight_trans=loss_weight_trans,
-        weight_rot=loss_weight_rot,
+        weight_translation=loss_weight_translation,
+        weight_rotation=loss_weight_rotation,
         weight_torsion=loss_weight_torsion,
         weight_energy=loss_weight_energy,
         weight_clash=loss_weight_clash,
         weight_pose_rank=loss_weight_pose_rank,
         curriculum_weights={
             "coarse": {
-                "trans": loss_coarse_trans,
-                "rot": loss_coarse_rot,
+                "translation": loss_coarse_translation,
+                "rotation": loss_coarse_rotation,
                 "torsion": loss_coarse_torsion,
                 "energy": loss_coarse_energy,
                 "clash": loss_coarse_clash,
                 "pose_rank": loss_coarse_pose_rank,
             },
             "transition": {
-                "trans": loss_transition_trans,
-                "rot": loss_transition_rot,
+                "translation": loss_transition_translation,
+                "rotation": loss_transition_rotation,
                 "torsion": loss_transition_torsion,
                 "energy": loss_transition_energy,
                 "clash": loss_transition_clash,
                 "pose_rank": loss_transition_pose_rank,
             },
             "refine": {
-                "trans": loss_refine_trans,
-                "rot": loss_refine_rot,
+                "translation": loss_refine_translation,
+                "rotation": loss_refine_rotation,
                 "torsion": loss_refine_torsion,
                 "energy": loss_refine_energy,
                 "clash": loss_refine_clash,
@@ -1567,17 +1608,74 @@ def train(
 
     ema_model: AveragedModel | None = None
 
-    best_val_loss = float("inf")
-    best_rmsd = float("inf")
-    best_composite_metrics: dict[str, float] | None = None
-    best_single_shot_success2a_metrics: dict[str, float] | None = None
-    best_rmsd_metrics: dict[str, float] | None = None
-    best_selected_metrics: dict[str, float] | None = None
-    current_fusion_weights = dict(DEFAULT_FUSION_WEIGHTS)
-    total_oom_batches = 0
-    runtime_benchmark_history: list[dict[str, Any]] = []
-    clone_safety_checked = False
-    selected_primary_key, selected_higher_is_better, selected_metric_label = resolve_selection_rule(checkpoint_selection_mode)
+    runtime_state = TrainerRuntimeState(
+        best_val_loss=float("inf"),
+        best_rmsd=float("inf"),
+        best_composite_metrics=None,
+        best_single_shot_success2a_metrics=None,
+        best_rmsd_metrics=None,
+        best_selected_metrics=None,
+        current_fusion_weights=dict(DEFAULT_FUSION_WEIGHTS),
+        total_oom_batches=0,
+        runtime_benchmark_history=[],
+        clone_safety_checked=False,
+    )
+    selected_primary_key, selected_higher_is_better, selected_metric_label = resolve_selection_rule(
+        checkpoint_selection_mode
+    )
+    start_epoch = 0
+    resume_blind_pool_source_dir: str | None = None
+    if resume_ckpt is not None:
+        resume_result = load_resume_checkpoint(
+            resume_ckpt=resume_ckpt,
+            device=device,
+            use_configured_cuda=use_configured_cuda,
+            training_config_snapshot=training_config_snapshot,
+            resume_blind_pool_dir=resume_blind_pool_dir,
+            model=model,
+            criterion=criterion,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            ema_decay=ema_decay,
+            runtime_state=runtime_state,
+            train_budget_controller=train_budget_controller,
+            val_partial_budget_controller=val_partial_budget_controller,
+            val_full_budget_controller=val_full_budget_controller,
+            same_center_budget_controller=same_center_budget_controller,
+            ranking_budget_controller=ranking_budget_controller,
+            replay_budget_controller=replay_budget_controller,
+        )
+        start_epoch = resume_result.start_epoch
+        resume_blind_pool_source_dir = resume_result.resume_blind_pool_source_dir
+        ema_model = resume_result.ema_model
+        runtime_state = resume_result.runtime_state
+    best_val_loss = runtime_state.best_val_loss
+    best_rmsd = runtime_state.best_rmsd
+    best_composite_metrics = runtime_state.best_composite_metrics
+    best_single_shot_success2a_metrics = (
+        runtime_state.best_single_shot_success2a_metrics
+    )
+    best_rmsd_metrics = runtime_state.best_rmsd_metrics
+    best_selected_metrics = runtime_state.best_selected_metrics
+    current_fusion_weights = dict(runtime_state.current_fusion_weights)
+    total_oom_batches = runtime_state.total_oom_batches
+    runtime_benchmark_history = list(runtime_state.runtime_benchmark_history)
+    clone_safety_checked = runtime_state.clone_safety_checked
+    effective_stop_after_epoch = epochs
+    if stop_after_epoch is not None:
+        effective_stop_after_epoch = min(int(stop_after_epoch), epochs)
+        if effective_stop_after_epoch != int(stop_after_epoch):
+            logger.info(
+                "stop_after_epoch=%d is beyond configured epochs=%d; clamping to %d.",
+                int(stop_after_epoch),
+                epochs,
+                effective_stop_after_epoch,
+            )
+    if start_epoch >= effective_stop_after_epoch:
+        raise ValueError(
+            "No epochs left to run after applying resume/stop settings. "
+            f"start_epoch={start_epoch + 1}, stop_after_epoch={effective_stop_after_epoch}, epochs={epochs}."
+        )
     blind_pool_cache_dir = os.path.join(save_dir, "blind_pool_cache")
     os.makedirs(blind_pool_cache_dir, exist_ok=True)
     blind_pool_signature = build_blind_pool_signature(
@@ -1592,9 +1690,20 @@ def train(
     )
     if cached_blind_pool:
         logger.info("Loaded existing blind pool: %d complexes.", len(cached_blind_pool))
+    elif resume_blind_pool_source_dir is not None:
+        cached_blind_pool = load_blind_pool(
+            resume_blind_pool_source_dir,
+            expected_signature=blind_pool_signature,
+        )
+        if cached_blind_pool:
+            logger.info(
+                "Loaded resume blind pool from %s: %d complexes.",
+                resume_blind_pool_source_dir,
+                len(cached_blind_pool),
+            )
     best_selected_updated_this_epoch = False
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, effective_stop_after_epoch):
         epoch_start_time = time.perf_counter()
         epoch_progress = 1.0 if epochs <= 1 else epoch / max(1, epochs - 1)
         gc.collect()
@@ -1736,8 +1845,8 @@ def train(
                     if not clone_safety_checked:
                         clone_safety_checked = True
                     train_progress = epoch_progress
-                    learned_center_ready = (
-                        train_progress >= center_guidance_learned_start
+                    center_guidance_fraction = _resolve_center_guidance_fraction(
+                        train_progress,
                     )
                     center_negative_ready = train_progress >= crop_near_miss_start
                     ligand_centers = scatter_mean(
@@ -1756,7 +1865,7 @@ def train(
                     center_guidance_logits_cpu = compute_center_guidance_scores(
                         proposal_logits_cpu,
                         residue_prior_feat_cpu,
-                        use_learned_scores=learned_center_ready,
+                        learned_score_fraction=center_guidance_fraction,
                     )
                     residue_pos_cpu = residue_pos_for_crop.detach().cpu()
                     residue_batch_cpu = residue_batch_for_crop.detach().cpu()
@@ -2050,12 +2159,40 @@ def train(
                         )
                         loss_dict["loss_pose_bootstrap"] = loss_pose_bootstrap.detach()
 
-                    loss_dict["loss_center_value"] = torch.tensor(0.0, device=device)
+                    loss_center_value = torch.tensor(0.0, device=device)
+                    if (
+                        center_proposal_weight > 0.0
+                        and proposal_logits is not None
+                        and residue_pos_for_crop is not None
+                        and residue_batch_for_crop is not None
+                        and ligand_centers is not None
+                    ):
+                        ligand_centers_device = ligand_centers.to(
+                            device=residue_pos_for_crop.device,
+                            dtype=residue_pos_for_crop.dtype,
+                        )
+                        center_value_targets = build_center_value_targets(
+                            residue_pos_for_crop,
+                            residue_batch_for_crop,
+                            ligand_centers_device,
+                            positive_radius=center_positive_radius,
+                        )
+                        loss_center_value = compute_center_value_loss(
+                            proposal_logits.view(-1),
+                            center_value_targets.to(
+                                device=proposal_logits.device,
+                                dtype=proposal_logits.dtype,
+                            ),
+                        )
+                        loss_dict["_raw_loss_center_value"] = loss_center_value
+
+                    loss_dict["loss_center_value"] = loss_center_value.detach()
                     loss_dict["weight_center_value"] = torch.tensor(center_proposal_weight, device=device)
                     loss_dict["weight_pose_rank_pair"] = torch.tensor(pose_ranking_pair_weight, device=device)
                     loss_dict["weight_pose_bootstrap"] = torch.tensor(pose_bootstrap_weight, device=device)
                     loss = (
                         loss_dict["total"]
+                        + center_proposal_weight * loss_center_value
                         + pose_ranking_pair_weight * loss_pose_rank
                         + pose_bootstrap_weight * loss_pose_bootstrap
                     )
@@ -2081,11 +2218,15 @@ def train(
                     loss_sum = loss * num_graphs
                     loss_terms_for_debug = {
                         "base_total": loss_dict["total"] * num_graphs,
-                        "base_trans": (
-                            loss_dict["weight_trans"] * loss_dict["_raw_loss_trans"] * num_graphs
+                        "base_translation": (
+                            loss_dict["weight_translation"]
+                            * loss_dict["_raw_loss_translation"]
+                            * num_graphs
                         ),
-                        "base_rot": (
-                            loss_dict["weight_rot"] * loss_dict["_raw_loss_rot"] * num_graphs
+                        "base_rotation": (
+                            loss_dict["weight_rotation"]
+                            * loss_dict["_raw_loss_rotation"]
+                            * num_graphs
                         ),
                         "base_torsion": (
                             loss_dict["weight_torsion"] * loss_dict["_raw_loss_torsion"] * num_graphs
@@ -2098,6 +2239,11 @@ def train(
                         ),
                         "base_pose_rank_bce": (
                             loss_dict["weight_pose_rank"] * loss_dict["_raw_loss_pose_rank_bce"] * num_graphs
+                        ),
+                        "center_value": (
+                            center_proposal_weight * loss_center_value * num_graphs
+                            if center_proposal_weight > 0.0
+                            else None
                         ),
                         "pose_rank_pair": (
                             pose_ranking_pair_weight * loss_pose_rank * num_graphs
@@ -2254,9 +2400,9 @@ def train(
                 pbar.set_postfix(
                     {
                         "Loss": f"{loss.item():.4f}",
-                        "L_tr": f"{loss_dict.get('loss_trans', torch.tensor(0)).item():.3f}",
-                        "L_rot": f"{loss_dict.get('loss_rot', torch.tensor(0)).item():.3f}",
-                        "L_tor": f"{loss_dict.get('loss_torsion', torch.tensor(0)).item():.3f}",
+                        "L_translation": f"{loss_dict.get('loss_translation', torch.tensor(0)).item():.3f}",
+                        "L_rotation": f"{loss_dict.get('loss_rotation', torch.tensor(0)).item():.3f}",
+                        "L_torsion": f"{loss_dict.get('loss_torsion', torch.tensor(0)).item():.3f}",
                         "L_ene": f"{loss_dict.get('loss_energy', torch.tensor(0)).item():.3f}",
                         "L_cls": f"{loss_dict.get('loss_clash', torch.tensor(0)).item():.3f}",
                         "L_rank": f"{loss_dict.get('loss_pose_rank', torch.tensor(0)).item():.3f}",
@@ -2332,6 +2478,17 @@ def train(
         if epoch_local_losses:
             local_mean = float(np.mean(epoch_local_losses))
             local_std = float(np.std(epoch_local_losses))
+            epoch_center_guidance_fraction = _resolve_center_guidance_fraction(
+                epoch_progress,
+            )
+            if epoch_center_guidance_fraction <= 1e-6:
+                center_guidance_label = "heuristic_prior"
+            elif epoch_center_guidance_fraction >= 1.0 - 1e-6:
+                center_guidance_label = "learned_center_value"
+            else:
+                center_guidance_label = (
+                    f"blended_center_value({epoch_center_guidance_fraction:.2f})"
+                )
             logger.info(
                 "Local crop stats | local=%.4f±%.4f | source_res/graph=%.1f | "
                 "local_res/graph=%.1f | center_guidance=%s",
@@ -2339,7 +2496,7 @@ def train(
                 local_std,
                 float(np.mean(epoch_source_residues)) if epoch_source_residues else 0.0,
                 float(np.mean(epoch_local_residues)) if epoch_local_residues else 0.0,
-                "learned_center_value" if cached_blind_pool else "prior_bootstrap",
+                center_guidance_label,
             )
         logger.info(
             "Ranking stats | same_center=%d | wrong_center_low_clash=%d | misleading_center=%d | "
@@ -2529,67 +2686,31 @@ def train(
             selection_metrics[selected_primary_key],
         )
 
-        checkpoint = compose_checkpoint(
+        checkpoint_epoch_state = CheckpointEpochState(
             epoch_idx=epoch,
             avg_train_loss_value=avg_train_loss,
             val_metrics_obj=val_metrics,
             selection_metrics=selection_metrics,
-            model=model,
-            ema_model=ema_model,
-            criterion=criterion,
-            optimizer=optimizer,
-            scheduler=scheduler,
             best_val_loss=best_val_loss,
             best_rmsd=best_rmsd,
             current_fusion_weights=current_fusion_weights,
             normalization_stats=normalization_stats,
             run_name=run_name,
             run_log_file=run_log_file,
-            esm_dim=esm_dim,
-            interaction_profile=interaction_profile,
-            hidden_dim=hidden_dim,
-            num_gnn_blocks=num_gnn_blocks,
-            m_dim_scalar=m_dim_scalar,
-            dropout_rate=dropout_rate,
-            lig_atom_cont_count=lig_atom_cont_count,
-            lig_mol_cont_count=lig_mol_cont_count,
-            pro_atom_cont_count=pro_atom_cont_count,
-            pro_res_cont_count=pro_res_cont_count,
-            num_rbf=num_rbf,
-            r_cutoff=r_cutoff,
-            force_cutoff=force_cutoff,
-            frame_refine_threshold=frame_refine_threshold,
-            frame_refine_temperature=frame_refine_temperature,
-            energy_guide_threshold=energy_guide_threshold,
-            energy_guide_temperature=energy_guide_temperature,
-            clash_threshold=clash_threshold,
-            clash_push_threshold=clash_push_threshold,
-            clash_push_force=clash_push_force,
-            score_clamp_min=score_clamp_min,
-            score_clamp_max=score_clamp_max,
-            force_limit=force_limit,
-            prediction_max_neighbors=prediction_max_neighbors,
-            prediction_min_max_neighbors=prediction_min_max_neighbors,
-            prediction_knn_fallback_k=prediction_knn_fallback_k,
-            r_cutoff_intra=r_cutoff_intra,
-            max_neighbors_intra=max_neighbors_intra,
-            atom_neighbor_cap=atom_neighbor_cap,
-            residue_neighbor_cap=residue_neighbor_cap,
-            residue_radius_scale=residue_radius_scale,
-            residue_radius_bias=residue_radius_bias,
-            ligand_atom_fallback_k=ligand_atom_fallback_k,
-            protein_atom_fallback_k=protein_atom_fallback_k,
-            protein_residue_fallback_k=protein_residue_fallback_k,
-            dynamic_inter_cutoff=dynamic_inter_cutoff,
-            dynamic_inter_knn_k=dynamic_inter_knn_k,
-            dynamic_inter_max_neighbors=dynamic_inter_max_neighbors,
-            dynamic_residue_cutoff=dynamic_residue_cutoff,
-            dynamic_residue_knn_k=dynamic_residue_knn_k,
-            dynamic_residue_max_neighbors=dynamic_residue_max_neighbors,
-            dynamic_residue_candidate_topk=dynamic_residue_candidate_topk,
         )
-
-        torch.save(checkpoint, os.path.join(save_dir, "latest_model.pt"))
+        checkpoint_model_state = CheckpointModelState(
+            model=model,
+            ema_model=ema_model,
+            criterion=criterion,
+            optimizer=optimizer,
+            scheduler=scheduler,
+        )
+        selection_checkpoint = compose_selection_checkpoint(
+            epoch_state=checkpoint_epoch_state,
+            model_state=checkpoint_model_state,
+            model_config_kwargs=checkpoint_model_config_kwargs,
+            training_config=training_config_snapshot,
+        )
 
         is_warmup = epoch < warmup_epochs
         if not is_warmup:
@@ -2601,8 +2722,8 @@ def train(
             ):
                 best_selected_metrics = dict(selection_metrics)
                 best_selected_updated_this_epoch = True
-                torch.save(checkpoint, os.path.join(save_dir, "best_selected_model.pt"))
-                torch.save(checkpoint, os.path.join(save_dir, "best_model.pt"))
+                torch.save(selection_checkpoint, os.path.join(save_dir, "best_selected_model.pt"))
+                torch.save(selection_checkpoint, os.path.join(save_dir, "best_model.pt"))
                 logger.info(
                     "Saved best selected model | mode=%s | %s=%.4f | Single-shot Success@2A=%.2f | Mean RMSD=%.4f",
                     checkpoint_selection_mode,
@@ -2618,7 +2739,7 @@ def train(
                 primary_higher_is_better=True,
             ):
                 best_composite_metrics = dict(selection_metrics)
-                torch.save(checkpoint, os.path.join(save_dir, "best_composite_model.pt"))
+                torch.save(selection_checkpoint, os.path.join(save_dir, "best_composite_model.pt"))
                 logger.info(
                     "Saved best composite model | "
                     f"Composite={selection_metrics['composite_score']:.4f}, "
@@ -2634,7 +2755,7 @@ def train(
                 primary_higher_is_better=True,
             ):
                 best_single_shot_success2a_metrics = dict(selection_metrics)
-                torch.save(checkpoint, os.path.join(save_dir, "best_single_shot_success2a_model.pt"))
+                torch.save(selection_checkpoint, os.path.join(save_dir, "best_single_shot_success2a_model.pt"))
                 logger.info(
                     "Saved best single-shot Success@2A model | "
                     f"Single-shot Success@2A={selection_metrics['single_shot_success_2a']:.2f}, "
@@ -2650,12 +2771,9 @@ def train(
             ):
                 best_rmsd_metrics = dict(selection_metrics)
                 best_rmsd = selection_metrics["mean_rmsd"]
-                checkpoint["best_rmsd"] = best_rmsd
-                torch.save(checkpoint, os.path.join(save_dir, "best_rmsd_model.pt"))
+                selection_checkpoint["best_rmsd"] = best_rmsd
+                torch.save(selection_checkpoint, os.path.join(save_dir, "best_rmsd_model.pt"))
                 logger.info(f"Saved best Mean RMSD model: {best_rmsd:.4f}")
-
-        if (epoch + 1) % 10 == 0:
-            torch.save(checkpoint, os.path.join(save_dir, f"model_epoch_{epoch+1}.pt"))
 
         if should_refresh_pool(
             epoch,
@@ -2693,8 +2811,8 @@ def train(
                     crop_atom_margin=crop_atom_margin,
                     max_complexes=blind_pool_max_complexes,
                     fusion_weights=current_fusion_weights,
-                    use_learned_center_scores=(
-                        epoch_progress >= center_guidance_learned_start
+                    learned_score_fraction=_resolve_center_guidance_fraction(
+                        epoch_progress,
                     ),
                     cost_guard_limit=max(
                         1,
@@ -2754,6 +2872,7 @@ def train(
                     replay_sample_size = min(16, len(replay_dataset))
                     replay_indices = _rng.sample(range(len(replay_dataset)), replay_sample_size)
                     replay_items = [replay_dataset[i] for i in replay_indices]
+                    optimizer.zero_grad(set_to_none=True)
 
                     replay_losses = replay_and_compute_losses(
                         model=model,
@@ -2773,21 +2892,24 @@ def train(
                         micro_batch_size=replay_budget_controller.current_budget,
                         max_candidates_per_complex=replay_max_candidates_per_complex,
                         budget_controller=replay_budget_controller,
+                        backward_losses=True,
+                        backward_normalizer=float(replay_sample_size),
                     )
 
                     replay_total = replay_losses["rerank_total"]
                     center_val_loss = replay_losses.get("center_value_loss", torch.tensor(0.0, device=device))
                     combined_replay_loss = replay_total + center_proposal_weight * center_val_loss
 
-                    if combined_replay_loss.requires_grad and combined_replay_loss.item() > 0:
-                        optimizer.zero_grad()
-                        combined_replay_loss.backward()
+                    has_replay_grad = any(
+                        param.grad is not None for param in model.parameters()
+                    )
+                    if has_replay_grad and combined_replay_loss.item() > 0:
                         replay_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad)
                         if not (torch.isnan(replay_grad_norm) or torch.isinf(replay_grad_norm)):
                             optimizer.step()
                             if ema_model is not None:
                                 ema_model.update_parameters(model)
-                        optimizer.zero_grad()
+                    optimizer.zero_grad(set_to_none=True)
 
                     logger.info(
                         "Replay reranker | bce=%.4f | pairwise=%.4f | listwise=%.4f | "
@@ -2805,7 +2927,60 @@ def train(
                     model.eval()
 
             except Exception as e:
+                optimizer.zero_grad(set_to_none=True)
                 logger.warning("Replay reranker training failed: %s\n%s", e, traceback.format_exc())
+
+        runtime_state = TrainerRuntimeState(
+            best_val_loss=best_val_loss,
+            best_rmsd=best_rmsd,
+            best_composite_metrics=best_composite_metrics,
+            best_single_shot_success2a_metrics=best_single_shot_success2a_metrics,
+            best_rmsd_metrics=best_rmsd_metrics,
+            best_selected_metrics=best_selected_metrics,
+            current_fusion_weights=current_fusion_weights,
+            total_oom_batches=total_oom_batches,
+            runtime_benchmark_history=runtime_benchmark_history,
+            clone_safety_checked=clone_safety_checked,
+        )
+        trainer_state_snapshot = build_trainer_state_snapshot(
+            runtime_state=runtime_state,
+            train_budget_controller=train_budget_controller,
+            val_partial_budget_controller=val_partial_budget_controller,
+            val_full_budget_controller=val_full_budget_controller,
+            same_center_budget_controller=same_center_budget_controller,
+            ranking_budget_controller=ranking_budget_controller,
+            replay_budget_controller=replay_budget_controller,
+        )
+        checkpoint_epoch_state = CheckpointEpochState(
+            epoch_idx=epoch,
+            avg_train_loss_value=avg_train_loss,
+            val_metrics_obj=val_metrics,
+            selection_metrics=selection_metrics,
+            best_val_loss=best_val_loss,
+            best_rmsd=best_rmsd,
+            current_fusion_weights=current_fusion_weights,
+            normalization_stats=normalization_stats,
+            run_name=run_name,
+            run_log_file=run_log_file,
+        )
+        checkpoint_model_state = CheckpointModelState(
+            model=model,
+            ema_model=ema_model,
+            criterion=criterion,
+            optimizer=optimizer,
+            scheduler=scheduler,
+        )
+        resume_checkpoint = compose_resume_checkpoint(
+            epoch_state=checkpoint_epoch_state,
+            model_state=checkpoint_model_state,
+            model_config_kwargs=checkpoint_model_config_kwargs,
+            training_config=training_config_snapshot,
+            trainer_state=trainer_state_snapshot,
+            rng_state=capture_rng_state(),
+        )
+        torch.save(resume_checkpoint, os.path.join(save_dir, "latest_model.pt"))
+        if (epoch + 1) % 10 == 0:
+            torch.save(resume_checkpoint, os.path.join(save_dir, f"model_epoch_{epoch+1}.pt"))
 
         best_selected_updated_this_epoch = False
 

@@ -11,6 +11,7 @@ from importlib import import_module
 __all__ = [
     "DEFAULT_FUSION_WEIGHTS",
     "calibrate_linear_fusion_weights",
+    "compute_center_guidance_fraction",
     "combine_center_pose_score",
     "compute_center_guidance_scores",
     "evaluate_topn_success",
@@ -27,6 +28,10 @@ _EXPORT_MAP = {
     "calibrate_linear_fusion_weights": (
         "ehfnet.training.inference.metrics",
         "calibrate_linear_fusion_weights",
+    ),
+    "compute_center_guidance_fraction": (
+        "ehfnet.training.inference.center_utils",
+        "compute_center_guidance_fraction",
     ),
     "combine_center_pose_score": (
         "ehfnet.training.inference.center_utils",

@@ -221,13 +221,13 @@ class EHFNet(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
         )
 
-        self.rot_body_head = nn.Sequential(
+        self.rotation_body_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 3),
         )
 
-        self.rot_scale_head = nn.Sequential(
+        self.rotation_scale_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, hidden_dim // 4),
@@ -235,13 +235,13 @@ class EHFNet(nn.Module):
             nn.Linear(hidden_dim // 4, 1),
         )
 
-        self.trans_scale_head = nn.Sequential(
+        self.translation_scale_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
 
-        self.trans_body_head = nn.Sequential(
+        self.translation_body_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 3),
@@ -259,13 +259,13 @@ class EHFNet(nn.Module):
             nn.Linear(hidden_dim // 2, 1),
         )
 
-        self.energy_trans_refine_scale = nn.Sequential(
+        self.energy_translation_refine_scale = nn.Sequential(
             nn.Linear(hidden_dim + 1, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
         )
 
-        self.energy_rot_refine_scale = nn.Sequential(
+        self.energy_rotation_refine_scale = nn.Sequential(
             nn.Linear(hidden_dim + 1, hidden_dim // 2),
             nn.SiLU(),
             nn.Linear(hidden_dim // 2, 1),
@@ -394,21 +394,31 @@ class EHFNet(nn.Module):
         )
 
         v_com_raw = scatter_mean(lig_displacement, lig_batch, dim=0, dim_size=B)
-        v_body_trans = self.trans_body_head(lig_mol_feat)
-        v_mlp_trans_initial = (R_frame_initial @ v_body_trans.unsqueeze(-1)).squeeze(-1)
-        v_mlp_trans_current = (R_frame_current @ v_body_trans.unsqueeze(-1)).squeeze(-1)
-        v_mlp_trans = (
-            (1.0 - frame_refine_gate.squeeze(-1)) * v_mlp_trans_initial
-            + frame_refine_gate.squeeze(-1) * v_mlp_trans_current
+        v_body_translation = self.translation_body_head(lig_mol_feat)
+        v_mlp_translation_initial = (
+            R_frame_initial @ v_body_translation.unsqueeze(-1)
+        ).squeeze(-1)
+        v_mlp_translation_current = (
+            R_frame_current @ v_body_translation.unsqueeze(-1)
+        ).squeeze(-1)
+        v_mlp_translation = (
+            (1.0 - frame_refine_gate.squeeze(-1)) * v_mlp_translation_initial
+            + frame_refine_gate.squeeze(-1) * v_mlp_translation_current
         )
 
         gate = torch.sigmoid(self.fusion_gate(lig_mol_feat))
-        trans_scale = F.softplus(self.trans_scale_head(lig_mol_feat))
-        v_translation = (gate * v_com_raw + (1.0 - gate) * v_mlp_trans) * trans_scale
+        translation_scale = F.softplus(self.translation_scale_head(lig_mol_feat))
+        v_translation = (
+            gate * v_com_raw + (1.0 - gate) * v_mlp_translation
+        ) * translation_scale
 
-        omega_dir = F.normalize(self.rot_body_head(lig_mol_feat), dim=-1, eps=1e-8)
-        rot_scale = F.softplus(self.rot_scale_head(lig_mol_feat))
-        omega_body = omega_dir * rot_scale
+        omega_direction = F.normalize(
+            self.rotation_body_head(lig_mol_feat),
+            dim=-1,
+            eps=1e-8,
+        )
+        rotation_scale = F.softplus(self.rotation_scale_head(lig_mol_feat))
+        omega_body = omega_direction * rotation_scale
         v_rotation_initial = (R_frame_initial @ omega_body.unsqueeze(-1)).squeeze(-1)
         v_rotation_current = (R_frame_current @ omega_body.unsqueeze(-1)).squeeze(-1)
         v_rotation = (
@@ -453,20 +463,24 @@ class EHFNet(nn.Module):
             current_com = compute_center_of_mass(current_lig_pos, lig_batch, masses, dim_size=B)
             rel_to_com = current_lig_pos - current_com[lig_batch]
 
-            force_trans = scatter_mean(force_atom, lig_batch, dim=0, dim_size=B)
+            force_translation = scatter_mean(force_atom, lig_batch, dim=0, dim_size=B)
             force_torque = scatter_mean(torch.cross(rel_to_com, force_atom, dim=-1), lig_batch, dim=0, dim_size=B)
 
-            force_trans_norm = torch.norm(force_trans, dim=-1, keepdim=True)
+            force_translation_norm = torch.norm(force_translation, dim=-1, keepdim=True)
             force_torque_norm = torch.norm(force_torque, dim=-1, keepdim=True)
 
-            trans_refine = F.normalize(force_trans, dim=-1, eps=1e-8) * torch.tanh(force_trans_norm / 5.0)
-            rot_refine = F.normalize(force_torque, dim=-1, eps=1e-8) * torch.tanh(force_torque_norm / 5.0)
+            translation_refine = F.normalize(force_translation, dim=-1, eps=1e-8) * torch.tanh(force_translation_norm / 5.0)
+            rotation_refine = F.normalize(force_torque, dim=-1, eps=1e-8) * torch.tanh(force_torque_norm / 5.0)
 
-            trans_refine = trans_refine * F.softplus(self.energy_trans_refine_scale(guidance_input))
-            rot_refine = rot_refine * F.softplus(self.energy_rot_refine_scale(guidance_input))
+            translation_refine = translation_refine * F.softplus(
+                self.energy_translation_refine_scale(guidance_input)
+            )
+            rotation_refine = rotation_refine * F.softplus(
+                self.energy_rotation_refine_scale(guidance_input)
+            )
 
-            v_translation = v_translation + refine_gate * trans_refine
-            v_rotation = v_rotation + refine_gate * rot_refine
+            v_translation = v_translation + refine_gate * translation_refine
+            v_rotation = v_rotation + refine_gate * rotation_refine
 
         if torsion_indices.numel() > 0 and torsion_indices.size(0) > 0:
             a1_feat = lig_atom_feat[torsion_indices[:, 1]]

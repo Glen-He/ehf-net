@@ -322,26 +322,26 @@ def main():
             "protein_atom_fallback_k",
             "protein_residue_fallback_k",
             "loss_characteristic_scale",
-            "loss_weight_trans",
-            "loss_weight_rot",
+            "loss_weight_translation",
+            "loss_weight_rotation",
             "loss_weight_torsion",
             "loss_weight_energy",
             "loss_weight_clash",
             "loss_weight_pose_rank",
-            "loss_coarse_trans",
-            "loss_coarse_rot",
+            "loss_coarse_translation",
+            "loss_coarse_rotation",
             "loss_coarse_torsion",
             "loss_coarse_energy",
             "loss_coarse_clash",
             "loss_coarse_pose_rank",
-            "loss_transition_trans",
-            "loss_transition_rot",
+            "loss_transition_translation",
+            "loss_transition_rotation",
             "loss_transition_torsion",
             "loss_transition_energy",
             "loss_transition_clash",
             "loss_transition_pose_rank",
-            "loss_refine_trans",
-            "loss_refine_rot",
+            "loss_refine_translation",
+            "loss_refine_rotation",
             "loss_refine_torsion",
             "loss_refine_energy",
             "loss_refine_clash",
@@ -374,6 +374,24 @@ def main():
         help="ESM processing mode: auto, file, or off",
     )
     parser.add_argument("--save_dir", type=str, default=config_defaults["save_dir"], help="Directory to save checkpoints")
+    parser.add_argument(
+        "--resume_ckpt",
+        type=str,
+        default=None,
+        help="Checkpoint path used to resume training state",
+    )
+    parser.add_argument(
+        "--resume_blind_pool_dir",
+        type=str,
+        default=None,
+        help="Optional blind pool cache directory used when resuming into a new run directory",
+    )
+    parser.add_argument(
+        "--stop_after_epoch",
+        type=int,
+        default=None,
+        help="Stop after the specified absolute epoch number (1-based, inclusive)",
+    )
     parser.add_argument("--esm_path", type=str, default=config_defaults.get("esm_path"), help="Path to precomputed ESM embeddings (optional)")
 
     # 训练相关参数
@@ -446,26 +464,26 @@ def main():
     parser.add_argument("--flow_torsion_scale_min", type=float, default=config_defaults["flow_torsion_scale_min"], help="Flow curriculum minimum torsion scale")
     parser.add_argument("--flow_torsion_scale_max", type=float, default=config_defaults["flow_torsion_scale_max"], help="Flow curriculum maximum torsion scale")
     parser.add_argument("--loss_characteristic_scale", type=float, default=config_defaults["loss_characteristic_scale"], help="Characteristic length scale used to balance translation and rotation losses")
-    parser.add_argument("--loss_weight_trans", type=float, default=config_defaults["loss_weight_trans"], help="Global multiplier for translation loss")
-    parser.add_argument("--loss_weight_rot", type=float, default=config_defaults["loss_weight_rot"], help="Global multiplier for rotation loss")
+    parser.add_argument("--loss_weight_translation", type=float, default=config_defaults["loss_weight_translation"], help="Global multiplier for translation loss")
+    parser.add_argument("--loss_weight_rotation", type=float, default=config_defaults["loss_weight_rotation"], help="Global multiplier for rotation loss")
     parser.add_argument("--loss_weight_torsion", type=float, default=config_defaults["loss_weight_torsion"], help="Global multiplier for torsion loss")
     parser.add_argument("--loss_weight_energy", type=float, default=config_defaults["loss_weight_energy"], help="Global multiplier for affinity loss")
     parser.add_argument("--loss_weight_clash", type=float, default=config_defaults["loss_weight_clash"], help="Global multiplier for clash loss")
     parser.add_argument("--loss_weight_pose_rank", type=float, default=config_defaults["loss_weight_pose_rank"], help="Global multiplier for pose-rank BCE loss")
-    parser.add_argument("--loss_coarse_trans", type=float, default=config_defaults["loss_coarse_trans"], help="Coarse curriculum translation weight")
-    parser.add_argument("--loss_coarse_rot", type=float, default=config_defaults["loss_coarse_rot"], help="Coarse curriculum rotation weight")
+    parser.add_argument("--loss_coarse_translation", type=float, default=config_defaults["loss_coarse_translation"], help="Coarse curriculum translation weight")
+    parser.add_argument("--loss_coarse_rotation", type=float, default=config_defaults["loss_coarse_rotation"], help="Coarse curriculum rotation weight")
     parser.add_argument("--loss_coarse_torsion", type=float, default=config_defaults["loss_coarse_torsion"], help="Coarse curriculum torsion weight")
     parser.add_argument("--loss_coarse_energy", type=float, default=config_defaults["loss_coarse_energy"], help="Coarse curriculum affinity weight")
     parser.add_argument("--loss_coarse_clash", type=float, default=config_defaults["loss_coarse_clash"], help="Coarse curriculum clash weight")
     parser.add_argument("--loss_coarse_pose_rank", type=float, default=config_defaults["loss_coarse_pose_rank"], help="Coarse curriculum pose-rank BCE weight")
-    parser.add_argument("--loss_transition_trans", type=float, default=config_defaults["loss_transition_trans"], help="Transition curriculum translation weight")
-    parser.add_argument("--loss_transition_rot", type=float, default=config_defaults["loss_transition_rot"], help="Transition curriculum rotation weight")
+    parser.add_argument("--loss_transition_translation", type=float, default=config_defaults["loss_transition_translation"], help="Transition curriculum translation weight")
+    parser.add_argument("--loss_transition_rotation", type=float, default=config_defaults["loss_transition_rotation"], help="Transition curriculum rotation weight")
     parser.add_argument("--loss_transition_torsion", type=float, default=config_defaults["loss_transition_torsion"], help="Transition curriculum torsion weight")
     parser.add_argument("--loss_transition_energy", type=float, default=config_defaults["loss_transition_energy"], help="Transition curriculum affinity weight")
     parser.add_argument("--loss_transition_clash", type=float, default=config_defaults["loss_transition_clash"], help="Transition curriculum clash weight")
     parser.add_argument("--loss_transition_pose_rank", type=float, default=config_defaults["loss_transition_pose_rank"], help="Transition curriculum pose-rank BCE weight")
-    parser.add_argument("--loss_refine_trans", type=float, default=config_defaults["loss_refine_trans"], help="Refine curriculum translation weight")
-    parser.add_argument("--loss_refine_rot", type=float, default=config_defaults["loss_refine_rot"], help="Refine curriculum rotation weight")
+    parser.add_argument("--loss_refine_translation", type=float, default=config_defaults["loss_refine_translation"], help="Refine curriculum translation weight")
+    parser.add_argument("--loss_refine_rotation", type=float, default=config_defaults["loss_refine_rotation"], help="Refine curriculum rotation weight")
     parser.add_argument("--loss_refine_torsion", type=float, default=config_defaults["loss_refine_torsion"], help="Refine curriculum torsion weight")
     parser.add_argument("--loss_refine_energy", type=float, default=config_defaults["loss_refine_energy"], help="Refine curriculum affinity weight")
     parser.add_argument("--loss_refine_clash", type=float, default=config_defaults["loss_refine_clash"], help="Refine curriculum clash weight")
@@ -574,9 +592,9 @@ def main():
     parser.add_argument("--run_test_after_training", action="store_true", default=bool(config_defaults["run_test_after_training"]), help="Run final test-set evaluation after training")
     parser.add_argument("--skip_test_after_training", dest="run_test_after_training", action="store_false", help="Skip final test-set evaluation")
     parser.add_argument("--test_topk", type=str, default=config_defaults["test_topk"], help="Comma-separated top-k values for final test evaluation")
-    parser.add_argument("--center_proposal_weight", type=float, default=config_defaults["center_proposal_weight"], help="Loss weight for replay-based center value supervision")
+    parser.add_argument("--center_proposal_weight", type=float, default=config_defaults["center_proposal_weight"], help="Shared loss weight for online center supervision and replay-based center value supervision")
     parser.add_argument("--center_positive_radius", type=float, default=config_defaults["center_positive_radius"], help="Hit radius in angstroms used by crop curriculum and blind center metrics")
-    parser.add_argument("--center_guidance_learned_start", type=float, default=config_defaults["center_guidance_learned_start"], help="Training progress where crop-center scoring switches from heuristic priors to learned proposal logits")
+    parser.add_argument("--center_guidance_learned_start", type=float, default=config_defaults["center_guidance_learned_start"], help="Training progress where crop-center scoring starts blending heuristic priors with learned proposal logits")
     parser.add_argument("--center_proposal_topk", type=int, default=config_defaults["center_proposal_topk"], help="Number of diverse residue centers kept in stage-1 proposal")
     parser.add_argument("--center_refine_topk", type=int, default=config_defaults["center_refine_topk"], help="Number of centers refined in stage-2 local docking")
     parser.add_argument("--center_nms_radius", type=float, default=config_defaults["center_nms_radius"], help="Diversity radius in angstroms for center NMS")
@@ -643,6 +661,10 @@ def main():
     if not (args.data_root and str(args.data_root).strip()):
         parser.error("You must provide --data_root or set data_root in the config, e.g. data/processed/hiqbind")
     args.data_root = str(args.data_root).strip()
+    if args.resume_ckpt is not None and not str(args.resume_ckpt).strip():
+        args.resume_ckpt = None
+    if args.resume_blind_pool_dir is not None and not str(args.resume_blind_pool_dir).strip():
+        args.resume_blind_pool_dir = None
     args.index_file = os.path.join(args.data_root, "index.csv")
 
     try:
@@ -676,6 +698,12 @@ def main():
     logger.info("Smoke log grouping: %s", args.smoke)
     logger.info("Run suffix: %s", run_suffix)
     logger.info("Run artifacts will be saved to %s", args.save_dir)
+    if args.resume_ckpt is not None:
+        logger.info("Resume checkpoint: %s", args.resume_ckpt)
+    if args.resume_blind_pool_dir is not None:
+        logger.info("Resume blind pool dir: %s", args.resume_blind_pool_dir)
+    if args.stop_after_epoch is not None:
+        logger.info("Stop after epoch: %d", args.stop_after_epoch)
     logger.info("Starting training with arguments: %s", args)
 
     try:
@@ -741,26 +769,26 @@ def main():
             flow_torsion_scale_min=args.flow_torsion_scale_min,
             flow_torsion_scale_max=args.flow_torsion_scale_max,
             loss_characteristic_scale=args.loss_characteristic_scale,
-            loss_weight_trans=args.loss_weight_trans,
-            loss_weight_rot=args.loss_weight_rot,
+            loss_weight_translation=args.loss_weight_translation,
+            loss_weight_rotation=args.loss_weight_rotation,
             loss_weight_torsion=args.loss_weight_torsion,
             loss_weight_energy=args.loss_weight_energy,
             loss_weight_clash=args.loss_weight_clash,
             loss_weight_pose_rank=args.loss_weight_pose_rank,
-            loss_coarse_trans=args.loss_coarse_trans,
-            loss_coarse_rot=args.loss_coarse_rot,
+            loss_coarse_translation=args.loss_coarse_translation,
+            loss_coarse_rotation=args.loss_coarse_rotation,
             loss_coarse_torsion=args.loss_coarse_torsion,
             loss_coarse_energy=args.loss_coarse_energy,
             loss_coarse_clash=args.loss_coarse_clash,
             loss_coarse_pose_rank=args.loss_coarse_pose_rank,
-            loss_transition_trans=args.loss_transition_trans,
-            loss_transition_rot=args.loss_transition_rot,
+            loss_transition_translation=args.loss_transition_translation,
+            loss_transition_rotation=args.loss_transition_rotation,
             loss_transition_torsion=args.loss_transition_torsion,
             loss_transition_energy=args.loss_transition_energy,
             loss_transition_clash=args.loss_transition_clash,
             loss_transition_pose_rank=args.loss_transition_pose_rank,
-            loss_refine_trans=args.loss_refine_trans,
-            loss_refine_rot=args.loss_refine_rot,
+            loss_refine_translation=args.loss_refine_translation,
+            loss_refine_rotation=args.loss_refine_rotation,
             loss_refine_torsion=args.loss_refine_torsion,
             loss_refine_energy=args.loss_refine_energy,
             loss_refine_clash=args.loss_refine_clash,
@@ -862,6 +890,9 @@ def main():
             replay_budget_recover_window_count=args.replay_budget_recover_window_count,
             replay_candidate_cooldown=args.replay_candidate_cooldown,
             replay_max_candidates_per_complex=args.replay_max_candidates_per_complex,
+            resume_ckpt=args.resume_ckpt,
+            resume_blind_pool_dir=args.resume_blind_pool_dir,
+            stop_after_epoch=args.stop_after_epoch,
             run_name=run_name,
             run_log_file=log_file,
         )

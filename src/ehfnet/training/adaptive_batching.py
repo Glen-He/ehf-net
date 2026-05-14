@@ -8,6 +8,7 @@
 
 import random
 from dataclasses import dataclass, field
+from collections.abc import Mapping
 from typing import Any
 
 from torch.utils.data import Sampler, Subset
@@ -367,6 +368,87 @@ class WindowAimdBudgetController:
         self._clean_windows = 0
         return None
 
+    def state_dict(self) -> dict[str, Any]:
+        """
+        导出预算控制器状态。
+
+        Returns:
+            dict[str, Any]: 可安全写入 checkpoint 的预算控制器状态字典。
+        """
+        return {
+            "phase_name": self.phase_name,
+            "base_budget": int(self.base_budget),
+            "min_budget": int(self.min_budget),
+            "window_size": int(self.window_size),
+            "reduce_threshold": int(self.reduce_threshold),
+            "reduce_factor": float(self.reduce_factor),
+            "recover_window_count": int(self.recover_window_count),
+            "recover_step": int(self.recover_step),
+            "offender_cooldown": int(self.offender_cooldown),
+            "enable_adaptive": bool(self.enable_adaptive),
+            "current_budget": int(self.current_budget),
+            "offender_cooldowns": {
+                int(idx): int(remain)
+                for idx, remain in self.offender_cooldowns.items()
+                if int(remain) > 0
+            },
+            "window_total": int(self._window_total),
+            "window_oom": int(self._window_oom),
+            "clean_windows": int(self._clean_windows),
+        }
+
+    def load_state_dict(self, state_dict: Mapping[str, Any]) -> None:
+        """
+        从 checkpoint 恢复预算控制器状态。
+
+        Args:
+            state_dict: 预算控制器状态字典。
+
+        Raises:
+            TypeError: 当状态对象类型不满足要求时抛出。
+            ValueError: 当状态内容与当前控制器配置不兼容时抛出。
+        """
+        if not isinstance(state_dict, Mapping):
+            raise TypeError(
+                f"{self.phase_name}: budget controller state must be a mapping."
+            )
+        saved_phase_name = str(state_dict.get("phase_name", self.phase_name))
+        if saved_phase_name != self.phase_name:
+            raise ValueError(
+                f"Budget controller phase mismatch: saved={saved_phase_name!r}, "
+                f"current={self.phase_name!r}."
+            )
+
+        saved_base_budget = int(state_dict.get("base_budget", self.base_budget))
+        saved_min_budget = int(state_dict.get("min_budget", self.min_budget))
+        if saved_base_budget != self.base_budget or saved_min_budget != self.min_budget:
+            raise ValueError(
+                f"{self.phase_name}: budget controller config mismatch. "
+                f"saved_base_budget={saved_base_budget}, current_base_budget={self.base_budget}, "
+                f"saved_min_budget={saved_min_budget}, current_min_budget={self.min_budget}."
+            )
+
+        current_budget = int(state_dict.get("current_budget", self.current_budget))
+        self.current_budget = min(
+            self.base_budget,
+            max(self.min_budget, current_budget),
+        )
+
+        offender_cooldowns_raw = state_dict.get("offender_cooldowns", {})
+        if not isinstance(offender_cooldowns_raw, Mapping):
+            raise TypeError(
+                f"{self.phase_name}: offender_cooldowns must be a mapping."
+            )
+        self.offender_cooldowns = {
+            int(idx): int(remain)
+            for idx, remain in offender_cooldowns_raw.items()
+            if int(remain) > 0
+        }
+
+        self._window_total = max(0, int(state_dict.get("window_total", 0)))
+        self._window_oom = max(0, int(state_dict.get("window_oom", 0)))
+        self._clean_windows = max(0, int(state_dict.get("clean_windows", 0)))
+
 
 class AdaptiveCostBatchSampler(Sampler[list[int]]):
     """
@@ -434,5 +516,4 @@ class AdaptiveCostBatchSampler(Sampler[list[int]]):
             batch_cost += sample_cost
         if batch:
             yield batch
-
 

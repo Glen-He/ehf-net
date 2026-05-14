@@ -163,8 +163,8 @@ class ConditionalFlowMatcher:
             t: 采样的时间步 [B]
             x_t: t 时刻的插值坐标 [N, 3]（模型输入）
             targets: SE(3) x T^m 切向量目标字典，包含:
-                - v_trans_target [B, 3]
-                - v_rot_target   [B, 3]
+                - v_translation_target [B, 3]
+                - v_rotation_target   [B, 3]
                 - v_torsion_target [T]
         """
 
@@ -225,7 +225,7 @@ class ConditionalFlowMatcher:
             x_t = x_0
             cartesian_velocity = torch.zeros_like(x_0)
 
-        v_trans, v_rot, v_torsion = self.target_projector.decompose(
+        v_translation, v_rotation, v_torsion = self.target_projector.decompose(
             pos=x_t,
             vel=cartesian_velocity,
             masses=masses,
@@ -235,8 +235,8 @@ class ConditionalFlowMatcher:
         )
 
         targets: dict[str, Tensor] = {
-            "v_trans_target": v_trans,
-            "v_rot_target": v_rot,
+            "v_translation_target": v_translation,
+            "v_rotation_target": v_rotation,
             "v_torsion_target": v_torsion,
         }
 
@@ -300,7 +300,7 @@ class ConditionalFlowMatcher:
                 t_val = inference_t_start + i * dt
 
                 if method == "euler":
-                    v_trans, v_rot, v_torsion = self._predict_velocity(
+                    v_translation, v_rotation, v_torsion = self._predict_velocity(
                         model=model,
                         data=data,
                         pos=current_pos,
@@ -314,8 +314,8 @@ class ConditionalFlowMatcher:
                         pos=current_pos,
                         masses=masses,
                         batch=batch,
-                        v_trans=v_trans,
-                        v_rot=v_rot,
+                        v_translation=v_translation,
+                        v_rotation=v_rotation,
                         v_torsion=v_torsion,
                         torsion_indices=torsion_indices,
                         torsion_moving_mask=torsion_moving_mask,
@@ -323,7 +323,7 @@ class ConditionalFlowMatcher:
                     )
 
                 elif method == "rk4":
-                    v1_trans, v1_rot, v1_tor = self._predict_velocity(
+                    v1_translation, v1_rotation, v1_torsion = self._predict_velocity(
                         model=model,
                         data=data,
                         pos=current_pos,
@@ -336,15 +336,15 @@ class ConditionalFlowMatcher:
                         pos=current_pos,
                         masses=masses,
                         batch=batch,
-                        v_trans=v1_trans,
-                        v_rot=v1_rot,
-                        v_torsion=v1_tor,
+                        v_translation=v1_translation,
+                        v_rotation=v1_rotation,
+                        v_torsion=v1_torsion,
                         torsion_indices=torsion_indices,
                         torsion_moving_mask=torsion_moving_mask,
                         dt=dt / 2.0,
                     )
 
-                    v2_trans, v2_rot, v2_tor = self._predict_velocity(
+                    v2_translation, v2_rotation, v2_torsion = self._predict_velocity(
                         model=model,
                         data=data,
                         pos=k1_pos,
@@ -357,15 +357,15 @@ class ConditionalFlowMatcher:
                         pos=current_pos,
                         masses=masses,
                         batch=batch,
-                        v_trans=v2_trans,
-                        v_rot=v2_rot,
-                        v_torsion=v2_tor,
+                        v_translation=v2_translation,
+                        v_rotation=v2_rotation,
+                        v_torsion=v2_torsion,
                         torsion_indices=torsion_indices,
                         torsion_moving_mask=torsion_moving_mask,
                         dt=dt / 2.0,
                     )
 
-                    v3_trans, v3_rot, v3_tor = self._predict_velocity(
+                    v3_translation, v3_rotation, v3_torsion = self._predict_velocity(
                         model=model,
                         data=data,
                         pos=k2_pos,
@@ -378,15 +378,15 @@ class ConditionalFlowMatcher:
                         pos=current_pos,
                         masses=masses,
                         batch=batch,
-                        v_trans=v3_trans,
-                        v_rot=v3_rot,
-                        v_torsion=v3_tor,
+                        v_translation=v3_translation,
+                        v_rotation=v3_rotation,
+                        v_torsion=v3_torsion,
                         torsion_indices=torsion_indices,
                         torsion_moving_mask=torsion_moving_mask,
                         dt=dt,
                     )
 
-                    v4_trans, v4_rot, v4_tor = self._predict_velocity(
+                    v4_translation, v4_rotation, v4_torsion = self._predict_velocity(
                         model=model,
                         data=data,
                         pos=k3_pos,
@@ -396,21 +396,36 @@ class ConditionalFlowMatcher:
                         dtype=dtype,
                     )
 
-                    v_trans_avg = (v1_trans + 2 * v2_trans + 2 * v3_trans + v4_trans) / 6.0
-                    v_rot_avg = (v1_rot + 2 * v2_rot + 2 * v3_rot + v4_rot) / 6.0
+                    v_translation_avg = (
+                        v1_translation
+                        + 2 * v2_translation
+                        + 2 * v3_translation
+                        + v4_translation
+                    ) / 6.0
+                    v_rotation_avg = (
+                        v1_rotation
+                        + 2 * v2_rotation
+                        + 2 * v3_rotation
+                        + v4_rotation
+                    ) / 6.0
 
-                    if v1_tor is not None:
-                        v_tor_avg = (v1_tor + 2 * v2_tor + 2 * v3_tor + v4_tor) / 6.0
+                    if v1_torsion is not None:
+                        v_torsion_avg = (
+                            v1_torsion
+                            + 2 * v2_torsion
+                            + 2 * v3_torsion
+                            + v4_torsion
+                        ) / 6.0
                     else:
-                        v_tor_avg = None
+                        v_torsion_avg = None
 
                     current_pos = self.updater.update(
                         pos=current_pos,
                         masses=masses,
                         batch=batch,
-                        v_trans=v_trans_avg,
-                        v_rot=v_rot_avg,
-                        v_torsion=v_tor_avg,
+                        v_translation=v_translation_avg,
+                        v_rotation=v_rotation_avg,
+                        v_torsion=v_torsion_avg,
                         torsion_indices=torsion_indices,
                         torsion_moving_mask=torsion_moving_mask,
                         dt=dt,
@@ -451,14 +466,14 @@ class ConditionalFlowMatcher:
         finally:
             data["ligand_atom"].pos = original_pos
 
-        v_trans = out["v_translation"]
-        v_rot = out["v_rotation"]
+        v_translation = out["v_translation"]
+        v_rotation = out["v_rotation"]
         v_torsion = out.get("v_torsion", None)
 
         if v_torsion is not None:
             v_torsion = v_torsion.reshape(-1)
 
-        return v_trans, v_rot, v_torsion
+        return v_translation, v_rotation, v_torsion
 
 
     def _generate_random_pose(
@@ -488,9 +503,9 @@ class ConditionalFlowMatcher:
         device = x_ref.device
         dtype = x_ref.dtype
 
-        current_trans_scale = self.get_spatial_scale(epoch)
-        current_rot_max = self.get_rotation_scale(epoch)
-        current_tor_scale = self.get_torsion_scale(epoch)
+        current_translation_scale = self.get_spatial_scale(epoch)
+        current_rotation_max = self.get_rotation_scale(epoch)
+        current_torsion_scale = self.get_torsion_scale(epoch)
 
         base_pos = x_ref
         if seed_pos is not None and seed_pos.shape == x_ref.shape:
@@ -504,15 +519,15 @@ class ConditionalFlowMatcher:
             if T > 0:
                 rand_angles = (
                     (torch.rand(T, device=device, dtype=dtype) * 2 - 1)
-                    * math.pi * current_tor_scale
+                    * math.pi * current_torsion_scale
                 )
 
                 x_torsioned = self.updater.update(
                     pos=x_torsioned,
                     masses=masses,
                     batch=batch,
-                    v_trans=torch.zeros(B, 3, device=device, dtype=dtype),
-                    v_rot=torch.zeros(B, 3, device=device, dtype=dtype),
+                    v_translation=torch.zeros(B, 3, device=device, dtype=dtype),
+                    v_rotation=torch.zeros(B, 3, device=device, dtype=dtype),
                     v_torsion=rand_angles,
                     torsion_indices=torsion_indices,
                     torsion_moving_mask=torsion_moving_mask,
@@ -531,10 +546,17 @@ class ConditionalFlowMatcher:
         else:
             placement_center = compute_center_of_mass(x_ref, batch, masses, dim_size=B)
 
-        rot_matrices = self._random_bounded_rotation(B, device, dtype, max_angle=current_rot_max)
-        x_rotated = torch.bmm(rot_matrices[batch], x_centered.unsqueeze(-1)).squeeze(-1)
+        rotation_matrices = self._random_bounded_rotation(
+            B,
+            device,
+            dtype,
+            max_angle=current_rotation_max,
+        )
+        x_rotated = torch.bmm(rotation_matrices[batch], x_centered.unsqueeze(-1)).squeeze(-1)
 
-        translation_offset = torch.randn(B, 3, device=device, dtype=dtype) * current_trans_scale
+        translation_offset = (
+            torch.randn(B, 3, device=device, dtype=dtype) * current_translation_scale
+        )
 
         return x_rotated + placement_center[batch] + translation_offset[batch]
 

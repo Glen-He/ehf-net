@@ -13,6 +13,7 @@ __all__ = [
     "ConditionalFlowMatcher",
     "FlowMatchingLoss",
     "apply_loss_context",
+    "build_center_value_targets",
     "build_local_batch_from_centers",
     "build_selection_metrics",
     "compose_checkpoint",
@@ -50,6 +51,10 @@ _EXPORT_MAP = {
     "ConditionalFlowMatcher": ("ehfnet.training.flow_matcher", "ConditionalFlowMatcher"),
     "FlowMatchingLoss": ("ehfnet.training.losses", "FlowMatchingLoss"),
     "apply_loss_context": ("ehfnet.training.batch_helpers", "apply_loss_context"),
+    "build_center_value_targets": (
+        "ehfnet.training.rerank_losses",
+        "build_center_value_targets",
+    ),
     "build_local_batch_from_centers": (
         "ehfnet.training.batch_helpers",
         "build_local_batch_from_centers",
