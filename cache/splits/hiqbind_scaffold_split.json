@@ -8,7 +8,7 @@
       "test": 0.2
     },
     "dataset_size": 29484,
-    "index_file": "/pavo/glen/Code/EHFNet/data/processed/hiqbind/index.csv"
+    "index_file": "/home/glen/code/EHFNet/data/processed/hiqbind/index.csv"
   },
   "indices": {
     "train": [

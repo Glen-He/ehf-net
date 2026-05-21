@@ -206,7 +206,12 @@ def main():
             "val_subset_ratio",
             "val_full_every",
             "val_full_last_epochs",
+            "geometry_min_atom_distance",
             "ode_method",
+            "min_checkpoint_selection_coverage",
+            "max_val_non_oom_failures",
+            "max_val_oom_failures",
+            "final_topn_min_coverage",
             "split_train_frac",
             "split_val_frac",
             "split_test_frac",
@@ -539,6 +544,36 @@ def main():
         help="Always run full lightweight validation during the last N epochs",
     )
     parser.add_argument(
+        "--geometry_min_atom_distance",
+        type=float,
+        default=config_defaults["geometry_min_atom_distance"],
+        help="Minimum ligand atom distance used by the preprocessing filter",
+    )
+    parser.add_argument(
+        "--min_checkpoint_selection_coverage",
+        type=float,
+        default=config_defaults["min_checkpoint_selection_coverage"],
+        help="Minimum validation coverage required before updating best checkpoints",
+    )
+    parser.add_argument(
+        "--max_val_non_oom_failures",
+        type=int,
+        default=config_defaults["max_val_non_oom_failures"],
+        help="Maximum non-OOM validation failures allowed before validation fails",
+    )
+    parser.add_argument(
+        "--max_val_oom_failures",
+        type=int,
+        default=config_defaults["max_val_oom_failures"],
+        help="Maximum irreducible validation OOM failures allowed before validation fails",
+    )
+    parser.add_argument(
+        "--final_topn_min_coverage",
+        type=float,
+        default=config_defaults["final_topn_min_coverage"],
+        help="Minimum final Top-N evaluation coverage required for official metrics",
+    )
+    parser.add_argument(
         "--ode_method",
         type=str,
         default=config_defaults["ode_method"],
@@ -805,6 +840,10 @@ def main():
             val_subset_ratio=args.val_subset_ratio,
             val_full_every=args.val_full_every,
             val_full_last_epochs=args.val_full_last_epochs,
+            min_checkpoint_selection_coverage=args.min_checkpoint_selection_coverage,
+            max_val_non_oom_failures=args.max_val_non_oom_failures,
+            max_val_oom_failures=args.max_val_oom_failures,
+            final_topn_min_coverage=args.final_topn_min_coverage,
             ode_method=args.ode_method,
             accumulation_steps=args.accumulation_steps,
             train_cost_budget=args.train_cost_budget,
@@ -890,6 +929,7 @@ def main():
             replay_budget_recover_window_count=args.replay_budget_recover_window_count,
             replay_candidate_cooldown=args.replay_candidate_cooldown,
             replay_max_candidates_per_complex=args.replay_max_candidates_per_complex,
+            geometry_min_atom_distance=args.geometry_min_atom_distance,
             resume_ckpt=args.resume_ckpt,
             resume_blind_pool_dir=args.resume_blind_pool_dir,
             stop_after_epoch=args.stop_after_epoch,

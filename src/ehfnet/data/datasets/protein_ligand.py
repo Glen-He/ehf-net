@@ -49,6 +49,7 @@ from ehfnet.graph import ESMEmbeddingFiller, GraphBuilder, build_graph_cost_prof
 
 logger = logging.getLogger(__name__)
 GRAPH_COST_PROFILE_VERSION = 1
+START_POSE_CACHE_DIRNAME = "flow_start_pos"
 
 
 class ProteinLigandDataset(Dataset):
@@ -81,8 +82,10 @@ class ProteinLigandDataset(Dataset):
         protein_atom_fallback_k: int,
         protein_residue_fallback_k: int,
         interaction_profile: str,
-        force_reprocess: bool = False,
         esm_dim: int,
+        force_reprocess: bool = False,
+        process_num_shards: int = 1,
+        process_shard_index: int = 0,
     ) -> None:
         """
         初始化蛋白配体数据集。
@@ -107,8 +110,10 @@ class ProteinLigandDataset(Dataset):
             protein_atom_fallback_k: 蛋白原子图内边回退到 kNN 时的邻居数。
             protein_residue_fallback_k: 蛋白残基层图内边回退到 kNN 时的邻居数。
             interaction_profile: 跨图交互拓扑配置。
-            force_reprocess: 是否忽略已有缓存并强制重新预处理。
             esm_dim: ESM 残基嵌入维度。
+            force_reprocess: 是否忽略已有缓存并强制重新预处理。
+            process_num_shards: 预处理分片总数。
+            process_shard_index: 当前进程负责的分片编号。
 
         Raises:
             ValueError: 当输入参数或运行时状态不满足要求时抛出。
@@ -140,6 +145,17 @@ class ProteinLigandDataset(Dataset):
         self.esm_device = None if esm_device is None else str(esm_device)
         self.force_reprocess = force_reprocess
         self.esm_dim = int(esm_dim)
+        self.process_num_shards = int(process_num_shards)
+        self.process_shard_index = int(process_shard_index)
+        if self.process_num_shards < 1:
+            raise ValueError(
+                f"process_num_shards must be >= 1, got {self.process_num_shards}."
+            )
+        if not 0 <= self.process_shard_index < self.process_num_shards:
+            raise ValueError(
+                "process_shard_index must be in [0, process_num_shards), got "
+                f"{self.process_shard_index} for {self.process_num_shards} shards."
+            )
 
         self.index_df = load_index(index_file)
         self.cleaned_dir = osp.join(root, "cleaned")
@@ -377,9 +393,15 @@ class ProteinLigandDataset(Dataset):
         self._write_preprocess_metadata(pdb_id, metadata)
         return graph_cost_profile
 
-    def _write_preprocess_summary(self, summary: dict[str, Any]) -> None:
+    def _write_preprocess_summary(
+        self,
+        summary: dict[str, Any],
+        *,
+        summary_path: str | None = None,
+    ) -> None:
         os.makedirs(self.processed_dir, exist_ok=True)
-        with open(self.preprocess_summary_path, "w", encoding="utf-8") as f:
+        output_path = summary_path or self.preprocess_summary_path
+        with open(output_path, "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=True, indent=2, sort_keys=True)
 
     def download(self) -> None:
@@ -393,8 +415,24 @@ class ProteinLigandDataset(Dataset):
         if self.force_reprocess:
             logger.info("Force reprocess enabled - overwriting existing cache")
 
-        total = len(self.index_df)
-        logger.info("Processing %d complexes...", total)
+        indexed_total = len(self.index_df)
+        rows = list(self.index_df.iterrows())
+        if self.process_num_shards > 1:
+            rows = [
+                row
+                for row_offset, row in enumerate(rows)
+                if row_offset % self.process_num_shards == self.process_shard_index
+            ]
+            logger.info(
+                "Processing shard %d/%d: %d of %d complexes...",
+                self.process_shard_index + 1,
+                self.process_num_shards,
+                len(rows),
+                indexed_total,
+            )
+        else:
+            logger.info("Processing %d complexes...", indexed_total)
+        total = len(rows)
 
         success_count = 0
         skip_count = 0
@@ -410,7 +448,7 @@ class ProteinLigandDataset(Dataset):
             }
         )
 
-        for _, row in tqdm(self.index_df.iterrows(), total=total, desc="Processing"):
+        for _, row in tqdm(rows, total=total, desc="Processing"):
             pdb_id = row["pdb_id"]
             affinity = float(row["affinity"])
             out_path = osp.join(self.processed_dir, f"data_{pdb_id}.pt")
@@ -519,8 +557,13 @@ class ProteinLigandDataset(Dataset):
             "processed_dir": osp.abspath(self.processed_dir),
             "index_file": osp.abspath(self.index_file),
             "force_reprocess": bool(self.force_reprocess),
+            "shard": {
+                "index": self.process_shard_index,
+                "count": self.process_num_shards,
+            },
             "totals": {
-                "indexed": total,
+                "indexed": indexed_total,
+                "assigned": total,
                 "success": success_count,
                 "cached": skip_count,
                 "filtered": filtered_count,
@@ -534,7 +577,13 @@ class ProteinLigandDataset(Dataset):
                 "unknown": int(sanitize_counts["unknown"]),
             },
         }
-        self._write_preprocess_summary(summary)
+        summary_path = self.preprocess_summary_path
+        if self.process_num_shards > 1:
+            summary_path = osp.join(
+                self.processed_dir,
+                f"preprocess_summary_shard_{self.process_shard_index}_of_{self.process_num_shards}.json",
+            )
+        self._write_preprocess_summary(summary, summary_path=summary_path)
 
         logger.info(
             "Processing complete: %d success, %d cached, %d filtered, %d errors",
@@ -550,7 +599,7 @@ class ProteinLigandDataset(Dataset):
             sanitize_counts["rejected"],
             sanitize_counts["unknown"],
         )
-        logger.info("Preprocess summary written to %s", self.preprocess_summary_path)
+        logger.info("Preprocess summary written to %s", summary_path)
 
         if self._esm_model is not None:
             logger.info("Releasing ESM model from GPU memory...")
@@ -609,7 +658,7 @@ class ProteinLigandDataset(Dataset):
         valid_pdb_ids: list[str] = []
         excluded = 0
         for pdb_id in candidates:
-            cache_path = self._diffdock_like_cache_path(pdb_id)
+            cache_path = self._start_pos_cache_path(pdb_id)
             if osp.exists(cache_path):
                 valid_pdb_ids.append(pdb_id)
                 continue
@@ -646,11 +695,11 @@ class ProteinLigandDataset(Dataset):
         self._pdb_to_idx = {pdb: i for i, pdb in enumerate(valid_pdb_ids)}
         logger.info("Dataset ready: %d valid samples", len(valid_pdb_ids))
 
-    def _diffdock_like_cache_path(self, pdb_id: str) -> str:
+    def _start_pos_cache_path(self, pdb_id: str) -> str:
         return osp.join(
             self.root,
             "candidates",
-            "diffdock_like_init",
+            START_POSE_CACHE_DIRNAME,
             pdb_id,
             "poses.pt",
         )
@@ -660,7 +709,7 @@ class ProteinLigandDataset(Dataset):
         pdb_id: str,
         expected_num_atoms: int,
     ) -> torch.Tensor | None:
-        cache_path = self._diffdock_like_cache_path(pdb_id)
+        cache_path = self._start_pos_cache_path(pdb_id)
         if osp.exists(cache_path):
             try:
                 cached = torch.load(cache_path, map_location="cpu", weights_only=False)

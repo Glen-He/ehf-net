@@ -78,6 +78,7 @@ def generate_blind_candidates(
     dataset_indices: list[int] | None = None,
     pool_epoch: int = -1,
     generator_ckpt_id: str = "",
+    fail_on_sample_error: bool = False,
 ) -> list[dict[str, Any]]:
     """
     在给定样本列表上运行完整的两阶段 blind pipeline。
@@ -110,6 +111,7 @@ def generate_blind_candidates(
         dataset_indices: 与样本一一对应的原始数据集索引。
         pool_epoch: 当前候选池对应的训练轮次。
         generator_ckpt_id: 生成候选时使用的 checkpoint 标识。
+        fail_on_sample_error: Whether non-OOM per-sample failures should abort generation.
 
     Returns:
         list[dict[str, Any]]: 每个复合物对应的候选中心与构象记录列表。
@@ -292,6 +294,10 @@ def generate_blind_candidates(
         except Exception as exc:
             failed_samples += 1
             logger.warning("Candidate generation: sample %d failed: %s\n%s", sample_idx, exc, traceback.format_exc())
+            if fail_on_sample_error:
+                raise RuntimeError(
+                    f"Candidate generation failed for sample {sample_idx}."
+                ) from exc
             gc.collect()
             if use_configured_cuda:
                 torch.cuda.empty_cache()
@@ -474,6 +480,7 @@ def generate_candidates_from_loader(
     generator_ckpt_id: str = "",
     progress_desc: str = "Candidate Generation",
     dataset_raw_dir: str | None = None,
+    fail_on_non_oom_error: bool = False,
 ) -> dict[str, Any]:
     """
     便捷封装：遍历 DataLoader，拆分 batch 后逐样本生成候选。
@@ -514,6 +521,7 @@ def generate_candidates_from_loader(
         generator_ckpt_id: 生成候选时使用的 checkpoint 标识。
         progress_desc: 终端中显示的候选生成阶段名称。
         dataset_raw_dir: 数据集原始样本目录，用于计算对称感知 RMSD。
+        fail_on_non_oom_error: Whether non-OOM candidate generation failures should abort.
 
     Returns:
         dict[str, Any]: 候选记录与候选生成运行统计。
@@ -523,8 +531,10 @@ def generate_candidates_from_loader(
     """
     all_records: list[dict[str, Any]] = []
     total_complexes = 0
+    failed_complexes = 0
     batches_seen = 0
     failed_batches = 0
+    non_oom_failed_batches = 0
     cost_guard_skips = 0
     oom_batches = 0
     use_configured_cuda = device.type == "cuda"
@@ -637,9 +647,11 @@ def generate_candidates_from_loader(
                         ),
                         pool_epoch=pool_epoch,
                         generator_ckpt_id=generator_ckpt_id,
+                        fail_on_sample_error=fail_on_non_oom_error,
                     )
                     all_records.extend(batch_records)
                     total_complexes += len(batch_records)
+                    failed_complexes += max(0, len(batch_samples) - len(batch_records))
                     pbar.set_postfix(
                         processed=total_complexes,
                         skipped=cost_guard_skips,
@@ -671,6 +683,7 @@ def generate_candidates_from_loader(
                         )
                         continue
                     failed_batches += 1
+                    failed_complexes += len(batch_samples)
                     logger.warning(
                         "Candidate gen batch %d: irreducible CUDA OOM after split retries.",
                         batch_idx,
@@ -684,6 +697,8 @@ def generate_candidates_from_loader(
                     )
                 except Exception as exc:
                     failed_batches += 1
+                    non_oom_failed_batches += 1
+                    failed_complexes += len(batch_samples)
                     logger.warning(
                         "Candidate gen batch %d failed: %s\n%s",
                         batch_idx,
@@ -700,6 +715,10 @@ def generate_candidates_from_loader(
                     gc.collect()
                     if use_configured_cuda:
                         torch.cuda.empty_cache()
+                    if fail_on_non_oom_error:
+                        raise RuntimeError(
+                            f"Candidate generation failed for batch {batch_idx}."
+                        ) from exc
 
             if max_complexes is not None and total_complexes >= max_complexes:
                 break
@@ -711,10 +730,21 @@ def generate_candidates_from_loader(
             f"Candidate generation failed for all processed batches. failed_batches={failed_batches}"
         )
 
+    expected_complexes = total_graphs if total_graphs > 0 else total_complexes + failed_complexes + cost_guard_skips
+    coverage = (
+        float(total_complexes / expected_complexes)
+        if expected_complexes > 0
+        else 0.0
+    )
+
     return {
         "candidate_records": all_records,
         "processed_complexes": float(total_complexes),
+        "failed_complexes": float(failed_complexes),
+        "total_complexes": float(expected_complexes),
+        "coverage": coverage,
         "cost_guard_skips": float(cost_guard_skips),
         "oom_batches": float(oom_batches),
         "failed_batches": float(failed_batches),
+        "non_oom_failed_batches": float(non_oom_failed_batches),
     }

@@ -27,6 +27,7 @@ from tqdm import tqdm
 
 from ehfnet.data import ProteinLigandDataset
 from ehfnet.data.datasets import ScaffoldSplitter
+from ehfnet.data.preprocess import LigandGeometryPreFilter
 from ehfnet.data.featurizers import (
     LIGAND_ATOM_CONT_SCHEMA,
     LIGAND_MOLECULE_CONT_SCHEMA,
@@ -203,6 +204,10 @@ def train(
     val_subset_ratio: float,
     val_full_every: int,
     val_full_last_epochs: int,
+    min_checkpoint_selection_coverage: float,
+    max_val_non_oom_failures: int,
+    max_val_oom_failures: int,
+    final_topn_min_coverage: float,
     ode_method: str,
     accumulation_steps: int,
     train_cost_budget: int,
@@ -288,6 +293,7 @@ def train(
     replay_budget_recover_window_count: int,
     replay_candidate_cooldown: int,
     replay_max_candidates_per_complex: int,
+    geometry_min_atom_distance: float,
     resume_ckpt: str | None = None,
     resume_blind_pool_dir: str | None = None,
     stop_after_epoch: int | None = None,
@@ -394,6 +400,10 @@ def train(
         val_subset_ratio: 日常 partial 验证覆盖的验证集比例。
         val_full_every: 每隔多少个 epoch 执行一次 100% 轻量验证；0 表示关闭周期全量验证。
         val_full_last_epochs: 训练末尾连续执行 100% 轻量验证的 epoch 数。
+        min_checkpoint_selection_coverage: Minimum validation coverage required for best checkpoint updates.
+        max_val_non_oom_failures: Maximum non-OOM validation failures allowed before validation fails.
+        max_val_oom_failures: Maximum irreducible validation OOM failures allowed before validation fails.
+        final_topn_min_coverage: Minimum final Top-N coverage required for official test metrics.
         ode_method: 训练、bootstrap 与 blind 推理统一使用的 ODE 积分方法。
         accumulation_steps: 梯度累积步数。
         train_cost_budget: 训练阶段的基础成本预算。
@@ -479,6 +489,7 @@ def train(
         replay_budget_recover_window_count: replay 微批回升所需的连续干净窗口数。
         replay_candidate_cooldown: replay 复杂样本冷却时长。
         replay_max_candidates_per_complex: replay 每个复合物保留的最大候选数。
+        geometry_min_atom_distance: Minimum ligand atom distance used by the preprocessing filter.
         resume_ckpt: 继续训练时要加载的 checkpoint 路径。
         resume_blind_pool_dir: 继续训练时优先读取 blind pool 缓存的目录。
         stop_after_epoch: 提前停止训练的绝对 epoch 编号，按 1-based 计数且包含该轮。
@@ -540,6 +551,9 @@ def train(
         protein_atom_fallback_k=protein_atom_fallback_k,
         protein_residue_fallback_k=protein_residue_fallback_k,
         interaction_profile=interaction_profile,
+        pre_filter=LigandGeometryPreFilter(
+            min_atom_distance=float(geometry_min_atom_distance),
+        ),
     )
     graph_builder = dataset.graph_builder
 
@@ -776,6 +790,22 @@ def train(
         )
     if stop_after_epoch is not None and int(stop_after_epoch) < 1:
         raise ValueError(f"Invalid stop_after_epoch={stop_after_epoch}.")
+    if not 0.0 <= float(min_checkpoint_selection_coverage) <= 1.0:
+        raise ValueError(
+            "min_checkpoint_selection_coverage must be in [0, 1], got "
+            f"{min_checkpoint_selection_coverage}."
+        )
+    if int(max_val_non_oom_failures) < 0:
+        raise ValueError(
+            f"Invalid max_val_non_oom_failures={max_val_non_oom_failures}."
+        )
+    if int(max_val_oom_failures) < 0:
+        raise ValueError(f"Invalid max_val_oom_failures={max_val_oom_failures}.")
+    if not 0.0 <= float(final_topn_min_coverage) <= 1.0:
+        raise ValueError(
+            "final_topn_min_coverage must be in [0, 1], got "
+            f"{final_topn_min_coverage}."
+        )
 
     if val_cost_budget is None:
         raise ValueError("val_cost_budget must be configured explicitly.")
@@ -2538,6 +2568,9 @@ def train(
         if use_configured_cuda:
             torch.cuda.empty_cache()
 
+        validation_center_guidance_fraction = _resolve_center_guidance_fraction(
+            epoch_progress,
+        )
         val_plan = _resolve_validation_plan(epoch)
         val_monitor_subset = val_plan["subset"]
         is_full_val = bool(val_plan["is_full"])
@@ -2591,6 +2624,12 @@ def train(
             dynamic_residue_candidate_topk=dynamic_residue_candidate_topk,
             phase_multiplier=float(val_plan["phase_multiplier"]),
             max_oom_retry_splits=max_oom_retry_splits,
+            max_non_oom_failures=max_val_non_oom_failures,
+            max_oom_failures=max_val_oom_failures,
+            center_hit_radius=center_positive_radius,
+            center_recall_topk_values=(1, 3, center_proposal_topk),
+            center_nms_radius=center_nms_radius,
+            learned_score_fraction=validation_center_guidance_fraction,
         ))
         logger.info(
             "Finished validation for epoch %d/%d | mode=%s | subset=%d/%d graphs.",
@@ -2617,8 +2656,24 @@ def train(
                 "mean_rmsd_final": float(val_metrics.get("mean_rmsd_final", float("inf"))),
                 "single_shot_success_2a": float(val_metrics.get("single_shot_success_2a", 0.0)),
                 "single_shot_success_5a": float(val_metrics.get("single_shot_success_5a", 0.0)),
+                "local_center_recall@1_4a": float(val_metrics.get("local_center_recall@1_4a", 0.0)),
+                "local_center_recall@3_4a": float(val_metrics.get("local_center_recall@3_4a", 0.0)),
+                f"local_center_recall@{center_proposal_topk}_4a": float(
+                    val_metrics.get(f"local_center_recall@{center_proposal_topk}_4a", 0.0)
+                ),
+                "local_center_mean_min_dist": float(
+                    val_metrics.get("local_center_mean_min_dist", float("inf"))
+                ),
                 "train_oom_batches": int(epoch_root_oom_events),
                 "val_oom_batches": int(val_metrics.get("oom_batches", 0.0)),
+                "val_failed_batches": int(val_metrics.get("failed_batches", 0.0)),
+                "val_non_oom_failed_batches": int(
+                    val_metrics.get("non_oom_failed_batches", 0.0)
+                ),
+                "val_coverage": float(val_metrics.get("val_coverage", 0.0)),
+                "val_selection_coverage": float(
+                    val_metrics.get("val_selection_coverage", 0.0)
+                ),
                 "cost_guard_skips": int(epoch_cost_guard_skips),
                 "epoch_seconds": float(epoch_seconds),
                 "graphs_per_second": float(len(train_set) / epoch_seconds),
@@ -2662,6 +2717,13 @@ def train(
             f"Val Mean RMSD: {mean_rmsd:.4f} | "
             f"Single-shot Success@2A: {val_metrics.get('single_shot_success_2a', 0.0):.2f} | "
             f"Single-shot Success@5A: {val_metrics.get('single_shot_success_5a', 0.0):.2f} | "
+            f"Local Center@1/3/{center_proposal_topk} 4A: "
+            f"{val_metrics.get('local_center_recall@1_4a', 0.0):.2f}/"
+            f"{val_metrics.get('local_center_recall@3_4a', 0.0):.2f}/"
+            f"{val_metrics.get(f'local_center_recall@{center_proposal_topk}_4a', 0.0):.2f} | "
+            f"Local Center mean min dist: {val_metrics.get('local_center_mean_min_dist', float('inf')):.2f} A | "
+            f"Val coverage: {100.0 * val_metrics.get('val_selection_coverage', 0.0):.2f}% | "
+            f"Val failed batches: {int(val_metrics.get('failed_batches', 0.0))} | "
             f"Val mode: {val_plan['mode']} | "
             f"Val subset: {int(val_metrics.get('val_subset_size', 0.0))} ({100.0 * val_metrics.get('val_subset_ratio', 0.0):.2f}%) | "
             f"Root OOM events: epoch={epoch_root_oom_events}, total={total_oom_batches} | "
@@ -2685,6 +2747,22 @@ def train(
             selected_metric_label,
             selection_metrics[selected_primary_key],
         )
+        val_selection_coverage = float(
+            val_metrics.get("val_selection_coverage", 0.0)
+        )
+        checkpoint_selection_eligible = (
+            val_selection_coverage >= float(min_checkpoint_selection_coverage)
+        )
+        val_metrics["checkpoint_selection_eligible"] = (
+            1.0 if checkpoint_selection_eligible else 0.0
+        )
+        if not checkpoint_selection_eligible:
+            logger.warning(
+                "Skipping best-checkpoint updates: validation selection coverage %.2f%% "
+                "is below required %.2f%%.",
+                100.0 * val_selection_coverage,
+                100.0 * float(min_checkpoint_selection_coverage),
+            )
 
         checkpoint_epoch_state = CheckpointEpochState(
             epoch_idx=epoch,
@@ -2713,7 +2791,7 @@ def train(
         )
 
         is_warmup = epoch < warmup_epochs
-        if not is_warmup:
+        if not is_warmup and checkpoint_selection_eligible:
             if is_better_checkpoint(
                 selection_metrics,
                 best_selected_metrics,
@@ -3047,6 +3125,8 @@ def train(
                 return_candidate_records=True,
                 progress_desc="Final [Test-TopN]",
                 dataset_raw_dir=dataset.raw_dir,
+                min_coverage=final_topn_min_coverage,
+                fail_on_non_oom_error=True,
             )
             logger.info("Finished final blind Top-N test evaluation.")
             test_candidate_records = cast(list[dict[str, Any]], topn_eval.get("candidate_records", []))
@@ -3060,9 +3140,16 @@ def train(
             topn_metrics["fusion_aff_weight"] = float(current_fusion_weights.get("aff_weight", 0.0))
             topn_metrics["fusion_clash_weight"] = float(current_fusion_weights.get("clash_weight", 0.0))
             topn_metrics["fusion_bias"] = float(current_fusion_weights["bias"])
+            topn_metrics["topn_expected_complexes"] = float(topn_eval.get("topn_expected_complexes", 0.0))
+            topn_metrics["topn_processed_complexes"] = float(topn_eval.get("topn_processed_complexes", 0.0))
+            topn_metrics["topn_failed_complexes"] = float(topn_eval.get("topn_failed_complexes", 0.0))
+            topn_metrics["topn_coverage"] = float(topn_eval.get("topn_coverage", 0.0))
             topn_metrics["topn_cost_guard_skips"] = float(topn_eval.get("topn_cost_guard_skips", 0.0))
             topn_metrics["topn_oom_batches"] = float(topn_eval.get("topn_oom_batches", 0.0))
             topn_metrics["topn_failed_batches"] = float(topn_eval.get("topn_failed_batches", 0.0))
+            topn_metrics["topn_non_oom_failed_batches"] = float(
+                topn_eval.get("topn_non_oom_failed_batches", 0.0)
+            )
             test_metrics.update(topn_metrics)
 
             report_dir = os.path.join(save_dir, "reports")

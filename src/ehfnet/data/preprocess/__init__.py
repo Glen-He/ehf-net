@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ehfnet.data.preprocess.build_graph_sample import get_esm_model, prepare_graph_sample
     from ehfnet.data.preprocess.context_repair import ensure_context_features
+    from ehfnet.data.preprocess.filters import LigandGeometryPreFilter
     from ehfnet.data.preprocess.hf_runtime import configure_hf_cache_env, resolve_esm_device
     from ehfnet.data.preprocess.metadata import extract_ligand_sanitize_metadata, normalize_ligand_sanitize_mode
 
@@ -19,6 +20,7 @@ __all__ = [
     "ensure_context_features",
     "extract_ligand_sanitize_metadata",
     "get_esm_model",
+    "LigandGeometryPreFilter",
     "normalize_ligand_sanitize_mode",
     "prepare_graph_sample",
     "resolve_esm_device",
@@ -57,6 +59,10 @@ def __getattr__(name: str):
         from ehfnet.data.preprocess.context_repair import ensure_context_features
 
         return ensure_context_features
+    if name == "LigandGeometryPreFilter":
+        from ehfnet.data.preprocess.filters import LigandGeometryPreFilter
+
+        return LigandGeometryPreFilter
     if name in {"configure_hf_cache_env", "resolve_esm_device"}:
         from ehfnet.data.preprocess.hf_runtime import (
             configure_hf_cache_env,

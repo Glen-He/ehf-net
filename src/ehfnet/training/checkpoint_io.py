@@ -342,29 +342,19 @@ def build_checkpoint_model_config_kwargs(
     source_values: Mapping[str, Any],
 ) -> dict[str, Any]:
     """
-    从训练上下文提取 checkpoint 所需的模型配置参数。
+    从训练上下文提取 checkpoint 组装函数所需的模型参数。
 
     Args:
         source_values: 训练上下文或 `locals()` 形成的参数映射。
 
     Returns:
-        dict[str, Any]: 适合传给 `compose_*_checkpoint` 的模型配置字典。
+        dict[str, Any]: 适合传给 `compose_*_checkpoint` 的模型参数字典。
     """
-    model_config_kwargs = {
+
+    return {
         key: source_values[key]
         for key in CHECKPOINT_MODEL_CONFIG_KEYS
     }
-    model_config_kwargs["time_dim"] = source_values["hidden_dim"]
-    model_config_kwargs["max_neighbors"] = model_config_kwargs.pop(
-        "prediction_max_neighbors"
-    )
-    model_config_kwargs["min_max_neighbors"] = model_config_kwargs.pop(
-        "prediction_min_max_neighbors"
-    )
-    model_config_kwargs["knn_fallback_k"] = model_config_kwargs.pop(
-        "prediction_knn_fallback_k"
-    )
-    return model_config_kwargs
 
 
 def compose_selection_checkpoint(

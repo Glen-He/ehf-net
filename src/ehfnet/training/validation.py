@@ -8,6 +8,7 @@
 
 import gc
 import logging
+import traceback
 from typing import Any, cast
 
 import numpy as np
@@ -27,9 +28,93 @@ from ehfnet.training.adaptive_batching import (
 )
 from ehfnet.training.batch_helpers import apply_loss_context, build_local_batch_from_centers, compute_pose_rank_target
 from ehfnet.training.flow_matcher import ConditionalFlowMatcher
+from ehfnet.training.inference import (
+    compute_center_guidance_scores,
+    predict_center_proposal_logits,
+    select_diverse_center_indices,
+)
 from ehfnet.training.losses import FlowMatchingLoss
 
 logger = logging.getLogger(__name__)
+
+
+class ValidationFailureBudgetExceeded(RuntimeError):
+    """Raised when validation exceeds its configured failure budget."""
+
+
+def _evaluate_local_center_recall(
+    *,
+    model: torch.nn.Module,
+    batch: Any,
+    ligand_pos: torch.Tensor,
+    device: torch.device,
+    topk_values: tuple[int, ...],
+    center_hit_radius: float,
+    center_nms_radius: float,
+    learned_score_fraction: float,
+) -> tuple[dict[int, int], dict[int, int], float, int]:
+    """Evaluate center proposal recall inside the validation local crop."""
+    if not topk_values:
+        return {}, {}, 0.0, 0
+
+    proposal_logits, residue_pos_device, residue_batch_device, residue_prior_feat = (
+        predict_center_proposal_logits(model, batch, device=device)
+    )
+    center_scores = compute_center_guidance_scores(
+        proposal_logits.detach().cpu().view(-1),
+        residue_prior_feat.detach().cpu(),
+        learned_score_fraction=learned_score_fraction,
+    )
+    residue_pos = residue_pos_device.detach().cpu()
+    residue_batch = residue_batch_device.detach().cpu()
+    ligand_batch = batch["ligand_atom"].batch.detach().cpu()
+    num_graphs = int(ligand_batch.max().item()) + 1 if ligand_batch.numel() > 0 else 0
+    true_centers = scatter_mean(
+        ligand_pos.detach().cpu(),
+        ligand_batch,
+        dim=0,
+        dim_size=num_graphs,
+    )
+
+    max_topk = max(topk_values)
+    hits_4a = {topk: 0 for topk in topk_values}
+    hits_6a = {topk: 0 for topk in topk_values}
+    min_dist_sum = 0.0
+    evaluated_graphs = 0
+
+    for graph_idx in range(num_graphs):
+        graph_mask = residue_batch == graph_idx
+        graph_positions = residue_pos[graph_mask]
+        if graph_positions.numel() == 0:
+            continue
+
+        graph_scores = center_scores[graph_mask]
+        selected_indices = select_diverse_center_indices(
+            graph_scores,
+            graph_positions,
+            topk=min(max_topk, graph_positions.size(0)),
+            min_distance=center_nms_radius,
+        ).cpu()
+        if selected_indices.numel() == 0:
+            continue
+
+        selected_positions = graph_positions[selected_indices]
+        distances = torch.norm(
+            selected_positions - true_centers[graph_idx].view(1, 3),
+            dim=-1,
+        )
+        min_dist_sum += float(distances.min().item())
+        evaluated_graphs += 1
+
+        for topk in topk_values:
+            k = min(topk, distances.numel())
+            if k <= 0:
+                continue
+            topk_distances = distances[:k]
+            hits_4a[topk] += int(torch.any(topk_distances <= center_hit_radius).item())
+            hits_6a[topk] += int(torch.any(topk_distances <= 6.0).item())
+
+    return hits_4a, hits_6a, min_dist_sum, evaluated_graphs
 
 
 def compute_validation_loss(
@@ -59,6 +144,12 @@ def compute_validation_loss(
     dynamic_residue_candidate_topk: int,
     phase_multiplier: float = 1.0,
     max_oom_retry_splits: int = 0,
+    max_non_oom_failures: int = 0,
+    max_oom_failures: int = 3,
+    center_hit_radius: float = 4.0,
+    center_recall_topk_values: tuple[int, ...] = (1, 3, 8),
+    center_nms_radius: float = 6.0,
+    learned_score_fraction: float = 1.0,
 ) -> dict[str, float]:
     """
     计算验证集损失与 RMSD 指标。
@@ -92,6 +183,12 @@ def compute_validation_loss(
         dynamic_residue_candidate_topk: 动态配体-残基边每个复合物保留的候选残基数。
         phase_multiplier: 当前验证阶段的成本倍率。
         max_oom_retry_splits: 单个验证 batch 允许递归拆分重试的最大深度。
+        max_non_oom_failures: Maximum non-OOM validation failures allowed before failing validation.
+        max_oom_failures: Maximum irreducible OOM validation failures allowed before failing validation.
+        center_hit_radius: Local center hit radius used for validation recall.
+        center_recall_topk_values: Top-K values reported for local center recall.
+        center_nms_radius: Minimum distance used when selecting diverse center proposals.
+        learned_score_fraction: Fraction of learned center score mixed into proposal ranking.
 
     Returns:
         dict[str, float]: 验证损失、RMSD、亲和力和中心提议相关指标的汇总字典。
@@ -113,8 +210,31 @@ def compute_validation_loss(
     affinity_targets: list[torch.Tensor] = []
 
     valid_batches = 0
+    valid_graphs = 0
     oom_batches = 0
+    oom_failed_batches = 0
+    oom_failed_graphs = 0
+    failed_batches = 0
+    failed_graphs = 0
+    non_oom_failed_batches = 0
+    non_oom_failed_graphs = 0
+    invalid_loss_batches = 0
+    invalid_loss_graphs = 0
     cost_guard_skips = 0
+    cost_guard_skipped_graphs = 0
+    rmsd_attempted_graphs = 0
+    rmsd_valid_graphs = 0
+    rmsd_failed_batches = 0
+    rmsd_failed_graphs = 0
+    center_topk_values = tuple(
+        sorted({int(topk) for topk in center_recall_topk_values if int(topk) > 0})
+    )
+    center_hits_4a = {topk: 0 for topk in center_topk_values}
+    center_hits_6a = {topk: 0 for topk in center_topk_values}
+    center_min_dist_sum = 0.0
+    center_eval_graphs = 0
+    center_failed_batches = 0
+    center_failed_graphs = 0
 
     if epoch is not None:
         torch.manual_seed(42 + epoch)
@@ -161,6 +281,8 @@ def compute_validation_loss(
                     ] + pending_batches
                     continue
                 cost_guard_skips += 1
+                cost_guard_skipped_graphs += num_graphs
+                failed_graphs += num_graphs
                 logger.warning(
                     f"Validation batch {i}: skip due to oversized cost batch "
                     f"(cost={batch_cost} > limit={current_budget_limit})."
@@ -241,11 +363,49 @@ def compute_validation_loss(
                     loss_dict = criterion(predictions, targets, batch)
                     loss = loss_dict["total"]
 
-                if not torch.isnan(loss) and not torch.isinf(loss) and loss.item() < 1e6:
+                    if center_topk_values:
+                        try:
+                            batch_hits_4a, batch_hits_6a, batch_min_dist_sum, batch_eval_graphs = (
+                                _evaluate_local_center_recall(
+                                    model=model,
+                                    batch=batch,
+                                    ligand_pos=x_1,
+                                    device=device,
+                                    topk_values=center_topk_values,
+                                    center_hit_radius=center_hit_radius,
+                                    center_nms_radius=center_nms_radius,
+                                    learned_score_fraction=learned_score_fraction,
+                                )
+                            )
+                            for topk in center_topk_values:
+                                center_hits_4a[topk] += batch_hits_4a.get(topk, 0)
+                                center_hits_6a[topk] += batch_hits_6a.get(topk, 0)
+                            center_min_dist_sum += batch_min_dist_sum
+                            center_eval_graphs += batch_eval_graphs
+                        except torch.cuda.OutOfMemoryError:
+                            raise
+                        except Exception as e:
+                            center_failed_batches += 1
+                            center_failed_graphs += num_graphs
+                            logger.warning(
+                                "Local center recall evaluation failed for validation batch %d "
+                                "with %d graphs: %s",
+                                i,
+                                num_graphs,
+                                e,
+                            )
+
+                loss_is_valid = (
+                    not torch.isnan(loss)
+                    and not torch.isinf(loss)
+                    and loss.item() < 1e6
+                )
+                if loss_is_valid:
                     total_loss += loss.item()
                     valid_batches += 1
+                    valid_graphs += num_graphs
 
-                if not torch.isnan(loss) and not torch.isinf(loss) and loss.item() < 1e6:
+                if loss_is_valid:
                     if t is not None:
                         valid_mask = t > 0.8
                     else:
@@ -271,7 +431,29 @@ def compute_validation_loss(
                                         )
                                         affinity_targets.append(target_raw_valid)
 
-                if max_rmsd_batches is None or i < max_rmsd_batches:
+                else:
+                    failed_batches += 1
+                    failed_graphs += num_graphs
+                    non_oom_failed_batches += 1
+                    non_oom_failed_graphs += num_graphs
+                    invalid_loss_batches += 1
+                    invalid_loss_graphs += num_graphs
+                    logger.warning(
+                        "Validation batch %d produced invalid loss; skipping metrics for %d graphs.",
+                        i,
+                        num_graphs,
+                    )
+                    if (
+                        max_non_oom_failures >= 0
+                        and non_oom_failed_batches > max_non_oom_failures
+                    ):
+                        raise ValidationFailureBudgetExceeded(
+                            "Validation exceeded non-OOM failure budget: "
+                            f"{non_oom_failed_batches} failures > {max_non_oom_failures}."
+                        )
+
+                if loss_is_valid and (max_rmsd_batches is None or i < max_rmsd_batches):
+                    rmsd_attempted_graphs += num_graphs
                     try:
                         with torch.no_grad():
                             infer_batch = batch.clone()
@@ -325,15 +507,15 @@ def compute_validation_loss(
                                 store_trajectory=False,
                             )
 
-                            all_rmsd_final.append(
-                                compute_batch_symmetry_aware_rmsd(
-                                    current_pos=final_pos,
-                                    target_pos=x_1,
-                                    batch_idx=infer_batch["ligand_atom"].batch,
-                                    samples=local_batch_samples,
-                                    dataset_raw_dir=dataset.raw_dir,
-                                ).detach().cpu()
-                            )
+                            final_rmsd = compute_batch_symmetry_aware_rmsd(
+                                current_pos=final_pos,
+                                target_pos=x_1,
+                                batch_idx=infer_batch["ligand_atom"].batch,
+                                samples=local_batch_samples,
+                                dataset_raw_dir=dataset.raw_dir,
+                            ).detach().cpu()
+                            all_rmsd_final.append(final_rmsd)
+                            rmsd_valid_graphs += int(final_rmsd.numel())
 
                             B_infer = int(infer_batch["ligand_atom"].batch.max().item()) + 1
                             pred_centroid = scatter_mean(
@@ -355,10 +537,21 @@ def compute_validation_loss(
                         del infer_batch, x_0_infer, final_pos
 
                     except Exception as e:
-                        logger.warning(f"RMSD inference failed for batch {i}: {e}")
+                        rmsd_failed_batches += 1
+                        rmsd_failed_graphs += num_graphs
+                        logger.warning(
+                            "RMSD inference failed for batch %d with %d graphs: %s\n%s",
+                            i,
+                            num_graphs,
+                            e,
+                            traceback.format_exc(),
+                        )
                         gc.collect()
                         if use_configured_cuda:
                             torch.cuda.empty_cache()
+
+            except ValidationFailureBudgetExceeded:
+                raise
 
             except torch.cuda.OutOfMemoryError:
                 oom_batches += 1
@@ -383,15 +576,42 @@ def compute_validation_loss(
                         (split_batches[1], split_depth + 1),
                     ] + pending_batches
                     continue
+                oom_failed_batches += 1
+                oom_failed_graphs += num_graphs
+                failed_batches += 1
+                failed_graphs += num_graphs
                 logger.warning(f"Validation batch {i}: CUDA OOM, skipping and clearing cache.")
+                if max_oom_failures >= 0 and oom_failed_batches > max_oom_failures:
+                    raise RuntimeError(
+                        "Validation exceeded irreducible OOM failure budget: "
+                        f"{oom_failed_batches} failures > {max_oom_failures}."
+                    )
                 continue
 
             except Exception as e:
-                logger.warning(f"Validation batch failed: {e}")
+                failed_batches += 1
+                failed_graphs += num_graphs
+                non_oom_failed_batches += 1
+                non_oom_failed_graphs += num_graphs
+                logger.warning(
+                    "Validation batch %d failed with %d graphs: %s\n%s",
+                    i,
+                    num_graphs,
+                    e,
+                    traceback.format_exc(),
+                )
                 del predictions, loss_dict, loss, x_1, x_t, t, targets, ligand_centers, local_batch, crop_centers
                 gc.collect()
                 if use_configured_cuda:
                     torch.cuda.empty_cache()
+                if (
+                    max_non_oom_failures >= 0
+                    and non_oom_failed_batches > max_non_oom_failures
+                ):
+                    raise RuntimeError(
+                        "Validation exceeded non-OOM failure budget: "
+                        f"{non_oom_failed_batches} failures > {max_non_oom_failures}."
+                    )
                 continue
 
             del predictions, targets, loss_dict, loss, x_1, x_t, t, batch, ligand_centers, local_batch, crop_centers
@@ -467,9 +687,73 @@ def compute_validation_loss(
     metrics["single_shot_success_5a"] = success_5a
     metrics["centroid_dist_mean"] = mean_centroid
     metrics["centroid_dist_median"] = median_centroid
+    center_mean_min_dist = (
+        center_min_dist_sum / center_eval_graphs
+        if center_eval_graphs > 0
+        else float("inf")
+    )
+    metrics["local_center_mean_min_dist"] = center_mean_min_dist
+    metrics["local_center_eval_graphs"] = float(center_eval_graphs)
+    metrics["local_center_failed_batches"] = float(center_failed_batches)
+    metrics["local_center_failed_graphs"] = float(center_failed_graphs)
+    for topk in center_topk_values:
+        recall_4a = (
+            100.0 * center_hits_4a[topk] / center_eval_graphs
+            if center_eval_graphs > 0
+            else 0.0
+        )
+        recall_6a = (
+            100.0 * center_hits_6a[topk] / center_eval_graphs
+            if center_eval_graphs > 0
+            else 0.0
+        )
+        metrics[f"local_center_recall@{topk}_4a"] = recall_4a
+        metrics[f"local_center_recall@{topk}_6a"] = recall_6a
+    if center_eval_graphs > 0:
+        topk_label = "/".join(str(topk) for topk in center_topk_values)
+        recall_4a_label = "/".join(
+            f"{metrics[f'local_center_recall@{topk}_4a']:.2f}"
+            for topk in center_topk_values
+        )
+        recall_6a_label = "/".join(
+            f"{metrics[f'local_center_recall@{topk}_6a']:.2f}"
+            for topk in center_topk_values
+        )
+        logger.info(
+            "  Local Center Recall@%s: 4A %s%% | 6A %s%% | Mean min dist %.2f A",
+            topk_label,
+            recall_4a_label,
+            recall_6a_label,
+            center_mean_min_dist,
+        )
     metrics["oom_batches"] = float(oom_batches)
+    metrics["oom_failed_batches"] = float(oom_failed_batches)
+    metrics["oom_failed_graphs"] = float(oom_failed_graphs)
     metrics["valid_batches"] = float(valid_batches)
+    metrics["valid_graphs"] = float(valid_graphs)
+    metrics["failed_batches"] = float(failed_batches)
+    metrics["failed_graphs"] = float(failed_graphs)
+    metrics["non_oom_failed_batches"] = float(non_oom_failed_batches)
+    metrics["non_oom_failed_graphs"] = float(non_oom_failed_graphs)
+    metrics["invalid_loss_batches"] = float(invalid_loss_batches)
+    metrics["invalid_loss_graphs"] = float(invalid_loss_graphs)
     metrics["cost_guard_skips"] = float(cost_guard_skips)
+    metrics["cost_guard_skipped_graphs"] = float(cost_guard_skipped_graphs)
+    metrics["rmsd_attempted_graphs"] = float(rmsd_attempted_graphs)
+    metrics["rmsd_valid_graphs"] = float(rmsd_valid_graphs)
+    metrics["rmsd_failed_batches"] = float(rmsd_failed_batches)
+    metrics["rmsd_failed_graphs"] = float(rmsd_failed_graphs)
+    total_graphs = val_total_graphs if val_total_graphs > 0 else valid_graphs + failed_graphs
+    val_coverage = float(valid_graphs / total_graphs) if total_graphs > 0 else 0.0
+    rmsd_coverage = (
+        float(rmsd_valid_graphs / rmsd_attempted_graphs)
+        if rmsd_attempted_graphs > 0
+        else val_coverage
+    )
+    metrics["validation_total_graphs"] = float(total_graphs)
+    metrics["val_coverage"] = val_coverage
+    metrics["rmsd_coverage"] = rmsd_coverage
+    metrics["val_selection_coverage"] = min(val_coverage, rmsd_coverage)
 
     if valid_batches == 0:
         metrics["val_loss"] = float("nan")

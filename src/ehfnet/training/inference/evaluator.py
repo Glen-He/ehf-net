@@ -49,6 +49,8 @@ def evaluate_topn_success(
     return_candidate_records: bool = False,
     progress_desc: str = "TopN Eval",
     dataset_raw_dir: str | None = None,
+    min_coverage: float = 1.0,
+    fail_on_non_oom_error: bool = True,
 ) -> dict[str, Any]:
     """
     评估 Top-N 对接成功率。
@@ -87,6 +89,8 @@ def evaluate_topn_success(
         return_candidate_records: 是否同时返回候选记录明细。
         progress_desc: 终端中显示的 Top-N 评估阶段名称。
         dataset_raw_dir: 数据集原始样本目录，用于计算对称感知 RMSD。
+        min_coverage: Minimum successful complex coverage required for official metrics.
+        fail_on_non_oom_error: Whether non-OOM candidate failures should abort evaluation.
 
     Returns:
         dict[str, Any]: Top-N 指标字典，必要时附带候选记录明细。
@@ -127,11 +131,18 @@ def evaluate_topn_success(
         max_oom_retry_splits=max_oom_retry_splits,
         progress_desc=progress_desc,
         dataset_raw_dir=dataset_raw_dir,
+        fail_on_non_oom_error=fail_on_non_oom_error,
     )
     candidate_records = cast(
         list[dict[str, Any]],
         generation_result.get("candidate_records", []),
     )
+    generation_coverage = float(generation_result.get("coverage", 0.0))
+    if generation_coverage < min_coverage:
+        raise RuntimeError(
+            "Top-N evaluation coverage is below the configured minimum: "
+            f"{generation_coverage:.4f} < {min_coverage:.4f}."
+        )
 
     total_graphs = len(candidate_records)
     if total_graphs == 0:
@@ -142,9 +153,16 @@ def evaluate_topn_success(
 
     metrics: dict[str, Any] = {
         "topn_total_graphs": float(total_graphs),
+        "topn_expected_complexes": float(generation_result.get("total_complexes", total_graphs)),
+        "topn_processed_complexes": float(generation_result.get("processed_complexes", total_graphs)),
+        "topn_failed_complexes": float(generation_result.get("failed_complexes", 0.0)),
+        "topn_coverage": generation_coverage,
         "topn_cost_guard_skips": float(generation_result.get("cost_guard_skips", 0.0)),
         "topn_oom_batches": float(generation_result.get("oom_batches", 0.0)),
         "topn_failed_batches": float(generation_result.get("failed_batches", 0.0)),
+        "topn_non_oom_failed_batches": float(
+            generation_result.get("non_oom_failed_batches", 0.0)
+        ),
     }
     metrics.update(
         summarize_blind_candidate_records(

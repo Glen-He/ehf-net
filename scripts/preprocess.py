@@ -7,8 +7,10 @@
 
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import json
 import logging
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -22,6 +24,7 @@ if str(PROJECT_ROOT / "src") not in sys.path:
     sys.path.append(str(PROJECT_ROOT / "src"))
 
 from ehfnet.contracts import ESM_CACHE_VERSION_TAG, GRAPH_CACHE_DIRNAME
+from ehfnet.data.preprocess import LigandGeometryPreFilter
 from ehfnet.runtime import (
     configure_text_logging,
     get_configured_device,
@@ -33,33 +36,10 @@ from ehfnet.runtime import (
 logger = logging.getLogger(__name__)
 
 
-def _geometry_pre_filter(data, *, min_atom_distance: float) -> bool:
-    """
-    几何合理性检查：配体原子间最小距离低于阈值则过滤。
+def _build_geometry_pre_filter(*, min_atom_distance: float) -> LigandGeometryPreFilter:
+    """Build the stable PyG pre_filter used by build, stats, and train."""
 
-    Args:
-        data: 当前待检查的图样本对象。
-        min_atom_distance: 允许保留样本的最小配体原子间距阈值（Å）。
-
-    Returns:
-        bool: 返回样本是否通过几何合理性筛选。
-    """
-    if "ligand_atom" not in data or not hasattr(data["ligand_atom"], "pos"):
-        return True
-    lig_pos = data["ligand_atom"].pos
-    if lig_pos.shape[0] <= 1:
-        return True
-    import torch
-    dist_mat = torch.cdist(lig_pos, lig_pos, p=2)
-    dist_mat = dist_mat + torch.eye(dist_mat.shape[0], device=dist_mat.device) * 1000.0
-    min_dist = dist_mat.min().item()
-    if min_dist < min_atom_distance:
-        logger.warning(
-            "Filtering sample with unreasonable geometry: min atom distance = %.3f Å",
-            min_dist,
-        )
-        return False
-    return True
+    return LigandGeometryPreFilter(min_atom_distance=float(min_atom_distance))
 
 
 def _suggest_distance_cutoff(
@@ -104,6 +84,104 @@ def _configure_logging(command: str, *, smoke: bool) -> str:
     logger.info("Logging to %s", log_file)
     logger.info("Smoke log grouping: %s", smoke)
     return str(log_file)
+
+
+def _limit_worker_native_threads() -> None:
+    """Keep each worker process from spawning large native thread pools."""
+
+    for name in (
+        "OMP_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OPENBLAS_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+    ):
+        os.environ.setdefault(name, "1")
+
+
+def _build_preprocess_shard(
+    *,
+    data_root: str,
+    esm_root: str | None,
+    device: str,
+    dataset_build_kwargs: dict[str, object],
+    force_rebuild: bool,
+    geometry_min_atom_distance: float,
+    num_shards: int,
+    shard_index: int,
+) -> dict[str, int]:
+    """Build one deterministic preprocessing shard inside a worker process."""
+
+    _limit_worker_native_threads()
+
+    from ehfnet.data.preprocess import configure_hf_cache_env, resolve_esm_device
+    from ehfnet.runtime import build_dataset
+
+    root = Path(data_root)
+    _, hub_cache, cache_source = configure_hf_cache_env(project_root=PROJECT_ROOT)
+    resolved_device = resolve_esm_device(device)
+    logger.info(
+        "Shard %d/%d using ESM device %s and HuggingFace cache %s (%s).",
+        shard_index + 1,
+        num_shards,
+        resolved_device,
+        hub_cache,
+        cache_source,
+    )
+
+    dataset = build_dataset(
+        root=str(root),
+        index_file=str(root / "index.csv"),
+        esm_root=esm_root,
+        esm_device=str(resolved_device),
+        **dataset_build_kwargs,
+        force_reprocess=force_rebuild,
+        pre_filter=_build_geometry_pre_filter(
+            min_atom_distance=geometry_min_atom_distance,
+        ),
+        process_num_shards=num_shards,
+        process_shard_index=shard_index,
+    )
+    dataset.process()
+    return {"shard_index": shard_index, "num_shards": num_shards}
+
+
+def _run_parallel_build(args: argparse.Namespace) -> None:
+    """Run preprocessing shards with a process pool."""
+
+    num_workers = int(args.num_workers)
+    logger.info(
+        "Starting parallel preprocess build with %d worker processes.",
+        num_workers,
+    )
+    with ProcessPoolExecutor(
+        max_workers=num_workers,
+        initializer=_limit_worker_native_threads,
+    ) as executor:
+        futures = {
+            executor.submit(
+                _build_preprocess_shard,
+                data_root=str(args.data_root),
+                esm_root=args.esm_root or None,
+                device=str(args.device),
+                dataset_build_kwargs=dict(args.dataset_build_kwargs),
+                force_rebuild=bool(args.force_rebuild),
+                geometry_min_atom_distance=float(args.geometry_min_atom_distance),
+                num_shards=num_workers,
+                shard_index=shard_index,
+            ): shard_index
+            for shard_index in range(num_workers)
+        }
+        completed = 0
+        for future in as_completed(futures):
+            result = future.result()
+            completed += 1
+            logger.info(
+                "Shard %d/%d complete (%d/%d).",
+                int(result["shard_index"]) + 1,
+                int(result["num_shards"]),
+                completed,
+                num_workers,
+            )
 
 
 def _build_dataset_kwargs(config_defaults: dict[str, object]) -> dict[str, object]:
@@ -162,6 +240,15 @@ def cmd_build(args: argparse.Namespace) -> None:
         _clean_target(data_root, target="graph", dry_run=False)
         _clean_target(data_root, target="esm", dry_run=False)
 
+    if int(args.num_workers) > 1:
+        if int(args.num_shards) != 1 or int(args.shard_index) != 0:
+            raise ValueError(
+                "--num-workers cannot be combined with explicit shard options."
+            )
+        _run_parallel_build(args)
+        logger.info("Parallel build complete.")
+        return
+
     _, hub_cache, cache_source = configure_hf_cache_env(project_root=PROJECT_ROOT)
     resolved_device = resolve_esm_device(args.device)
     logger.info("Using ESM device: %s", resolved_device)
@@ -174,10 +261,11 @@ def cmd_build(args: argparse.Namespace) -> None:
         esm_device=str(resolved_device),
         **args.dataset_build_kwargs,
         force_reprocess=args.force_rebuild,
-        pre_filter=lambda data: _geometry_pre_filter(
-            data,
+        pre_filter=_build_geometry_pre_filter(
             min_atom_distance=float(args.geometry_min_atom_distance),
         ),
+        process_num_shards=int(args.num_shards),
+        process_shard_index=int(args.shard_index),
     )
     dataset.process()
     logger.info("Build complete.")
@@ -206,7 +294,7 @@ def _clean_target(
     size_bytes = 0
 
     if target == "graph":
-        for name in (GRAPH_CACHE_DIRNAME,):
+        for name in (GRAPH_CACHE_DIRNAME, "candidates"):
             d = root / name
             if d.exists():
                 for f in d.rglob("*"):
@@ -218,6 +306,21 @@ def _clean_target(
                     logger.info("Deleted %s", d)
                 else:
                     logger.info("[DRY RUN] Would delete %s", d)
+
+        generated_files = [
+            root / "dataset_profile.json",
+            root / "preprocess_summary.json",
+            *root.glob("preprocess_summary_shard_*_of_*.json"),
+        ]
+        for f in generated_files:
+            if f.exists() and f.is_file():
+                size_bytes += f.stat().st_size
+                count += 1
+                if not dry_run:
+                    f.unlink()
+                    logger.info("Deleted %s", f)
+                else:
+                    logger.info("[DRY RUN] Would delete %s", f)
 
     elif target == "esm":
         for npz in cleaned_dir.rglob("*.npz"):
@@ -283,6 +386,9 @@ def cmd_stats(args: argparse.Namespace) -> None:
         index_file=index_file,
         esm_root=None,
         **stats_dataset_kwargs,
+        pre_filter=_build_geometry_pre_filter(
+            min_atom_distance=float(args.geometry_min_atom_distance),
+        ),
     )
     processed_dir = Path(dataset.processed_dir)
     if not processed_dir.exists():
@@ -433,7 +539,10 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # 构建缓存。
-    p_build = subparsers.add_parser("build", help="Build graph cache + ESM + geometry check")
+    p_build = subparsers.add_parser(
+        "build",
+        help="Build graph cache + ESM + geometry check",
+    )
     p_build.add_argument(
         "--data-root",
         type=str,
@@ -448,6 +557,24 @@ def main() -> None:
         help="ESM device, e.g. cuda:0 or cpu",
     )
     p_build.add_argument("--force-rebuild", action="store_true")
+    p_build.add_argument(
+        "--num-workers",
+        type=int,
+        default=8,
+        help="Number of worker processes used by build; defaults to 8.",
+    )
+    p_build.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help=argparse.SUPPRESS,
+    )
+    p_build.add_argument(
+        "--shard-index",
+        type=int,
+        default=0,
+        help=argparse.SUPPRESS,
+    )
     p_build.set_defaults(func=cmd_build)
 
     # 清理缓存。
@@ -475,6 +602,13 @@ def main() -> None:
     p_stats.set_defaults(func=cmd_stats)
 
     args = parser.parse_args()
+    if getattr(args, "num_workers", 1) < 1:
+        parser.error("--num-workers must be >= 1")
+    if getattr(args, "num_shards", 1) < 1:
+        parser.error("--num-shards must be >= 1")
+    if not 0 <= getattr(args, "shard_index", 0) < getattr(args, "num_shards", 1):
+        parser.error("--shard-index must be in [0, --num-shards)")
+
     args.dataset_build_kwargs = _build_dataset_kwargs(config_defaults)
     args.geometry_min_atom_distance = float(config_defaults["geometry_min_atom_distance"])
     args.stats_cutoff_percentile = float(config_defaults["stats_cutoff_percentile"])

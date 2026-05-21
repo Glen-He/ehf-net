@@ -55,6 +55,8 @@ def build_dataset(
     interaction_profile: str,
     force_reprocess: bool = False,
     pre_filter: Any = None,
+    process_num_shards: int = 1,
+    process_shard_index: int = 0,
 ) -> ProteinLigandDataset:
     """
     构造数据集对象。
@@ -82,6 +84,8 @@ def build_dataset(
         interaction_profile: 跨图交互拓扑配置。
         force_reprocess: 是否忽略已有缓存并强制重新预处理。
         pre_filter: 样本写入缓存前执行的过滤回调。
+        process_num_shards: 预处理分片总数。
+        process_shard_index: 当前进程负责的分片编号。
 
     Returns:
         ProteinLigandDataset: 按当前运行参数构造好的数据集对象。
@@ -128,6 +132,8 @@ def build_dataset(
         ),
         force_reprocess=force_reprocess,
         pre_filter=pre_filter,
+        process_num_shards=process_num_shards,
+        process_shard_index=process_shard_index,
     )
 
 
@@ -142,6 +148,8 @@ def build_dataset_from_model_config(
     esm_device: str | None = None,
     force_reprocess: bool = False,
     pre_filter: Any = None,
+    process_num_shards: int = 1,
+    process_shard_index: int = 0,
 ) -> ProteinLigandDataset:
     """
     按模型配置构造数据集。
@@ -159,6 +167,8 @@ def build_dataset_from_model_config(
         esm_device: 执行 ESM 推理时使用的设备。
         force_reprocess: 是否忽略已有缓存并强制重新预处理。
         pre_filter: 样本写入缓存前执行的过滤回调。
+        process_num_shards: 预处理分片总数。
+        process_shard_index: 当前进程负责的分片编号。
 
     Returns:
         ProteinLigandDataset: 与给定模型配置保持一致的数据集对象。
@@ -184,6 +194,8 @@ def build_dataset_from_model_config(
         interaction_profile=str(model_config["interaction_profile"]),
         force_reprocess=force_reprocess,
         pre_filter=pre_filter,
+        process_num_shards=process_num_shards,
+        process_shard_index=process_shard_index,
     )
 
 

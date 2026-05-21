@@ -42,6 +42,12 @@ val_full_every = 10
 val_full_last_epochs = 10
 ode_method = "euler"
 
+[validation]
+min_checkpoint_selection_coverage = 0.98
+max_val_non_oom_failures = 0
+max_val_oom_failures = 3
+final_topn_min_coverage = 1.0
+
 [split]
 split_train_frac = 0.7
 split_val_frac = 0.1
